@@ -35,6 +35,7 @@ listen_timestamps*.json
 mid_listen_counts.json
 queue_playlists*.json
 out.json
+download_list.txt
 
 # Local/generated artifacts
 *.npz

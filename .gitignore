@@ -1,0 +1,43 @@
+# macOS
+.DS_Store
+
+# Python caches
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# IDE/editor local files
+.idea/
+.vscode/
+
+# Virtual environments
+venv/
+.venv/
+demucs-venv/
+
+# Local audio/media files
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.aac
+*.ogg
+
+# Generated audio separation/model outputs
+separated/
+
+# Local generated data
+*.html
+tags.json
+mid_tags.json
+listen_counts.json
+listen_timestamps*.json
+mid_listen_counts.json
+queue_playlists*.json
+out.json
+
+# Local/generated artifacts
+*.npz
+*.cache
+.loudness_cache.json
+.track_emb_cache.npz

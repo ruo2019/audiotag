@@ -1,0 +1,71 @@
+# One line per download:
+# VIDEO_ID title [m|mm]
+# [m]  -> static/mp3/
+# [mm] -> static/mid-mp3s/
+
+# CR53302rIfA Mendelssohn [m]
+# dQw4w9WgXcQ Example Song [mm]
+
+# VMFaVFGgr6I Malinconica [m]
+# 0EbelAhRHUo Lose [m]
+# Z027UW-XHcM Ready [m]
+# MQY52sgvNI4 Disappearing [m]
+# iSqVdkXICeg Tomorrow [m]
+# XSvpEbTpyMU Il Mostro [m]
+# qW9ume_EYx0 New World [m]
+
+# CAMWdvo71ls Tous Les Mêmes [m]
+
+# nH_kD8oj6dg L'Amour Toujours [m]
+
+# g2GbpXqL5P8 Time2 [m]
+
+# vINbyAmhQCE Good Life [mm]
+
+# lW9ep22YmlM Royalty [mm]
+
+# JYwdyQFn2Bc Vem Kan Segla Förutan Vind [m]
+
+# plnfIj7dkJE Starboy [mm]
+
+# pQV0WEdT_OE Circles [mm]
+# ozqw3UZRsIU To Build a Home [mm]
+# TA1W-pHNKl8 a thousand years [mm]
+# q6i3LgOjyGY Apologize [mm]
+# vFFT1iAUNDE Scared to be Lonely [mm]
+
+# ilLEuwH4hws Pompeii [mm]
+
+# 6PEa3_r8-f8 a thousand years [m]
+
+# 4IeIZXELOy8 test [mm]
+
+# J2KplbLXPkA A Revolution in Cuisine [m]
+
+# HWFnlfDpnLE Bring Me to Life [mm]
+
+# 8ofCZObsnOo Hold On [mm]
+
+# w5GrxfjuTTI Hollywood's Bleeding [m]
+
+# Ru57E789gdY Idea 22 Remix [mm]
+
+# WNlXKiTcIHI glow in the dark [mm]
+
+# jzeHZ-wwYuE Ordinary (Instrumental) [m]
+
+# bfYzue5E9GU Immaterial [m]
+
+# CUIIh98BHmQ Dystopia [m]
+
+# A8dH4cKGa6s Ordinary [mm]
+
+# AlDE1OkcaEA Stranger Things [mm]
+
+# y93xvnqLRss Psycho [mm]
+
+# k7iVAQYpHl4 La symphonie des éclairs [mm]
+
+# ZJcCPmPKlPQ The Godfather [m]
+
+MEiVnNNpJLA Doubt [m]

@@ -12,8 +12,31 @@ from sklearn.metrics.pairwise import cosine_similarity
 from pydub import AudioSegment
 from pydub.exceptions import CouldntDecodeError
 import torch
+import threading
+from datetime import datetime, timedelta
+
+if sys.platform == "darwin":
+    try:
+        from Foundation import NSObject, NSDistributedNotificationCenter, NSRunLoop, NSDate
+        from PyObjCTools import AppHelper
+
+        MAC_LOCK_LISTENER_AVAILABLE = True
+    except Exception:
+        MAC_LOCK_LISTENER_AVAILABLE = False
+else:
+    MAC_LOCK_LISTENER_AVAILABLE = False
 
 # --- Configuration ---
+IS_SCREEN_LOCKED = threading.Event()
+# --- Exit Policy ---
+LOCK_EXIT_MINUTES = 30  # Exit if the screen stays locked this long (continuous)
+EXIT_AT_LOCAL_HOUR = 1  # 1:30 AM local time
+EXIT_AT_LOCAL_MINUTE = 30
+
+EXIT_NOW = threading.Event()  # set from any thread to request process exit
+LOCKED_SINCE_WALL: float | None = None  # wall-clock seconds since epoch when lock started
+_OBSERVER = None  # keep strong ref to the NSNotification observer
+
 MP3_FOLDER = "static/mp3"
 TAGS_FILE = 'tags.json'
 SAMPLE_MP3_FILENAME = "Deep Stone Crypt Theme.mp3"
@@ -26,6 +49,8 @@ elif torch.cuda.is_available():
     DEVICE = 'cuda'
 else:
     DEVICE = 'cpu'
+
+
 # ---------------------
 
 # --- Helper Functions (Volume Normalization) ---
@@ -55,18 +80,136 @@ def get_audio_loudness(full_filepath_with_extension):
         print(f"Error analyzing loudness for {os.path.basename(full_filepath_with_extension)}: {e}. Skipping analysis.")
         return None
 
+
 def calculate_volume_scale(target_peak_dbfs, current_peak_dbfs):
     """Calculates the pygame volume scale factor (0.0 to 1.0)."""
     if target_peak_dbfs is None or current_peak_dbfs is None:
-        return 0.5 # Default volume if analysis failed
+        return 0.5  # Default volume if analysis failed
 
     if target_peak_dbfs <= -100.0 or current_peak_dbfs <= -100.0:
-         return 0.5
+        return 0.5
 
     db_difference = target_peak_dbfs - current_peak_dbfs
-    scale_factor = 10**(db_difference/20) # Use 20 for peak normalization
-    scaled_volume = max(0.0, min(1.0, 0.5*scale_factor))
+    scale_factor = 10 ** (db_difference / 20)  # Use 20 for peak normalization
+    scaled_volume = max(0.0, min(1.0, 0.5 * scale_factor))
     return scaled_volume
+
+def _next_local_time(hour: int, minute: int) -> datetime:
+    """
+    Return the next occurrence (today or tomorrow) at local hour:minute.
+    """
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
+def _maybe_exit_for_scheduled_time(next_exit_dt: datetime):
+    """
+    Exit immediately if we've reached the scheduled cutoff OR if the lock-exit flag is set.
+    """
+    if EXIT_NOW.is_set():
+        print(f"\nScreen was locked for \u2265 {LOCK_EXIT_MINUTES} minutes (wall clock). Exiting.")
+        try:
+            pygame.mixer.stop()
+        except Exception:
+            pass
+        raise SystemExit
+
+    if datetime.now() >= next_exit_dt:
+        print(f"\nReached scheduled exit time ({next_exit_dt.strftime('%Y-%m-%d %H:%M')} local). Exiting.")
+        try:
+            pygame.mixer.stop()
+        except Exception:
+            pass
+        raise SystemExit
+
+
+def _mac_is_locked_poll() -> bool:
+    """Return True if the screen is locked (macOS), else False.
+    Uses Quartz (CGSessionCopyCurrentDictionary) when available.
+    Falls back to the IS_SCREEN_LOCKED event if Quartz or PyObjC isn't available.
+    Side effect: clears IS_SCREEN_LOCKED if we detect an unlocked state via Quartz.
+    """
+    if sys.platform != "darwin":
+        return IS_SCREEN_LOCKED.is_set()
+    try:
+        from Quartz import CGSessionCopyCurrentDictionary  # type: ignore
+        sess = CGSessionCopyCurrentDictionary() or {}
+        if "CGSSessionScreenIsLocked" in sess:
+            locked = bool(sess.get("CGSSessionScreenIsLocked"))
+        elif "CGSSessionOnConsoleKey" in sess:
+            # OnConsoleKey==True -> user is at console -> not locked
+            locked = not bool(sess.get("CGSSessionOnConsoleKey"))
+        else:
+            locked = IS_SCREEN_LOCKED.is_set()
+        if not locked and IS_SCREEN_LOCKED.is_set():
+            IS_SCREEN_LOCKED.clear()
+        return locked
+    except Exception:
+        return _mac_is_locked_poll()
+
+def _wait_while_locked_or_exit(lock_since_wall: float | None,
+                               next_exit_dt: datetime,
+                               tick_hz: int = 10) -> float | None:
+    """
+    Blocks while the screen is locked. If locked continuously for LOCK_EXIT_MINUTES (wall time), exit.
+    Also exits if the scheduled cutoff hits while waiting.
+    Returns updated lock_since_wall (None when unlocked).
+    """
+    clk = pygame.time.Clock()
+    while True:
+        _maybe_exit_for_scheduled_time(next_exit_dt)
+
+        # Determine current lock-state. On macOS, poll Quartz as a fallback so we do not
+        # get stuck if the NSDistributedNotification 'unlocked' event is missed.
+        locked_now = _mac_is_locked_poll()
+        if sys.platform == "darwin":
+            try:
+                from Quartz import CGSessionCopyCurrentDictionary  # type: ignore
+                sess = CGSessionCopyCurrentDictionary() or {}
+                locked_now = bool(sess.get("CGSSessionScreenIsLocked", locked_now))
+            except Exception:
+                pass
+
+        if not locked_now:
+            # Unlocked now; clear the timer
+            return None
+
+        # Track wall-clock duration across actual lock state
+        if lock_since_wall is None:
+            lock_since_wall = LOCKED_SINCE_WALL or time.time()
+        else:
+            if time.time() - lock_since_wall >= LOCK_EXIT_MINUTES * 60:
+                EXIT_NOW.set()
+                _maybe_exit_for_scheduled_time(next_exit_dt)
+
+        clk.tick(tick_hz)
+
+def _sleep_with_exit_checks(duration_sec: float,
+                            next_exit_dt: datetime,
+                            lock_since_wall: float | None) -> float | None:
+    """
+    Sleep in short increments while honoring the exit policies.
+    Returns updated lock_since_wall (cleared if unlocked).
+    """
+    end = time.time() + duration_sec
+    while time.time() < end:
+        _maybe_exit_for_scheduled_time(next_exit_dt)
+
+        if _mac_is_locked_poll():
+            if lock_since_wall is None:
+                lock_since_wall = LOCKED_SINCE_WALL or time.time()
+            elif time.time() - lock_since_wall >= LOCK_EXIT_MINUTES * 60:
+                EXIT_NOW.set()
+                _maybe_exit_for_scheduled_time(next_exit_dt)
+        else:
+            lock_since_wall = None
+
+        time.sleep(0.1)
+    return lock_since_wall
+
 
 # --- Main Combined Logic ---
 
@@ -222,7 +365,8 @@ def main(target_mood_str, top_n, mp3_folder_path, tags_file_path, sample_file_na
                 print(f"  - {filename_ext}:")
                 print(f"      Loudness: {data['loudness_dbfs']:.2f} LUFS -> Scale: {scale:.3f}")
         else:
-            print(f"  - Skipping scale calculation for {filename_ext} (analysis failed or file missing). Will use default scale 0.5.")
+            print(
+                f"  - Skipping scale calculation for {filename_ext} (analysis failed or file missing). Will use default scale 0.5.")
             audio_data[full_path] = {'loudness_dbfs': None, 'scale': 0.5}
 
     print("Initializing Pygame Mixer...")
@@ -242,12 +386,20 @@ def main(target_mood_str, top_n, mp3_folder_path, tags_file_path, sample_file_na
         print("Ensure audio drivers are installed and configured.")
         sys.exit(1)
 
+    # --- Exit policy state ---
+    next_exit_dt = _next_local_time(EXIT_AT_LOCAL_HOUR, EXIT_AT_LOCAL_MINUTE)
+    lock_since_wall = None
+    print(f"\nExit policy: exit if locked for {LOCK_EXIT_MINUTES} minutes (wall clock, includes sleep), "
+          f"or at {next_exit_dt.strftime('%Y-%m-%d %H:%M')} local (1:30 AM cutoff).")
+
     playback_list = top_files_full_paths_playback[:]
     print(f"\n--- Starting Looping Playback of Top {len(playback_list)} Mood Matches (Ctrl+C to stop) ---")
     try:
         while True:
+            _maybe_exit_for_scheduled_time(next_exit_dt)
             random.shuffle(playback_list)
             for full_path in playback_list:
+                _maybe_exit_for_scheduled_time(next_exit_dt)
                 filename_ext = os.path.basename(full_path)
                 if full_path not in audio_data:
                     print(f"\nSkipping {filename_ext}: Missing analysis data.")
@@ -265,15 +417,67 @@ def main(target_mood_str, top_n, mp3_folder_path, tags_file_path, sample_file_na
                 try:
                     sound = pygame.mixer.Sound(full_path)
                     sound.set_volume(volume_scale)
+
+                    # If currently locked, wait — but honor exit policies
+                    if _mac_is_locked_poll():
+                        print("Screen is locked; pausing playback until unlock (or exit conditions)...")
+                        lock_since_wall = _wait_while_locked_or_exit(lock_since_wall, next_exit_dt)
+                        print("Unlocked — starting next MP3 in 10 seconds...")
+
                     sound.play()
+
+                    # Start tracking for progress bar
+                    __progress_start_ts = time.monotonic()
+                    __total_duration_sec = 0.0
+                    try:
+                        __total_duration_sec = float(sound.get_length())
+                    except Exception:
+                        __total_duration_sec = 0.0
+
+                    # While the sound is playing, break early if we lock
                     while pygame.mixer.get_busy():
+                        _maybe_exit_for_scheduled_time(next_exit_dt)
+
+                        # Update progress bar (15s ticks, single-line; no trailing newline)
+                        if __total_duration_sec > 0.0:
+                            __elapsed_sec = max(0.0, time.monotonic() - __progress_start_ts)
+                            __elapsed_sec = min(__elapsed_sec, __total_duration_sec)
+
+                            __segment_len = 10.0  # one tick per 15 seconds
+                            __total_segments = max(1, int(math.ceil(__total_duration_sec / __segment_len)))
+                            __filled_segments = min(__total_segments, int(__elapsed_sec // __segment_len))
+
+                            __bar = '[' + ('-' * __filled_segments) + (
+                                        ' ' * (__total_segments - __filled_segments)) + ']'
+
+                            __mm = int(__elapsed_sec // 60)
+                            __ss = int(__elapsed_sec % 60)
+                            __tmm = int(__total_duration_sec // 60)
+                            __tss = int(__total_duration_sec % 60)
+
+                            # \r = return to line start; \x1b[K clears to end-of-line so no artifacts remain
+                            sys.stdout.write(f'\r{__bar} {__mm}:{__ss:02d} / {__tmm}:{__tss:02d}\x1b[K')
+                            sys.stdout.flush()
+
+                        if _mac_is_locked_poll():
+                            print("Screen locked detected — stopping playback.")
+                            pygame.mixer.stop()
+                            lock_since_wall = _wait_while_locked_or_exit(lock_since_wall, next_exit_dt)
+                            print("Unlocked — starting next MP3 in 10 seconds...")
+                            break
+
                         for event in pygame.event.get():
                             if event.type == pygame.QUIT:
                                 print("\nQuit event detected. Stopping playback.")
                                 pygame.mixer.stop()
                                 raise SystemExit
+
                         pygame.time.Clock().tick(10)
-                    time.sleep(10)
+
+                    # Optional pacing between tracks (only if not locked)
+                    if not _mac_is_locked_poll():
+                        lock_since_wall = _sleep_with_exit_checks(10, next_exit_dt, lock_since_wall)
+
                 except pygame.error as e:
                     print(f"  Error playing {filename_ext}: {e}")
                     time.sleep(1)
@@ -290,9 +494,11 @@ def main(target_mood_str, top_n, mp3_folder_path, tags_file_path, sample_file_na
         pygame.quit()
         print("Done.")
 
+
 # --- Script Entry Point ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Find and play music files matching a specified mood with volume normalization.')
+    parser = argparse.ArgumentParser(
+        description='Find and play music files matching a specified mood with volume normalization.')
     parser.add_argument('-mood', '--mood', type=str, required=True,
                         help='Target mood description (e.g., "epic space battle", "calm ambient study").')
     parser.add_argument('-top', '--top', type=int, default=5,
@@ -318,7 +524,8 @@ if __name__ == "__main__":
         from tabulate import tabulate
     except ImportError as e:
         print(f"Error: Missing required Python package: {e.name}")
-        print("Please install required packages: pip install sentence-transformers scikit-learn pydub pygame tabulate torch")
+        print(
+            "Please install required packages: pip install sentence-transformers scikit-learn pydub pygame tabulate torch")
         print("Note: pydub requires FFmpeg/libav. Pygame might have OS dependencies.")
         sys.exit(1)
 

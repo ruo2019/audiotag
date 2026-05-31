@@ -1008,6 +1008,9 @@ class CursesTUI:
         self.playback_mode_toggle_request = False
         self.playback_mode_col_start = 0
         self.playback_mode_col_end = 0
+        self.current_play_once_toggle_request = False
+        self.current_mode_col_start = 0
+        self.current_mode_col_end = 0
 
     def __enter__(self):
         if not self.enable:
@@ -1137,7 +1140,7 @@ class CursesTUI:
             "Enter: add selected (Similar)",
             "Drag in Queue: reorder",
             "Ctrl+X: delete (Queue)",
-            "Click loop/once to toggle",
+            "Click current/queue loop/once to toggle",
             "Click [mode:manual/auto] to arm auto takeover",
             "Most: click [by:count/time] or Ctrl+T",
             "Ctrl+W: save queue (Playlists)",
@@ -1334,6 +1337,12 @@ class CursesTUI:
                     and self.playback_mode_col_start <= mx < self.playback_mode_col_end
                 ):
                     self.playback_mode_toggle_request = True
+                    return None
+                if (
+                    my == 1
+                    and self.current_mode_col_start <= mx < self.current_mode_col_end
+                ):
+                    self.current_play_once_toggle_request = True
                     return None
                 x, y, w, h = self.queue_bounds
                 if x <= mx < x + w and y + 1 <= my < y + h:
@@ -1560,6 +1569,7 @@ class CursesTUI:
         elapsed_sec: float,
         total_sec: float,
         playback_mode: str,
+        current_play_once: Optional[bool],
         counts: Dict[str, int],
         listen_hours_for_stem: Optional[Callable[[str, int], float]],
         similar_entries: Optional[List[Tuple[str, float]]],
@@ -1615,7 +1625,24 @@ class CursesTUI:
         self.playback_mode_col_end = chip_x + len(mode_chip)
         self._draw(0, 0, header)
         self._draw(0, chip_x, mode_chip)
-        self._draw(1, 2, f"Track: {now_playing or '(none)'}")
+        current_chip = ""
+        if now_playing and current_play_once is not None:
+            current_chip = f"[{'once' if current_play_once else 'loop'}]"
+            current_chip_x = max(0, w - len(current_chip) - 2)
+            self.current_mode_col_start = current_chip_x
+            self.current_mode_col_end = current_chip_x + len(current_chip)
+        else:
+            current_chip_x = 0
+            self.current_mode_col_start = 0
+            self.current_mode_col_end = 0
+
+        track_line = f"Track: {now_playing or '(none)'}"
+        if current_chip:
+            max_track_len = max(0, current_chip_x - 4)
+            track_line = track_line[:max_track_len]
+        self._draw(1, 2, track_line)
+        if current_chip:
+            self._draw(1, current_chip_x, current_chip)
 
         td = "N/A" if target_lufs is None else f"{target_lufs:.2f}"
         cd = "N/A" if current_lufs is None else f"{current_lufs:.2f}"
@@ -1652,6 +1679,13 @@ class CursesTUI:
 
         if table_height > 0:
             self._set_draw_target(self._table_win, table_top)
+
+            def display_play_once(item: Dict[str, object]) -> bool:
+                play_once = bool(item.get("play_once"))
+                if item.get("play_once_overridden"):
+                    return play_once
+                source = str(item.get("source") or "manual")
+                return play_once or (playback_mode == "auto" and source == "manual")
 
             def render_pane(
                 title: str, rows: List[str], x: int, y: int, width: int, height: int
@@ -1813,7 +1847,7 @@ class CursesTUI:
                 item = queue_items[order[i]]
                 path = item.get("path")
                 name = path.name if isinstance(path, Path) else "(unknown)"
-                mode = "once" if item.get("play_once") else "loop"
+                mode = "once" if display_play_once(item) else "loop"
                 if self.queue_drag_start is not None and order[i] == self.queue_drag_start:
                     sel = "D"
                 else:
@@ -2048,6 +2082,19 @@ def main(
     last_completed_track_name: Optional[str] = None
     playback_mode = str(playback_mode)
 
+    def item_effective_play_once(item: Dict[str, object]) -> bool:
+        play_once = bool(item.get("play_once"))
+        if item.get("play_once_overridden"):
+            return play_once
+        source = str(item.get("source") or "manual")
+        return play_once or (playback_mode == "auto" and source == "manual")
+
+    def set_item_effective_play_once(
+        item: Dict[str, object], play_once: bool
+    ) -> None:
+        item["play_once"] = bool(play_once)
+        item["play_once_overridden"] = True
+
     audio_data: Dict[Path, Dict[str, float | None]] = {}
     resolved_target_loudness: Optional[float] = None
     duration_by_stem: Dict[str, float] = {}
@@ -2075,7 +2122,7 @@ def main(
                 items.append(
                     {
                         "base": path.stem,
-                        "play_once": bool(current_playing_item.get("play_once", False)),
+                        "play_once": item_effective_play_once(current_playing_item),
                     }
                 )
         for item in queue:
@@ -2084,7 +2131,7 @@ def main(
                 items.append(
                     {
                         "base": path.stem,
-                        "play_once": bool(item.get("play_once", False)),
+                        "play_once": item_effective_play_once(item),
                     }
                 )
         playlists_db[name] = items
@@ -2113,6 +2160,7 @@ def main(
                     {
                         "path": p,
                         "play_once": bool(it.get("play_once", False)),
+                        "play_once_overridden": True,
                         "mood": f"playlist:{name}",
                         "source": "manual",
                     }
@@ -2159,7 +2207,13 @@ def main(
     def enqueue_tracks(tracks: List[Path], mood_text: Optional[str]) -> None:
         for p in tracks:
             queue.append(
-                {"path": p, "play_once": False, "mood": mood_text, "source": "manual"}
+                {
+                    "path": p,
+                    "play_once": False,
+                    "play_once_overridden": False,
+                    "mood": mood_text,
+                    "source": "manual",
+                }
             )
 
     def ensure_audio_data_for_tracks(paths: List[Path]) -> None:
@@ -2198,7 +2252,13 @@ def main(
             return False
         ensure_audio_data_for_tracks([track_path])
         queue.append(
-            {"path": track_path, "play_once": True, "mood": "auto", "source": "auto"}
+            {
+                "path": track_path,
+                "play_once": True,
+                "play_once_overridden": False,
+                "mood": "auto",
+                "source": "auto",
+            }
         )
         if tui and tui.enable:
             tui.status_msg = f"Auto-picked: {track_path.stem}"
@@ -2377,8 +2437,8 @@ def main(
                 click_x = tui.queue_click_x or 0
                 if 0 <= idx < len(queue):
                     if tui.queue_mode_col_start <= click_x < tui.queue_mode_col_end:
-                        cur = bool(queue[idx].get("play_once"))
-                        queue[idx]["play_once"] = not cur
+                        cur = item_effective_play_once(queue[idx])
+                        set_item_effective_play_once(queue[idx], not cur)
                         tui.status_msg = (
                             "Toggled play-once." if not cur else "Set to loop."
                         )
@@ -2439,7 +2499,14 @@ def main(
                 tui.status_msg = "Track not found on disk."
                 return
             ensure_audio_data_for_tracks([path])
-            queue.append({"path": path, "play_once": False, "mood": current_similar_mood})
+            queue.append(
+                {
+                    "path": path,
+                    "play_once": False,
+                    "play_once_overridden": False,
+                    "mood": current_similar_mood,
+                }
+            )
             queue[-1]["source"] = "manual"
             tui.status_msg = f"Added to queue: {base}"
 
@@ -2458,7 +2525,15 @@ def main(
                 tui.status_msg = "Track not found on disk."
                 return
             ensure_audio_data_for_tracks([path])
-            queue.append({"path": path, "play_once": False, "mood": "most", "source": "manual"})
+            queue.append(
+                {
+                    "path": path,
+                    "play_once": False,
+                    "play_once_overridden": False,
+                    "mood": "most",
+                    "source": "manual",
+                }
+            )
             tui.status_msg = f"Added to queue: {name}"
 
         def apply_most_sort_toggle() -> None:
@@ -2469,6 +2544,17 @@ def main(
             tui.most_selected = 0
             tui.most_scroll = 0
             tui.status_msg = f"Most sort: {tui.most_sort_mode}"
+
+        def apply_current_play_once_toggle() -> None:
+            if not tui.current_play_once_toggle_request:
+                return
+            tui.current_play_once_toggle_request = False
+            if not current_playing_item:
+                tui.status_msg = "No current track to toggle."
+                return
+            cur = item_effective_play_once(current_playing_item)
+            set_item_effective_play_once(current_playing_item, not cur)
+            tui.status_msg = "Toggled play-once." if not cur else "Set to loop."
 
         def handle_save_playlist_input(submitted: str) -> bool:
             if tui.input_mode != "save_playlist":
@@ -2507,6 +2593,7 @@ def main(
             if tui.playback_mode_toggle_request:
                 tui.playback_mode_toggle_request = False
                 toggle_playback_mode(tui)
+            apply_current_play_once_toggle()
             apply_most_sort_toggle()
             apply_queue_actions()
             apply_similar_actions()
@@ -2547,6 +2634,7 @@ def main(
                     elapsed_sec=max(0.0, seconds - max(0.0, end - time.monotonic())),
                     total_sec=seconds,
                     playback_mode=playback_mode,
+                    current_play_once=None,
                     counts=counts,
                     listen_hours_for_stem=listen_hours_for_stem,
                     similar_entries=current_similar_entries,
@@ -2601,6 +2689,7 @@ def main(
                         elapsed_sec=0.0,
                         total_sec=0.0,
                         playback_mode=playback_mode,
+                        current_play_once=None,
                         counts=counts,
                         listen_hours_for_stem=listen_hours_for_stem,
                         similar_entries=current_similar_entries,
@@ -2644,17 +2733,14 @@ def main(
                 current_item = queue.pop(0)
                 current_playing_item = current_item if isinstance(current_item, dict) else None
                 track_path = current_item.get("path") if isinstance(current_item, dict) else None
-                play_once = bool(current_item.get("play_once")) if isinstance(current_item, dict) else False
                 track_source = (
                     str(current_item.get("source"))
                     if isinstance(current_item, dict) and current_item.get("source")
                     else "manual"
                 )
-                effective_play_once = play_once or (
-                    playback_mode == "auto" and track_source == "manual"
-                )
 
                 if not isinstance(track_path, Path):
+                    current_playing_item = None
                     continue
 
                 # refresh queue selection bounds
@@ -2666,6 +2752,7 @@ def main(
                     maybe_exit(next_exit_dt)
 
                     if track_path not in audio_data:
+                        current_playing_item = None
                         break
 
                     filename_ext = track_path.name
@@ -2730,6 +2817,7 @@ def main(
                                     elapsed_sec=elapsed,
                                     total_sec=total_dur,
                                     playback_mode=playback_mode,
+                                    current_play_once=item_effective_play_once(current_item),
                                     counts=counts,
                                     listen_hours_for_stem=listen_hours_for_stem,
                                     similar_entries=current_similar_entries,
@@ -2831,7 +2919,10 @@ def main(
                                 break
 
                         # Requeue if looping
-                        if not effective_play_once and current_item is not skip_requeue_item:
+                        if (
+                            not item_effective_play_once(current_item)
+                            and current_item is not skip_requeue_item
+                        ):
                             queue.append(current_item)
                         if current_item is skip_requeue_item:
                             skip_requeue_item = None
@@ -2844,7 +2935,10 @@ def main(
                         else:
                             print(f"Error playing {filename_ext}: {e}")
                         time.sleep(1)
-                        if not effective_play_once and current_item is not skip_requeue_item:
+                        if (
+                            not item_effective_play_once(current_item)
+                            and current_item is not skip_requeue_item
+                        ):
                             queue.append(current_item)
                         if current_item is skip_requeue_item:
                             skip_requeue_item = None
@@ -2856,7 +2950,10 @@ def main(
                         else:
                             print(f"Unexpected error for {filename_ext}: {e}")
                         time.sleep(1)
-                        if not effective_play_once and current_item is not skip_requeue_item:
+                        if (
+                            not item_effective_play_once(current_item)
+                            and current_item is not skip_requeue_item
+                        ):
                             queue.append(current_item)
                         if current_item is skip_requeue_item:
                             skip_requeue_item = None

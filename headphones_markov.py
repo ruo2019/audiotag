@@ -934,8 +934,9 @@ class CursesTUI:
     CTRL_W = 23  # playlist save (alternate)
     CTRL_D = 4   # playlist delete
     CTRL_T = 20  # Most sort toggle
-    SCROLL_DEBOUNCE_SEC = 0.10
     RENDER_MIN_INTERVAL = 1.0 / 30.0
+    INPUT_DRAIN_LIMIT = 64
+    MAX_WHEEL_STEPS_PER_RENDER = 1
 
     def __init__(self, enable: bool = True):
         self.enable = enable
@@ -979,8 +980,16 @@ class CursesTUI:
         self.most_add = False
         self.most_sort_mode = "count"  # count | time
         self.most_toggle_request = False
-        self._last_scroll_ts = 0.0
         self._last_render_ts = 0.0
+        self._input_seen = False
+        self._windows_size: Optional[Tuple[int, int]] = None
+        self._header_win: Optional["curses._CursesWindow"] = None
+        self._table_win: Optional["curses._CursesWindow"] = None
+        self._status_win: Optional["curses._CursesWindow"] = None
+        self._input_win: Optional["curses._CursesWindow"] = None
+        self._draw_win: Optional["curses._CursesWindow"] = None
+        self._draw_base_y = 0
+        self._wheel_steps_this_render = 0
 
         self.last_h = 0
         self.last_w = 0
@@ -1038,11 +1047,58 @@ class CursesTUI:
         except Exception:
             pass
 
+    def _make_window(
+        self, height: int, width: int, y: int, x: int
+    ) -> Optional["curses._CursesWindow"]:
+        if height <= 0 or width <= 0:
+            return None
+        try:
+            win = curses.newwin(height, width, y, x)
+            win.nodelay(True)
+            try:
+                win.keypad(True)
+            except Exception:
+                pass
+            return win
+        except Exception:
+            return None
+
+    def _ensure_windows(
+        self,
+        h: int,
+        w: int,
+        table_top: int,
+        table_height: int,
+        status_y: int,
+        input_y: int,
+    ) -> None:
+        size = (h, w)
+        if self._windows_size == size:
+            return
+        self._windows_size = size
+        self._header_win = self._make_window(min(table_top, h), w, 0, 0)
+        self._table_win = self._make_window(table_height, w, table_top, 0)
+        self._status_win = self._make_window(1, w, status_y, 0)
+        self._input_win = self._make_window(3, w, input_y - 1, 0)
+        if self.stdscr:
+            try:
+                self.stdscr.erase()
+            except Exception:
+                pass
+
+    def _set_draw_target(
+        self, win: Optional["curses._CursesWindow"], base_y: int = 0
+    ) -> None:
+        self._draw_win = win
+        self._draw_base_y = base_y
+
     def _draw(self, y: int, x: int, s: str) -> None:
         if not self.enable or not self.stdscr:
             return
-        h, w = self.stdscr.getmaxyx()
-        if y < 0 or y >= h or x >= w:
+        win = self._draw_win or self.stdscr
+        local_y = y - self._draw_base_y
+        h, w = win.getmaxyx()
+        if local_y < 0 or local_y >= h or x >= w:
             return
 
         max_len = w - x
@@ -1052,18 +1108,64 @@ class CursesTUI:
             s = s[:max_len]
 
         try:
-            self.stdscr.addstr(y, x, s)
+            win.addstr(local_y, x, s)
         except Exception:
             pass
 
     def _hline(self, y: int, ch: str = "-") -> None:
         if not self.enable or not self.stdscr:
             return
-        h, w = self.stdscr.getmaxyx()
-        if y < 0 or y >= h:
+        win = self._draw_win or self.stdscr
+        local_y = y - self._draw_base_y
+        h, w = win.getmaxyx()
+        if local_y < 0 or local_y >= h:
             return
         try:
-            self.stdscr.hline(y, 0, ord(ch), max(0, w - 1))
+            win.hline(local_y, 0, ord(ch), max(0, w - 1))
+        except Exception:
+            pass
+
+    def _render_help_overlay(self, h: int, w: int) -> None:
+        help_lines = [
+            "Shortcuts",
+            "",
+            "Enter: submit mood",
+            "TAB: focus (Queue/Similar/Playlists/Most)",
+            "↑/↓ PgUp/PgDn: move in focused panel",
+            "→: skip track",
+            "Ctrl+G: stop",
+            "Enter: add selected (Similar)",
+            "Drag in Queue: reorder",
+            "Ctrl+X: delete (Queue)",
+            "Click loop/once to toggle",
+            "Click [mode:manual/auto] to arm auto takeover",
+            "Most: click [by:count/time] or Ctrl+T",
+            "Ctrl+W: save queue (Playlists)",
+            "Enter on Playlists: load selected",
+            "Ctrl+D: delete selected playlist",
+            "",
+            "Press Esc to close",
+        ]
+        max_line = max(len(line) for line in help_lines) if help_lines else 0
+        box_w = min(w - 4, max(30, max_line + 4))
+        box_h = min(h - 4, len(help_lines) + 4)
+        if box_w <= 0 or box_h <= 0:
+            return
+        box_x = max(0, (w - box_w) // 2)
+        box_y = max(0, (h - box_h) // 2)
+        try:
+            help_win = curses.newwin(box_h, box_w, box_y, box_x)
+            top = "╭" + ("─" * (box_w - 2)) + "╮"
+            mid = "│" + (" " * (box_w - 2)) + "│"
+            bot = "╰" + ("─" * (box_w - 2)) + "╯"
+            help_win.addstr(0, 0, top)
+            for i in range(1, box_h - 1):
+                help_win.addstr(i, 0, mid)
+            help_win.addstr(box_h - 1, 0, bot)
+            content_start = 2
+            for i, line in enumerate(help_lines[: box_h - 4]):
+                help_win.addstr(content_start + i, 2, line[: box_w - 4])
+            help_win.noutrefresh()
         except Exception:
             pass
 
@@ -1076,6 +1178,7 @@ class CursesTUI:
             key = -1
         if key == -1:
             return None
+        self._input_seen = True
 
         if self.show_help:
             if key == 27:  # Esc
@@ -1088,12 +1191,20 @@ class CursesTUI:
             except Exception:
                 return None
             # Mouse wheel scrolling
-            if bstate & getattr(curses, "BUTTON4_PRESSED", 0) or bstate & getattr(curses, "BUTTON5_PRESSED", 0):
-                now = time.monotonic()
-                if now - self._last_scroll_ts < self.SCROLL_DEBOUNCE_SEC:
+            wheel_up = 0
+            for name in ("BUTTON4_PRESSED", "BUTTON4_CLICKED", "BUTTON4_RELEASED"):
+                wheel_up |= getattr(curses, name, 0)
+            if wheel_up == 0:
+                wheel_up = 0x00080000
+            wheel_down = 0
+            for name in ("BUTTON5_PRESSED", "BUTTON5_CLICKED", "BUTTON5_RELEASED"):
+                wheel_down |= getattr(curses, name, 0)
+            wheel_down |= 0x00200000 | 0x08000000
+            if bstate & wheel_up or bstate & wheel_down:
+                direction = -1 if bstate & wheel_up else 1
+                if self._wheel_steps_this_render >= self.MAX_WHEEL_STEPS_PER_RENDER:
                     return None
-                self._last_scroll_ts = now
-                direction = -1 if bstate & getattr(curses, "BUTTON4_PRESSED", 0) else 1
+                self._wheel_steps_this_render += 1
                 # determine which panel is under the cursor
                 x, y, w, h = self.queue_bounds
                 if x <= mx < x + w and y + 1 <= my < y + h:
@@ -1321,10 +1432,6 @@ class CursesTUI:
         KEY_BTAB = getattr(curses, "KEY_BTAB", 353)
 
         if key == curses.KEY_UP:
-            now = time.monotonic()
-            if now - self._last_scroll_ts < self.SCROLL_DEBOUNCE_SEC:
-                return None
-            self._last_scroll_ts = now
             if self.focus_panel == "queue":
                 self.queue_selected = max(0, self.queue_selected - 1)
             elif self.focus_panel == "similar":
@@ -1336,10 +1443,6 @@ class CursesTUI:
                 if self.most_len:
                     self.most_selected = min(self.most_selected, self.most_len - 1)
         elif key == curses.KEY_DOWN:
-            now = time.monotonic()
-            if now - self._last_scroll_ts < self.SCROLL_DEBOUNCE_SEC:
-                return None
-            self._last_scroll_ts = now
             if self.focus_panel == "queue":
                 self.queue_selected = min(
                     max(0, self.queue_len - 1), self.queue_selected + 1
@@ -1357,10 +1460,6 @@ class CursesTUI:
                 if self.most_len:
                     self.most_selected = min(self.most_selected, self.most_len - 1)
         elif key == KEY_PGUP:
-            now = time.monotonic()
-            if now - self._last_scroll_ts < self.SCROLL_DEBOUNCE_SEC:
-                return None
-            self._last_scroll_ts = now
             page = max(1, self.last_h - 12)
             if self.focus_panel == "queue":
                 self.queue_selected = max(0, self.queue_selected - page)
@@ -1373,10 +1472,6 @@ class CursesTUI:
                 if self.most_len:
                     self.most_selected = min(self.most_selected, self.most_len - 1)
         elif key == KEY_PGDN:
-            now = time.monotonic()
-            if now - self._last_scroll_ts < self.SCROLL_DEBOUNCE_SEC:
-                return None
-            self._last_scroll_ts = now
             page = max(1, self.last_h - 12)
             if self.focus_panel == "queue":
                 self.queue_selected = min(
@@ -1440,6 +1535,21 @@ class CursesTUI:
                 self.input_buffer += chr(key)
         return None
 
+    def _handle_pending_keys(self) -> Tuple[Optional[str], bool]:
+        submitted: Optional[str] = None
+        saw_input = False
+        self._wheel_steps_this_render = 0
+        for _ in range(self.INPUT_DRAIN_LIMIT):
+            self._input_seen = False
+            text = self._handle_key()
+            if not self._input_seen:
+                break
+            saw_input = True
+            if text:
+                submitted = text
+                break
+        return submitted, saw_input
+
     def render(
         self,
         now_playing: str,
@@ -1465,19 +1575,39 @@ class CursesTUI:
         self.similar_len = len(similar_entries or [])
         playlists = playlists or []
         self.playlist_len = len(playlists)
-        submitted = self._handle_key()
+        submitted, saw_input = self._handle_pending_keys()
 
         now = time.monotonic()
-        if not self.show_help and (now - self._last_render_ts) < self.RENDER_MIN_INTERVAL:
+        if (
+            not saw_input
+            and not self.show_help
+            and (now - self._last_render_ts) < self.RENDER_MIN_INTERVAL
+        ):
             return submitted
         self._last_render_ts = now
 
-        self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
         self.last_h, self.last_w = h, w
         self.playback_mode = playback_mode
+        input_y = h - 2
+        status_y = h - 4
+        table_top = 8
+        table_height = max(0, status_y - table_top)
+        self._ensure_windows(h, w, table_top, table_height, status_y, input_y)
+        for win in (
+            self._header_win,
+            self._table_win,
+            self._status_win,
+            self._input_win,
+        ):
+            if win:
+                try:
+                    win.erase()
+                except Exception:
+                    pass
 
         # Header block (fixed)
+        self._set_draw_target(self._header_win, 0)
         header = " Now Playing ".center(w, " ")
         mode_chip = f"[mode:{playback_mode}]"
         chip_x = max(0, w - len(mode_chip) - 2)
@@ -1511,13 +1641,8 @@ class CursesTUI:
 
         self._hline(7, "-")
 
-        # Layout: table region ends above input separator
-        input_y = h - 2
-        status_y = h - 4
-        table_top = 8
-        table_height = max(0, status_y - table_top)
-
         # Status line
+        self._set_draw_target(self._status_win, status_y)
         status = ""
         if self.status_msg:
             status = self.status_msg
@@ -1526,6 +1651,8 @@ class CursesTUI:
             self._draw(status_y, right_x, status)
 
         if table_height > 0:
+            self._set_draw_target(self._table_win, table_top)
+
             def render_pane(
                 title: str, rows: List[str], x: int, y: int, width: int, height: int
             ) -> None:
@@ -1579,27 +1706,37 @@ class CursesTUI:
                 self.most_scroll = self.most_selected - m_content_h + 1
             self.most_scroll = min(max(0, self.most_scroll), m_max_scroll)
             m_rows: List[str] = []
+            m_visible_entries = most_entries[
+                self.most_scroll : min(
+                    len(most_entries), self.most_scroll + m_content_h
+                )
+            ]
+            most_hours_metric: Dict[str, float] = {}
             if listen_hours_for_stem is not None:
-                most_hours_metric = {
-                    name: float(listen_hours_for_stem(name, cnt))
-                    for name, cnt in most_entries
-                }
-            else:
-                most_hours_metric = {name: 0.0 for name, _ in most_entries}
+                for name, cnt in m_visible_entries:
+                    if self.most_sort_mode == "time":
+                        most_hours_metric[name] = most_time_metric.get(name, 0.0)
+                    else:
+                        most_hours_metric[name] = float(
+                            listen_hours_for_stem(name, cnt)
+                        )
             m_count_num_w = max(
                 1, max((len(str(cnt)) for _, cnt in most_entries), default=1)
             )
             m_time_tok_w = max(
                 1,
                 max(
-                    (len(f"({most_hours_metric.get(name, 0.0):.1f}h)") for name, _ in most_entries),
+                    (
+                        len(f"({most_hours_metric.get(name, 0.0):.1f}h)")
+                        for name, _ in m_visible_entries
+                    ),
                     default=len("(0.0h)"),
                 ),
             )
             m_count_w = m_count_num_w + 1 + m_time_tok_w
             m_name_w = max(1, left_w - (2 + 3 + 3 + m_count_w + 5))
-            for i in range(self.most_scroll, min(len(most_entries), self.most_scroll + m_content_h)):
-                name, cnt = most_entries[i]
+            for offset, (name, cnt) in enumerate(m_visible_entries):
+                i = self.most_scroll + offset
                 sel = ">" if self.focus_panel == "most" and i == self.most_selected else " "
                 hours = (
                     most_time_metric.get(name, 0.0)
@@ -1718,6 +1855,7 @@ class CursesTUI:
                 self._draw(sep2_y, right_x, "─" * right_w)
 
         # Input bar + footer
+        self._set_draw_target(self._input_win, input_y - 1)
         self._hline(input_y - 1, "-")
         prompt = "mood: " if self.input_mode == "mood" else "playlist name: "
         if not self.input_buffer and not now_playing and self.input_mode == "mood":
@@ -1733,50 +1871,22 @@ class CursesTUI:
             "Enter submit/load • TAB focus • Ctrl+S save • Ctrl+G stop • --help",
         )
 
-        if self.show_help:
-            help_lines = [
-                "Shortcuts",
-                "",
-                "Enter: submit mood",
-                "TAB: focus (Queue/Similar/Playlists/Most)",
-                "↑/↓ PgUp/PgDn: move in focused panel",
-                "→: skip track",
-                "Ctrl+G: stop",
-                "Enter: add selected (Similar)",
-                "Drag in Queue: reorder",
-                "Ctrl+X: delete (Queue)",
-                "Click loop/once to toggle",
-                "Click [mode:manual/auto] to arm auto takeover",
-                "Most: click [by:count/time] or Ctrl+T",
-                "Ctrl+W: save queue (Playlists)",
-                "Enter on Playlists: load selected",
-                "Ctrl+D: delete selected playlist",
-                "",
-                "Press Esc to close",
-            ]
-            max_line = max(len(line) for line in help_lines) if help_lines else 0
-            box_w = min(w - 4, max(30, max_line + 4))
-            box_h = min(h - 4, len(help_lines) + 4)
-            box_x = max(0, (w - box_w) // 2)
-            box_y = max(0, (h - box_h) // 2)
-            top = "╭" + ("─" * (box_w - 2)) + "╮"
-            mid = "│" + (" " * (box_w - 2)) + "│"
-            bot = "╰" + ("─" * (box_w - 2)) + "╯"
-            self._draw(box_y, box_x, top)
-            for i in range(1, box_h - 1):
-                self._draw(box_y + i, box_x, mid)
-            self._draw(box_y + box_h - 1, box_x, bot)
-            content_start = box_y + 2
-            for i, line in enumerate(help_lines[: box_h - 4]):
-                self._draw(content_start + i, box_x + 2, line[: box_w - 4])
-
         try:
-            # Force a full redraw to avoid blank screens when the terminal isn't repainting.
-            self.stdscr.touchwin()
-            self.stdscr.noutrefresh()
+            for win in (
+                self._header_win,
+                self._table_win,
+                self._status_win,
+                self._input_win,
+            ):
+                if win:
+                    win.noutrefresh()
+            if self.show_help:
+                self._render_help_overlay(h, w)
             curses.doupdate()
         except Exception:
             pass
+        finally:
+            self._set_draw_target(None, 0)
 
         if submitted:
             if submitted.strip() != "--help":

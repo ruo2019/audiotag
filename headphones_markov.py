@@ -942,7 +942,7 @@ class CursesTUI:
         self.enable = enable
         self.stdscr: Optional["curses._CursesWindow"] = None
 
-        self.focus_panel: str = "queue"  # queue | similar | playlists | most
+        self.focus_panel: str = "queue"  # queue | similar | playlists | most | tags
         self.queue_scroll = 0
         self.queue_selected = 0
         self.queue_len = 0
@@ -952,6 +952,9 @@ class CursesTUI:
         self.playlist_scroll = 0
         self.playlist_selected = 0
         self.playlist_len = 0
+        self.tag_scroll = 0
+        self.tag_selected = 0
+        self.tag_len = 0
         self.most_scroll = 0
         self.most_selected = 0
 
@@ -967,7 +970,10 @@ class CursesTUI:
         self.playlist_activate = False
         self.playlist_save_request = False
         self.playlist_delete_request = False
-        self.input_mode = "mood"  # mood | save_playlist
+        self.input_mode = "mood"  # mood | save_playlist | tag_add | tag_edit
+        self.tag_panel_open = False
+        self.tag_delete_request = False
+        self.tag_edit_request = False
         self.queue_click_row: Optional[int] = None
         self.queue_click_x: Optional[int] = None
         self.queue_drag_start: Optional[int] = None
@@ -1000,7 +1006,16 @@ class CursesTUI:
         self.queue_name_col_end = 0
         self.similar_bounds = (0, 0, 0, 0)  # x, y, w, h
         self.playlist_bounds = (0, 0, 0, 0)  # x, y, w, h
+        self.tag_bounds = (0, 0, 0, 0)  # x, y, w, h
         self.most_bounds = (0, 0, 0, 0)  # x, y, w, h
+        self.tag_chip_col_start = 0
+        self.tag_chip_col_end = 0
+        self.tag_edit_col_start = 0
+        self.tag_edit_col_end = 0
+        self.tag_delete_col_start = 0
+        self.tag_delete_col_end = 0
+        self.tag_close_col_start = 0
+        self.tag_close_col_end = 0
         self.most_len = 0
         self.most_sort_col_start = 0
         self.most_sort_col_end = 0
@@ -1142,6 +1157,8 @@ class CursesTUI:
             "Ctrl+X: delete (Queue)",
             "Click current/queue loop/once to toggle",
             "Click [mode:manual/auto] to arm auto takeover",
+            "Click [tags] to open current-track tags",
+            "Tags: click row, [edit], [delete], [close]",
             "Most: click [by:count/time] or Ctrl+T",
             "Ctrl+W: save queue (Playlists)",
             "Enter on Playlists: load selected",
@@ -1224,11 +1241,16 @@ class CursesTUI:
                             self.focus_panel = "playlists"
                             self.playlist_selected = max(0, min(self.playlist_len - 1, self.playlist_selected + direction))
                         else:
-                            mx0, my0, mw, mh = self.most_bounds
-                            if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
-                                self.focus_panel = "most"
-                                if self.most_len:
-                                    self.most_selected = max(0, min(self.most_len - 1, self.most_selected + direction))
+                            tx, ty, tw, th = self.tag_bounds
+                            if self.tag_panel_open and tx <= mx < tx + tw and ty + 2 <= my < ty + th:
+                                self.focus_panel = "tags"
+                                self.tag_selected = max(0, min(self.tag_len - 1, self.tag_selected + direction))
+                            else:
+                                mx0, my0, mw, mh = self.most_bounds
+                                if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
+                                    self.focus_panel = "most"
+                                    if self.most_len:
+                                        self.most_selected = max(0, min(self.most_len - 1, self.most_selected + direction))
                 return None
             # Live drag tracking (when terminal reports motion)
             if self.queue_drag_start is not None:
@@ -1274,47 +1296,68 @@ class CursesTUI:
                         self._last_click_row = self.similar_selected
                         self._last_click_ts = now
                     else:
-                        px, py, pw, ph = self.playlist_bounds
-                        if px <= mx < px + pw and py + 1 <= my < py + ph:
-                            row = my - (py + 1)
-                            self.focus_panel = "playlists"
-                            self.playlist_selected = min(
-                                max(0, self.playlist_len - 1),
-                                self.playlist_scroll + row,
-                            )
-                            now = time.monotonic()
-                            if (
-                                self._last_click_panel == "playlists"
-                                and self._last_click_row == self.playlist_selected
-                                and (now - self._last_click_ts) <= 0.35
-                            ):
-                                self.playlist_activate = True
-                            self._last_click_panel = "playlists"
-                            self._last_click_row = self.playlist_selected
-                            self._last_click_ts = now
+                        tx, ty, tw, th = self.tag_bounds
+                        if self.tag_panel_open and tx <= mx < tx + tw and ty <= my < ty + th:
+                            self.focus_panel = "tags"
+                            if my == ty:
+                                if self.tag_edit_col_start <= mx < self.tag_edit_col_end:
+                                    self.tag_edit_request = True
+                                elif self.tag_delete_col_start <= mx < self.tag_delete_col_end:
+                                    self.tag_delete_request = True
+                                elif self.tag_close_col_start <= mx < self.tag_close_col_end:
+                                    self.tag_panel_open = False
+                                    self.input_mode = "mood"
+                                    self.input_buffer = ""
+                                    self.focus_panel = "queue"
+                                return None
+                            row = my - (ty + 2)
+                            if row >= 0:
+                                self.tag_selected = min(
+                                    max(0, self.tag_len - 1),
+                                    self.tag_scroll + row,
+                                )
                         else:
-                            mx0, my0, mw, mh = self.most_bounds
-                            if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
-                                self.focus_panel = "most"
-                                if my == my0:
-                                    return None
-                                row = my - (my0 + 1)
-                                if row >= 0:
-                                    self.most_selected = min(
-                                        max(0, self.most_scroll + row),
-                                        max(0, self.most_len - 1),
-                                    )
-                                most_idx = self.most_selected
+                            px, py, pw, ph = self.playlist_bounds
+                            if px <= mx < px + pw and py + 1 <= my < py + ph:
+                                row = my - (py + 1)
+                                self.focus_panel = "playlists"
+                                self.playlist_selected = min(
+                                    max(0, self.playlist_len - 1),
+                                    self.playlist_scroll + row,
+                                )
                                 now = time.monotonic()
                                 if (
-                                    self._last_click_panel == "most"
-                                    and self._last_click_row == most_idx
+                                    self._last_click_panel == "playlists"
+                                    and self._last_click_row == self.playlist_selected
                                     and (now - self._last_click_ts) <= 0.35
                                 ):
-                                    self.most_add = True
-                                self._last_click_panel = "most"
-                                self._last_click_row = most_idx
+                                    self.playlist_activate = True
+                                self._last_click_panel = "playlists"
+                                self._last_click_row = self.playlist_selected
                                 self._last_click_ts = now
+                            else:
+                                mx0, my0, mw, mh = self.most_bounds
+                                if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
+                                    self.focus_panel = "most"
+                                    if my == my0:
+                                        return None
+                                    row = my - (my0 + 1)
+                                    if row >= 0:
+                                        self.most_selected = min(
+                                            max(0, self.most_scroll + row),
+                                            max(0, self.most_len - 1),
+                                        )
+                                    most_idx = self.most_selected
+                                    now = time.monotonic()
+                                    if (
+                                        self._last_click_panel == "most"
+                                        and self._last_click_row == most_idx
+                                        and (now - self._last_click_ts) <= 0.35
+                                    ):
+                                        self.most_add = True
+                                    self._last_click_panel = "most"
+                                    self._last_click_row = most_idx
+                                    self._last_click_ts = now
             elif bstate & curses.BUTTON1_RELEASED:
                 x, y, w, h = self.queue_bounds
                 if x <= mx < x + w and y + 1 <= my < y + h:
@@ -1337,6 +1380,16 @@ class CursesTUI:
                     and self.playback_mode_col_start <= mx < self.playback_mode_col_end
                 ):
                     self.playback_mode_toggle_request = True
+                    return None
+                if (
+                    my == 1
+                    and self.tag_chip_col_start <= mx < self.tag_chip_col_end
+                ):
+                    self.tag_panel_open = not self.tag_panel_open
+                    self.input_mode = "tag_add" if self.tag_panel_open else "mood"
+                    self.focus_panel = "tags" if self.tag_panel_open else "queue"
+                    self.input_buffer = ""
+                    self.status_msg = "Tags opened." if self.tag_panel_open else "Tags closed."
                     return None
                 if (
                     my == 1
@@ -1388,52 +1441,83 @@ class CursesTUI:
                         self._last_click_row = self.similar_selected
                         self._last_click_ts = now
                     else:
-                        px, py, pw, ph = self.playlist_bounds
-                        if px <= mx < px + pw and py + 1 <= my < py + ph:
-                            row = my - (py + 1)
-                            self.focus_panel = "playlists"
-                            self.playlist_selected = min(
-                                max(0, self.playlist_len - 1),
-                                self.playlist_scroll + row,
-                            )
-                            now = time.monotonic()
-                            if (
-                                self._last_click_panel == "playlists"
-                                and self._last_click_row == self.playlist_selected
-                                and (now - self._last_click_ts) <= 0.35
-                            ):
-                                self.playlist_activate = True
-                            self._last_click_panel = "playlists"
-                            self._last_click_row = self.playlist_selected
-                            self._last_click_ts = now
-                        else:
-                            mx0, my0, mw, mh = self.most_bounds
-                            if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
-                                self.focus_panel = "most"
-                                if (
-                                    my == my0
-                                    and self.most_sort_col_start <= mx < self.most_sort_col_end
-                                ):
-                                    self.most_toggle_request = True
-                                    return None
-                                row = my - (my0 + 1)
-                                if row >= 0:
-                                    self.most_selected = min(
-                                        max(0, self.most_scroll + row),
-                                        max(0, self.most_len - 1),
-                                    )
-                                # double click in Most to add to queue
-                                most_idx = self.most_selected
+                        tx, ty, tw, th = self.tag_bounds
+                        if self.tag_panel_open and tx <= mx < tx + tw and ty <= my < ty + th:
+                            self.focus_panel = "tags"
+                            if my == ty:
+                                if self.tag_edit_col_start <= mx < self.tag_edit_col_end:
+                                    self.tag_edit_request = True
+                                elif self.tag_delete_col_start <= mx < self.tag_delete_col_end:
+                                    self.tag_delete_request = True
+                                elif self.tag_close_col_start <= mx < self.tag_close_col_end:
+                                    self.tag_panel_open = False
+                                    self.input_mode = "mood"
+                                    self.input_buffer = ""
+                                    self.focus_panel = "queue"
+                                return None
+                            row = my - (ty + 2)
+                            if row >= 0:
+                                self.tag_selected = min(
+                                    max(0, self.tag_len - 1),
+                                    self.tag_scroll + row,
+                                )
                                 now = time.monotonic()
                                 if (
-                                    self._last_click_panel == "most"
-                                    and self._last_click_row == most_idx
+                                    self._last_click_panel == "tags"
+                                    and self._last_click_row == self.tag_selected
                                     and (now - self._last_click_ts) <= 0.35
                                 ):
-                                    self.most_add = True
-                                self._last_click_panel = "most"
-                                self._last_click_row = most_idx
+                                    self.tag_edit_request = True
+                                self._last_click_panel = "tags"
+                                self._last_click_row = self.tag_selected
                                 self._last_click_ts = now
+                        else:
+                            px, py, pw, ph = self.playlist_bounds
+                            if px <= mx < px + pw and py + 1 <= my < py + ph:
+                                row = my - (py + 1)
+                                self.focus_panel = "playlists"
+                                self.playlist_selected = min(
+                                    max(0, self.playlist_len - 1),
+                                    self.playlist_scroll + row,
+                                )
+                                now = time.monotonic()
+                                if (
+                                    self._last_click_panel == "playlists"
+                                    and self._last_click_row == self.playlist_selected
+                                    and (now - self._last_click_ts) <= 0.35
+                                ):
+                                    self.playlist_activate = True
+                                self._last_click_panel = "playlists"
+                                self._last_click_row = self.playlist_selected
+                                self._last_click_ts = now
+                            else:
+                                mx0, my0, mw, mh = self.most_bounds
+                                if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
+                                    self.focus_panel = "most"
+                                    if (
+                                        my == my0
+                                        and self.most_sort_col_start <= mx < self.most_sort_col_end
+                                    ):
+                                        self.most_toggle_request = True
+                                        return None
+                                    row = my - (my0 + 1)
+                                    if row >= 0:
+                                        self.most_selected = min(
+                                            max(0, self.most_scroll + row),
+                                            max(0, self.most_len - 1),
+                                        )
+                                    # double click in Most to add to queue
+                                    most_idx = self.most_selected
+                                    now = time.monotonic()
+                                    if (
+                                        self._last_click_panel == "most"
+                                        and self._last_click_row == most_idx
+                                        and (now - self._last_click_ts) <= 0.35
+                                    ):
+                                        self.most_add = True
+                                    self._last_click_panel = "most"
+                                    self._last_click_row = most_idx
+                                    self._last_click_ts = now
             return None
 
         KEY_PGUP = getattr(curses, "KEY_PPAGE", 339)
@@ -1447,6 +1531,8 @@ class CursesTUI:
                 self.similar_selected = max(0, self.similar_selected - 1)
             elif self.focus_panel == "playlists":
                 self.playlist_selected = max(0, self.playlist_selected - 1)
+            elif self.focus_panel == "tags":
+                self.tag_selected = max(0, self.tag_selected - 1)
             else:
                 self.most_selected = max(0, self.most_selected - 1)
                 if self.most_len:
@@ -1464,6 +1550,10 @@ class CursesTUI:
                 self.playlist_selected = min(
                     max(0, self.playlist_len - 1), self.playlist_selected + 1
                 )
+            elif self.focus_panel == "tags":
+                self.tag_selected = min(
+                    max(0, self.tag_len - 1), self.tag_selected + 1
+                )
             else:
                 self.most_selected += 1
                 if self.most_len:
@@ -1476,6 +1566,8 @@ class CursesTUI:
                 self.similar_selected = max(0, self.similar_selected - page)
             elif self.focus_panel == "playlists":
                 self.playlist_selected = max(0, self.playlist_selected - page)
+            elif self.focus_panel == "tags":
+                self.tag_selected = max(0, self.tag_selected - page)
             else:
                 self.most_selected = max(0, self.most_selected - page)
                 if self.most_len:
@@ -1497,12 +1589,19 @@ class CursesTUI:
                     max(0, self.playlist_len - 1),
                     self.playlist_selected + page,
                 )
+            elif self.focus_panel == "tags":
+                self.tag_selected = min(
+                    max(0, self.tag_len - 1),
+                    self.tag_selected + page,
+                )
             else:
                 self.most_selected += page
                 if self.most_len:
                     self.most_selected = min(self.most_selected, self.most_len - 1)
         elif key in (self.KEY_TAB, KEY_BTAB):
-            order = ["queue", "similar", "playlists", "most"]
+            order = ["queue", "similar"]
+            order.append("tags" if self.tag_panel_open else "playlists")
+            order.append("most")
             try:
                 idx = order.index(self.focus_panel)
             except ValueError:
@@ -1520,6 +1619,8 @@ class CursesTUI:
             self.status_msg = "Stopped. Waiting for mood..."
         elif key == self.CTRL_X and self.focus_panel == "queue":
             self.queue_delete = True
+        elif key == self.CTRL_X and self.focus_panel == "tags":
+            self.tag_delete_request = True
         elif key in (self.CTRL_S, self.CTRL_W) and self.focus_panel == "playlists":
             self.playlist_save_request = True
         elif key == self.CTRL_D and self.focus_panel == "playlists":
@@ -1534,6 +1635,9 @@ class CursesTUI:
                 return None
             if not self.input_buffer and self.focus_panel == "similar":
                 self.similar_add = True
+                return None
+            if not self.input_buffer and self.focus_panel == "tags":
+                self.tag_edit_request = True
                 return None
             text = self.input_buffer.strip()
             if text:
@@ -1576,6 +1680,8 @@ class CursesTUI:
         similar_mood: Optional[str],
         queue_items: Optional[List[Dict[str, object]]],
         playlists: Optional[List[Tuple[str, int]]],
+        current_tags: Optional[List[str]] = None,
+        pending_tags: Optional[List[str]] = None,
     ) -> Optional[str]:
         if not self.enable or not self.stdscr:
             return None
@@ -1626,21 +1732,31 @@ class CursesTUI:
         self._draw(0, 0, header)
         self._draw(0, chip_x, mode_chip)
         current_chip = ""
+        tag_chip = ""
         if now_playing and current_play_once is not None:
             current_chip = f"[{'once' if current_play_once else 'loop'}]"
             current_chip_x = max(0, w - len(current_chip) - 2)
             self.current_mode_col_start = current_chip_x
             self.current_mode_col_end = current_chip_x + len(current_chip)
+            tag_chip = "[tags]" if not self.tag_panel_open else "[tags*]"
+            tag_chip_x = max(0, current_chip_x - len(tag_chip) - 1)
+            self.tag_chip_col_start = tag_chip_x
+            self.tag_chip_col_end = tag_chip_x + len(tag_chip)
         else:
             current_chip_x = 0
+            tag_chip_x = 0
             self.current_mode_col_start = 0
             self.current_mode_col_end = 0
+            self.tag_chip_col_start = 0
+            self.tag_chip_col_end = 0
 
         track_line = f"Track: {now_playing or '(none)'}"
-        if current_chip:
-            max_track_len = max(0, current_chip_x - 4)
+        if current_chip or tag_chip:
+            max_track_len = max(0, (tag_chip_x or current_chip_x) - 4)
             track_line = track_line[:max_track_len]
         self._draw(1, 2, track_line)
+        if tag_chip:
+            self._draw(1, tag_chip_x, tag_chip)
         if current_chip:
             self._draw(1, current_chip_x, current_chip)
 
@@ -1858,26 +1974,71 @@ class CursesTUI:
             render_pane(q_title.ljust(right_w), q_rows, right_x, mid_y, right_w, mid_h)
             self.queue_bounds = (right_x, mid_y, right_w, mid_h)
 
-            # Playlists (right bottom)
-            if self.playlist_selected >= len(playlists):
-                self.playlist_selected = max(0, len(playlists) - 1)
-            p_content_h = max(0, bot_h - 1)
-            p_max_scroll = max(0, len(playlists) - p_content_h)
-            if self.playlist_selected < self.playlist_scroll:
-                self.playlist_scroll = self.playlist_selected
-            if self.playlist_selected >= self.playlist_scroll + p_content_h:
-                self.playlist_scroll = self.playlist_selected - p_content_h + 1
-            self.playlist_scroll = min(self.playlist_scroll, p_max_scroll)
-            p_rows: List[str] = []
-            p_name_w = max(1, right_w - (2 + 3 + 3 + 4 + 5))
-            for i in range(self.playlist_scroll, min(len(playlists), self.playlist_scroll + p_content_h)):
-                name, count = playlists[i]
-                sel = ">" if i == self.playlist_selected and self.focus_panel == "playlists" else " "
-                name = str(name)[:p_name_w].ljust(p_name_w)
-                p_rows.append(f"{sel} {i+1:>3} | {name}| {count:>4}  ")
-            p_title = "[Playlists]" if self.focus_panel == "playlists" else " Playlists "
-            render_pane(p_title.ljust(right_w), p_rows, right_x, bot_y, right_w, bot_h)
-            self.playlist_bounds = (right_x, bot_y, right_w, bot_h)
+            # Playlists / Tags (right bottom)
+            if self.tag_panel_open:
+                tag_rows_data = [("saved", str(tag)) for tag in (current_tags or [])]
+                tag_rows_data.extend(("pending", str(tag)) for tag in (pending_tags or []))
+                self.tag_len = len(tag_rows_data)
+                if self.tag_selected >= self.tag_len:
+                    self.tag_selected = max(0, self.tag_len - 1)
+                t_content_h = max(0, bot_h - 2)
+                t_max_scroll = max(0, self.tag_len - t_content_h)
+                if self.tag_selected < self.tag_scroll:
+                    self.tag_scroll = self.tag_selected
+                if self.tag_selected >= self.tag_scroll + t_content_h:
+                    self.tag_scroll = self.tag_selected - t_content_h + 1
+                self.tag_scroll = min(self.tag_scroll, t_max_scroll)
+
+                mode_label = "edit" if self.input_mode == "tag_edit" else "add"
+                t_rows = [f"{mode_label}: {self.input_buffer}"[:right_w]]
+                t_name_w = max(1, right_w - 8)
+                for i in range(self.tag_scroll, min(self.tag_len, self.tag_scroll + t_content_h)):
+                    kind, tag = tag_rows_data[i]
+                    sel = ">" if i == self.tag_selected and self.focus_panel == "tags" else " "
+                    mark = "+" if kind == "pending" else " "
+                    t_rows.append(f"{sel} {mark} {tag[:t_name_w]}")
+                if not tag_rows_data:
+                    t_rows.append("  (no tags)")
+
+                t_focus = "[Tags]" if self.focus_panel == "tags" else " Tags "
+                edit_chip = "[edit]"
+                delete_chip = "[delete]"
+                close_chip = "[close]"
+                t_title = f"{t_focus} {edit_chip} {delete_chip} {close_chip}"
+                edit_idx = t_title.find(edit_chip)
+                delete_idx = t_title.find(delete_chip)
+                close_idx = t_title.find(close_chip)
+                self.tag_edit_col_start = right_x + edit_idx if edit_idx >= 0 else 0
+                self.tag_edit_col_end = self.tag_edit_col_start + len(edit_chip)
+                self.tag_delete_col_start = right_x + delete_idx if delete_idx >= 0 else 0
+                self.tag_delete_col_end = self.tag_delete_col_start + len(delete_chip)
+                self.tag_close_col_start = right_x + close_idx if close_idx >= 0 else 0
+                self.tag_close_col_end = self.tag_close_col_start + len(close_chip)
+                render_pane(t_title.ljust(right_w), t_rows, right_x, bot_y, right_w, bot_h)
+                self.tag_bounds = (right_x, bot_y, right_w, bot_h)
+                self.playlist_bounds = (0, 0, 0, 0)
+            else:
+                self.tag_len = 0
+                self.tag_bounds = (0, 0, 0, 0)
+                if self.playlist_selected >= len(playlists):
+                    self.playlist_selected = max(0, len(playlists) - 1)
+                p_content_h = max(0, bot_h - 1)
+                p_max_scroll = max(0, len(playlists) - p_content_h)
+                if self.playlist_selected < self.playlist_scroll:
+                    self.playlist_scroll = self.playlist_selected
+                if self.playlist_selected >= self.playlist_scroll + p_content_h:
+                    self.playlist_scroll = self.playlist_selected - p_content_h + 1
+                self.playlist_scroll = min(self.playlist_scroll, p_max_scroll)
+                p_rows: List[str] = []
+                p_name_w = max(1, right_w - (2 + 3 + 3 + 4 + 5))
+                for i in range(self.playlist_scroll, min(len(playlists), self.playlist_scroll + p_content_h)):
+                    name, count = playlists[i]
+                    sel = ">" if i == self.playlist_selected and self.focus_panel == "playlists" else " "
+                    name = str(name)[:p_name_w].ljust(p_name_w)
+                    p_rows.append(f"{sel} {i+1:>3} | {name}| {count:>4}  ")
+                p_title = "[Playlists]" if self.focus_panel == "playlists" else " Playlists "
+                render_pane(p_title.ljust(right_w), p_rows, right_x, bot_y, right_w, bot_h)
+                self.playlist_bounds = (right_x, bot_y, right_w, bot_h)
 
             # Separator between left/right
             for i in range(table_height):
@@ -1890,19 +2051,28 @@ class CursesTUI:
 
         # Input bar + footer
         self._set_draw_target(self._input_win, input_y - 1)
-        self._hline(input_y - 1, "-")
-        prompt = "mood: " if self.input_mode == "mood" else "playlist name: "
+        if self.input_mode == "save_playlist":
+            self._hline(input_y - 1, "-")
+            prompt = "playlist name: "
+        elif self.input_mode in ("tag_add", "tag_edit"):
+            self._hline(input_y - 1, "-")
+            prompt = ""
+        else:
+            self._hline(input_y - 1, "-")
+            prompt = "mood: "
         if not self.input_buffer and not now_playing and self.input_mode == "mood":
             self._draw(
                 input_y, 2, prompt + "(type a mood + Enter; optional: (top N) / top=N)"
             )
+        elif self.input_mode in ("tag_add", "tag_edit"):
+            self._draw(input_y, 2, "Tags panel: type in panel, click edit/delete/close")
         else:
             self._draw(input_y, 2, prompt + self.input_buffer)
 
         self._draw(
             h - 1,
             2,
-            "Enter submit/load • TAB focus • Ctrl+S save • Ctrl+G stop • --help",
+            "Click [tags] • Enter submit/load • TAB focus • Ctrl+S save • Ctrl+G stop • --help",
         )
 
         try:
@@ -1997,14 +2167,181 @@ def init_pygame(device_name: Optional[str] = None) -> None:
 
 def load_tags(tags_file: Path) -> Dict[str, List[str]]:
     if not tags_file.exists():
-        raise FileNotFoundError(f"Tags file not found: {tags_file}")
+        return {}
     data = safe_read_json(tags_file, {})
-    if not isinstance(data, dict) or not data:
-        raise ValueError(f"Tags data file '{tags_file}' is empty or invalid.")
+    if not isinstance(data, dict):
+        return {}
     out: Dict[str, List[str]] = {}
     for k, v in data.items():
         out[str(k)] = [str(t) for t in v] if isinstance(v, list) else [str(v)]
     return out
+
+
+def save_tags(tags_file: Path, tags_data: Dict[str, List[str]]) -> None:
+    atomic_write_json(tags_file, tags_data)
+
+
+def add_tags_for_track(
+    tags_data: Dict[str, List[str]], track_stem: str, new_tags: Iterable[str]
+) -> int:
+    existing = [str(t).strip() for t in tags_data.get(track_stem, []) if str(t).strip()]
+    seen = {t.casefold() for t in existing}
+    added = 0
+    for raw in new_tags:
+        tag = str(raw).strip()
+        if not tag:
+            continue
+        key = tag.casefold()
+        if key in seen:
+            continue
+        existing.append(tag)
+        seen.add(key)
+        added += 1
+    tags_data[track_stem] = existing
+    return added
+
+
+class TrackTagSession:
+    def __init__(self, tags_file: Path, tags_data: Dict[str, List[str]]):
+        self.tags_file = tags_file
+        self.tags_data = tags_data
+        self.track_path: Optional[Path] = None
+        self.pending: List[str] = []
+        self.editing_ref: Optional[Tuple[str, int]] = None
+
+    def start(self, track_path: Path) -> None:
+        self.track_path = track_path
+        self.pending = []
+
+    def abandon(self) -> None:
+        self.track_path = None
+        self.pending = []
+        self.editing_ref = None
+
+    def existing_tags(self) -> List[str]:
+        if self.track_path is None:
+            return []
+        return list(self.tags_data.get(self.track_path.stem, []) or [])
+
+    def pending_tags(self) -> List[str]:
+        return list(self.pending)
+
+    def submit(self, raw_tag: str) -> str:
+        if self.editing_ref is not None:
+            return self.apply_edit(raw_tag)
+        return self.add(raw_tag)
+
+    def add(self, raw_tag: str) -> str:
+        tag = raw_tag.strip()
+        if not tag:
+            return ""
+        if self.track_path is None:
+            return "No current track to tag."
+        if self._has_tag(tag) or self._has_pending(tag):
+            return f"Tag already exists: {tag}"
+        self.pending.append(tag)
+        return f"Queued tag for {self.track_path.stem}: {tag}"
+
+    def begin_edit(self, row_index: int) -> Tuple[str, str]:
+        ref = self._ref_for_row(row_index)
+        if ref is None:
+            return "", "No tag selected."
+        kind, idx = ref
+        self.editing_ref = ref
+        tags = self.existing_tags() if kind == "saved" else self.pending
+        return tags[idx], "Editing tag."
+
+    def apply_edit(self, raw_tag: str) -> str:
+        tag = raw_tag.strip()
+        ref = self.editing_ref
+        self.editing_ref = None
+        if not tag:
+            return "Edit cancelled."
+        if self.track_path is None or ref is None:
+            return "No current track to tag."
+        if self._has_tag(tag, exclude=ref) or self._has_pending(tag, exclude=ref):
+            return f"Tag already exists: {tag}"
+        kind, idx = ref
+        if kind == "saved":
+            existing = self.existing_tags()
+            if not 0 <= idx < len(existing):
+                return "Tag no longer exists."
+            existing[idx] = tag
+            self.tags_data[self.track_path.stem] = existing
+            save_tags(self.tags_file, self.tags_data)
+            return f"Updated tag: {tag}"
+        if not 0 <= idx < len(self.pending):
+            return "Tag no longer exists."
+        self.pending[idx] = tag
+        return f"Updated queued tag: {tag}"
+
+    def delete(self, row_index: int) -> str:
+        ref = self._ref_for_row(row_index)
+        if self.track_path is None or ref is None:
+            return "No tag selected."
+        if self.editing_ref == ref:
+            self.editing_ref = None
+        kind, idx = ref
+        if kind == "saved":
+            existing = self.existing_tags()
+            if not 0 <= idx < len(existing):
+                return "Tag no longer exists."
+            removed = existing.pop(idx)
+            self.tags_data[self.track_path.stem] = existing
+            save_tags(self.tags_file, self.tags_data)
+            return f"Deleted tag: {removed}"
+        if not 0 <= idx < len(self.pending):
+            return "Tag no longer exists."
+        removed = self.pending.pop(idx)
+        return f"Deleted queued tag: {removed}"
+
+    def finish(self, trailing_tag: str = "") -> int:
+        if trailing_tag.strip():
+            self.submit(trailing_tag)
+        if self.track_path is None or not self.pending:
+            self.abandon()
+            return 0
+        added = add_tags_for_track(self.tags_data, self.track_path.stem, self.pending)
+        if added:
+            save_tags(self.tags_file, self.tags_data)
+        self.abandon()
+        return added
+
+    def _has_tag(
+        self, tag: str, exclude: Optional[Tuple[str, int]] = None
+    ) -> bool:
+        key = tag.casefold()
+        for idx, existing in enumerate(self.existing_tags()):
+            if exclude == ("saved", idx):
+                continue
+            if existing.casefold() == key:
+                return True
+        return False
+
+    def _has_pending(
+        self, tag: str, exclude: Optional[Tuple[str, int]] = None
+    ) -> bool:
+        key = tag.casefold()
+        for idx, pending in enumerate(self.pending):
+            if exclude == ("pending", idx):
+                continue
+            if pending.casefold() == key:
+                return True
+        return False
+
+    def _append_unique_pending(self, raw_tag: str) -> None:
+        tag = raw_tag.strip()
+        if tag and not self._has_tag(tag) and not self._has_pending(tag):
+            self.pending.append(tag)
+
+    def _ref_for_row(self, row_index: int) -> Optional[Tuple[str, int]]:
+        existing_len = len(self.existing_tags())
+        if 0 <= row_index < existing_len:
+            return ("saved", row_index)
+        pending_idx = row_index - existing_len
+        if 0 <= pending_idx < len(self.pending):
+            return ("pending", pending_idx)
+        return None
 
 
 def main(
@@ -2073,6 +2410,7 @@ def main(
     loud_cache = load_loudness_cache(mp3_folder)
     playlists_filename = f"queue_playlists_{mp3_folder.name or 'default'}.json"
     playlists_db = load_playlists(playlists_filename)
+    tag_session = TrackTagSession(tags_file, tags_data)
 
     current_similar_entries: Optional[List[Tuple[str, float]]] = None
     current_similar_mood: Optional[str] = None
@@ -2382,10 +2720,40 @@ def main(
     def reset_to_idle(tui: Optional[CursesTUI]) -> None:
         nonlocal current_similar_entries, current_similar_mood, queue
         queue = []
+        tag_session.abandon()
         if tui and tui.enable:
             tui.focus_panel = "queue"
             tui.input_mode = "mood"
             tui.status_msg = "Stopped. Waiting for mood..."
+
+    def handle_tag_submission(submitted: str, tui: CursesTUI) -> bool:
+        if tui.input_mode not in ("tag_add", "tag_edit"):
+            return False
+        if tui.input_mode == "tag_add":
+            tag_session.editing_ref = None
+        msg = tag_session.submit(submitted)
+        if msg:
+            tui.status_msg = msg
+        tui.input_mode = "tag_add"
+        return True
+
+    def apply_tag_actions() -> None:
+        if tui.tag_delete_request:
+            tui.tag_delete_request = False
+            tui.status_msg = tag_session.delete(tui.tag_selected)
+            tui.input_mode = "tag_add"
+            tui.input_buffer = ""
+            if tui.tag_selected >= tui.tag_len - 1:
+                tui.tag_selected = max(0, tui.tag_len - 2)
+        if tui.tag_edit_request:
+            tui.tag_edit_request = False
+            text, msg = tag_session.begin_edit(tui.tag_selected)
+            tui.status_msg = msg
+            if text:
+                tui.tag_panel_open = True
+                tui.focus_panel = "tags"
+                tui.input_mode = "tag_edit"
+                tui.input_buffer = text
 
     # Seed
     if initial_mood:
@@ -2598,6 +2966,7 @@ def main(
             apply_queue_actions()
             apply_similar_actions()
             apply_most_actions()
+            apply_tag_actions()
             handle_playlist_requests()
 
         def pause_silence(seconds: float) -> tuple[bool, float | None]:
@@ -2644,6 +3013,8 @@ def main(
                 )
                 if submitted:
                     if handle_save_playlist_input(submitted):
+                        continue
+                    if handle_tag_submission(submitted, tui):
                         continue
                     apply_submission(submitted, tui)
                 handle_common_actions()
@@ -2705,6 +3076,9 @@ def main(
                         if handle_save_playlist_input(submitted):
                             time.sleep(0.01)
                             continue
+                        if handle_tag_submission(submitted, tui):
+                            time.sleep(0.01)
+                            continue
                         mood_text, new_top, new_vol = parse_mood_and_directives(
                             submitted
                         )
@@ -2742,6 +3116,9 @@ def main(
                 if not isinstance(track_path, Path):
                     current_playing_item = None
                     continue
+                tag_session.start(track_path)
+                if enable_tui and tui.input_mode in ("tag_add", "tag_edit"):
+                    tui.input_buffer = ""
 
                 # refresh queue selection bounds
                 if tui.queue_selected >= len(queue):
@@ -2752,6 +3129,7 @@ def main(
                     maybe_exit(next_exit_dt)
 
                     if track_path not in audio_data:
+                        tag_session.abandon()
                         current_playing_item = None
                         break
 
@@ -2824,9 +3202,15 @@ def main(
                                     similar_mood=current_similar_mood,
                                     queue_items=queue,
                                     playlists=get_playlists_list(),
+                                    current_tags=tag_session.existing_tags(),
+                                    pending_tags=tag_session.pending_tags(),
                                 )
                                 if submitted:
-                                    if not handle_save_playlist_input(submitted):
+                                    if handle_save_playlist_input(submitted):
+                                        pass
+                                    elif handle_tag_submission(submitted, tui):
+                                        pass
+                                    else:
                                         apply_submission(
                                             submitted, tui, track_path, channel
                                         )
@@ -2891,6 +3275,14 @@ def main(
 
                         if reached_end:
                             last_completed_track_name = track_path.name
+                            trailing_tag = (
+                                tui.input_buffer.strip()
+                                if enable_tui and tui.input_mode in ("tag_add", "tag_edit")
+                                else ""
+                            )
+                            saved_tags = tag_session.finish(trailing_tag)
+                            if trailing_tag and enable_tui and tui.input_mode in ("tag_add", "tag_edit"):
+                                tui.input_buffer = ""
                             if track_source == "manual":
                                 increment_listen(track_path, counts)
                                 save_listen_counts(counts, listen_db_filename)
@@ -2899,10 +3291,15 @@ def main(
                                     listen_timestamps, listen_timestamps_filename
                                 )
                                 if tui and tui.enable:
-                                    tui.status_msg = (
+                                    listen_msg = (
                                         f"Recorded listen: {track_path.stem} "
                                         f"({counts.get(track_path.stem, 0)})"
                                     )
+                                    if saved_tags:
+                                        listen_msg += f"; saved {saved_tags} tag(s)"
+                                    tui.status_msg = listen_msg
+                        else:
+                            tag_session.abandon()
 
                         if user_stop:
                             reset_to_idle(tui)
@@ -2930,6 +3327,7 @@ def main(
                         break
 
                     except pygame.error as e:
+                        tag_session.abandon()
                         if enable_tui:
                             tui.status_msg = f"Error playing {filename_ext}: {e}"
                         else:
@@ -2945,6 +3343,7 @@ def main(
                         current_playing_item = None
                         break
                     except Exception as e:
+                        tag_session.abandon()
                         if enable_tui:
                             tui.status_msg = f"Unexpected error: {e}"
                         else:

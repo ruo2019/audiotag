@@ -262,8 +262,7 @@ def load_playlists(db_filename: str) -> Dict[str, List[dict]]:
                     "play_once": bool(item.get("play_once", False)),
                 }
             )
-        if clean:
-            out[str(name)] = clean
+        out[str(name)] = clean
     return out
 
 
@@ -937,6 +936,7 @@ class CursesTUI:
     RENDER_MIN_INTERVAL = 1.0 / 30.0
     INPUT_DRAIN_LIMIT = 64
     MAX_WHEEL_STEPS_PER_RENDER = 1
+    DOUBLE_CLICK_SECONDS = 0.35
 
     def __init__(self, enable: bool = True):
         self.enable = enable
@@ -952,6 +952,9 @@ class CursesTUI:
         self.playlist_scroll = 0
         self.playlist_selected = 0
         self.playlist_len = 0
+        self.playlist_track_scroll = 0
+        self.playlist_track_selected = 0
+        self.playlist_track_len = 0
         self.tag_scroll = 0
         self.tag_selected = 0
         self.tag_len = 0
@@ -968,8 +971,22 @@ class CursesTUI:
         self.similar_add = False
         self.show_help = False
         self.playlist_activate = False
+        self.playlist_open_pending_idx: Optional[int] = None
+        self.playlist_open_pending_ts = 0.0
+        self.playlist_done_request = False
+        self.playlist_load_request = False
         self.playlist_save_request = False
         self.playlist_delete_request = False
+        self.playlist_editor_open = False
+        self.playlist_add_current_request = False
+        self.playlist_add_queue_request = False
+        self.playlist_add_similar_request = False
+        self.playlist_add_most_request = False
+        self.playlist_item_remove_request: Optional[int] = None
+        self.playlist_item_drag_start: Optional[int] = None
+        self.playlist_item_drag_target: Optional[int] = None
+        self.playlist_item_drag_commit_target: Optional[int] = None
+        self.playlist_item_drag_commit_start: Optional[int] = None
         self.input_mode = "mood"  # mood | save_playlist | tag_add | tag_edit
         self.tag_panel_open = False
         self.tag_delete_request = False
@@ -980,6 +997,7 @@ class CursesTUI:
         self.queue_drag_target: Optional[int] = None
         self.queue_drag_commit_target: Optional[int] = None
         self.queue_drag_commit_start: Optional[int] = None
+        self.queue_drag_started_selected = False
         self._last_click_ts = 0.0
         self._last_click_panel: Optional[str] = None
         self._last_click_row: Optional[int] = None
@@ -1004,12 +1022,24 @@ class CursesTUI:
         self.queue_mode_col_end = 0
         self.queue_name_col_start = 0
         self.queue_name_col_end = 0
+        self.queue_add_col_start = 0
+        self.queue_add_col_end = 0
         self.similar_bounds = (0, 0, 0, 0)  # x, y, w, h
+        self.similar_add_col_start = 0
+        self.similar_add_col_end = 0
         self.playlist_bounds = (0, 0, 0, 0)  # x, y, w, h
+        self.playlist_load_col_start = 0
+        self.playlist_load_col_end = 0
+        self.playlist_done_col_start = 0
+        self.playlist_done_col_end = 0
         self.tag_bounds = (0, 0, 0, 0)  # x, y, w, h
         self.most_bounds = (0, 0, 0, 0)  # x, y, w, h
+        self.most_add_col_start = 0
+        self.most_add_col_end = 0
         self.tag_chip_col_start = 0
         self.tag_chip_col_end = 0
+        self.current_add_col_start = 0
+        self.current_add_col_end = 0
         self.tag_edit_col_start = 0
         self.tag_edit_col_end = 0
         self.tag_delete_col_start = 0
@@ -1160,6 +1190,8 @@ class CursesTUI:
             "Click [tags] to open current-track tags",
             "Tags: click row, [edit], [delete], [close]",
             "Most: click [by:count/time] or Ctrl+T",
+            "Playlists: click to edit, double-click to load; [add] adds tracks",
+            "Playlist edit: drag reorder, double-click track to remove, [load]/[done]",
             "Ctrl+W: save queue (Playlists)",
             "Enter on Playlists: load selected",
             "Ctrl+D: delete selected playlist",
@@ -1188,6 +1220,105 @@ class CursesTUI:
             help_win.noutrefresh()
         except Exception:
             pass
+
+    def _handle_playlist_row_click(self, row: int) -> None:
+        idx = self.playlist_scroll + row
+        if idx < 0 or idx >= self.playlist_len:
+            return
+        self.focus_panel = "playlists"
+        self.playlist_selected = idx
+        now = time.monotonic()
+        if (
+            self._last_click_panel == "playlists"
+            and self._last_click_row == self.playlist_selected
+            and (now - self._last_click_ts) <= self.DOUBLE_CLICK_SECONDS
+        ):
+            self.playlist_activate = True
+            self.playlist_open_pending_idx = None
+            self.playlist_open_pending_ts = 0.0
+        else:
+            self.playlist_open_pending_idx = idx
+            self.playlist_open_pending_ts = now
+        self._last_click_panel = "playlists"
+        self._last_click_row = self.playlist_selected
+        self._last_click_ts = now
+
+    def _handle_playlist_press(self, mx: int, my: int) -> bool:
+        px, py, pw, ph = self.playlist_bounds
+        if not (px <= mx < px + pw and py <= my < py + ph):
+            return False
+        self.focus_panel = "playlists"
+        if self.playlist_editor_open:
+            if my == py:
+                if self.playlist_load_col_start <= mx < self.playlist_load_col_end:
+                    self.playlist_load_request = True
+                elif self.playlist_done_col_start <= mx < self.playlist_done_col_end:
+                    self.playlist_done_request = True
+                return True
+            row = my - (py + 1)
+            idx = self.playlist_track_scroll + row
+            if row >= 0 and 0 <= idx < self.playlist_track_len:
+                self.playlist_track_selected = idx
+                self.playlist_item_drag_start = idx
+                self.playlist_item_drag_target = self.playlist_item_drag_start
+                self.playlist_item_drag_commit_target = None
+                self.playlist_item_drag_commit_start = self.playlist_item_drag_start
+            return True
+        if my >= py + 1:
+            self._handle_playlist_row_click(my - (py + 1))
+            return True
+        return True
+
+    def _handle_playlist_release(self, mx: int, my: int) -> bool:
+        px, py, pw, ph = self.playlist_bounds
+        if not self.playlist_editor_open:
+            return False
+        if px <= mx < px + pw and py + 1 <= my < py + ph:
+            row = my - (py + 1)
+            drop_idx = self.playlist_track_scroll + row
+            if self.playlist_item_drag_start is not None and 0 <= drop_idx < self.playlist_track_len:
+                self.playlist_item_drag_target = drop_idx
+                self.playlist_track_selected = min(
+                    max(0, self.playlist_track_len - 1), drop_idx
+                )
+                if drop_idx == self.playlist_item_drag_start:
+                    self.playlist_item_drag_commit_target = None
+                else:
+                    self.playlist_item_drag_commit_target = drop_idx
+        self.playlist_item_drag_start = None
+        return px <= mx < px + pw and py <= my < py + ph
+
+    def _handle_playlist_click(self, mx: int, my: int) -> bool:
+        px, py, pw, ph = self.playlist_bounds
+        if not (px <= mx < px + pw and py <= my < py + ph):
+            return False
+        self.focus_panel = "playlists"
+        if self.playlist_editor_open:
+            if my == py:
+                if self.playlist_load_col_start <= mx < self.playlist_load_col_end:
+                    self.playlist_load_request = True
+                elif self.playlist_done_col_start <= mx < self.playlist_done_col_end:
+                    self.playlist_done_request = True
+                return True
+            row = my - (py + 1)
+            idx = self.playlist_track_scroll + row
+            if row >= 0 and 0 <= idx < self.playlist_track_len:
+                self.playlist_track_selected = idx
+                now = time.monotonic()
+                if (
+                    self._last_click_panel == "playlist_items"
+                    and self._last_click_row == idx
+                    and (now - self._last_click_ts) <= self.DOUBLE_CLICK_SECONDS
+                ):
+                    self.playlist_item_remove_request = idx
+                self._last_click_panel = "playlist_items"
+                self._last_click_row = idx
+                self._last_click_ts = now
+            return True
+        if my >= py + 1:
+            self._handle_playlist_row_click(my - (py + 1))
+            return True
+        return True
 
     def _handle_key(self) -> Optional[str]:
         if not self.enable or not self.stdscr:
@@ -1239,7 +1370,16 @@ class CursesTUI:
                         px, py, pw, ph = self.playlist_bounds
                         if px <= mx < px + pw and py + 1 <= my < py + ph:
                             self.focus_panel = "playlists"
-                            self.playlist_selected = max(0, min(self.playlist_len - 1, self.playlist_selected + direction))
+                            if self.playlist_editor_open:
+                                self.playlist_track_selected = max(
+                                    0,
+                                    min(
+                                        self.playlist_track_len - 1,
+                                        self.playlist_track_selected + direction,
+                                    ),
+                                )
+                            else:
+                                self.playlist_selected = max(0, min(self.playlist_len - 1, self.playlist_selected + direction))
                         else:
                             tx, ty, tw, th = self.tag_bounds
                             if self.tag_panel_open and tx <= mx < tx + tw and ty + 2 <= my < ty + th:
@@ -1264,15 +1404,26 @@ class CursesTUI:
                     if x <= mx < x + w and y + 1 <= my < y + h:
                         row = my - (y + 1)
                         self.queue_drag_target = self.queue_scroll + row
+            if self.playlist_item_drag_start is not None:
+                move_mask = (
+                    curses.REPORT_MOUSE_POSITION
+                    | getattr(curses, "BUTTON1_MOVED", 0)
+                    | curses.BUTTON1_PRESSED
+                )
+                if bstate & move_mask:
+                    px, py, pw, ph = self.playlist_bounds
+                    if px <= mx < px + pw and py + 1 <= my < py + ph:
+                        row = my - (py + 1)
+                        self.playlist_item_drag_target = self.playlist_track_scroll + row
             if bstate & curses.BUTTON1_PRESSED:
                 x, y, w, h = self.queue_bounds
                 if x <= mx < x + w and y + 1 <= my < y + h:
                     row = my - (y + 1)
+                    idx = self.queue_scroll + row
                     self.focus_panel = "queue"
-                    self.queue_selected = min(
-                        max(0, self.queue_len - 1), self.queue_scroll + row
-                    )
-                    self.queue_drag_start = self.queue_scroll + row
+                    self.queue_drag_started_selected = idx == self.queue_selected
+                    self.queue_selected = min(max(0, self.queue_len - 1), idx)
+                    self.queue_drag_start = idx
                     self.queue_drag_target = self.queue_drag_start
                     self.queue_drag_commit_target = None
                     self.queue_drag_commit_start = self.queue_drag_start
@@ -1280,16 +1431,21 @@ class CursesTUI:
                     sx, sy, sw, sh = self.similar_bounds
                     if sx <= mx < sx + sw and sy + 1 <= my < sy + sh:
                         row = my - (sy + 1)
+                        idx = self.similar_scroll + row
+                        was_selected = idx == self.similar_selected
                         self.focus_panel = "similar"
-                        self.similar_selected = min(
-                            max(0, self.similar_len - 1),
-                            self.similar_scroll + row,
-                        )
+                        self.similar_selected = min(max(0, self.similar_len - 1), idx)
+                        if (
+                            was_selected
+                            and self.similar_add_col_start <= mx < self.similar_add_col_end
+                        ):
+                            self.playlist_add_similar_request = True
+                            return None
                         now = time.monotonic()
                         if (
                             self._last_click_panel == "similar"
                             and self._last_click_row == self.similar_selected
-                            and (now - self._last_click_ts) <= 0.35
+                            and (now - self._last_click_ts) <= self.DOUBLE_CLICK_SECONDS
                         ):
                             self.similar_add = True
                         self._last_click_panel = "similar"
@@ -1318,23 +1474,8 @@ class CursesTUI:
                                 )
                         else:
                             px, py, pw, ph = self.playlist_bounds
-                            if px <= mx < px + pw and py + 1 <= my < py + ph:
-                                row = my - (py + 1)
-                                self.focus_panel = "playlists"
-                                self.playlist_selected = min(
-                                    max(0, self.playlist_len - 1),
-                                    self.playlist_scroll + row,
-                                )
-                                now = time.monotonic()
-                                if (
-                                    self._last_click_panel == "playlists"
-                                    and self._last_click_row == self.playlist_selected
-                                    and (now - self._last_click_ts) <= 0.35
-                                ):
-                                    self.playlist_activate = True
-                                self._last_click_panel = "playlists"
-                                self._last_click_row = self.playlist_selected
-                                self._last_click_ts = now
+                            if px <= mx < px + pw and py <= my < py + ph:
+                                self._handle_playlist_press(mx, my)
                             else:
                                 mx0, my0, mw, mh = self.most_bounds
                                 if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
@@ -1342,17 +1483,25 @@ class CursesTUI:
                                     if my == my0:
                                         return None
                                     row = my - (my0 + 1)
+                                    most_idx = self.most_scroll + row
+                                    was_selected = most_idx == self.most_selected
                                     if row >= 0:
                                         self.most_selected = min(
-                                            max(0, self.most_scroll + row),
+                                            max(0, most_idx),
                                             max(0, self.most_len - 1),
                                         )
+                                    if (
+                                        was_selected
+                                        and self.most_add_col_start <= mx < self.most_add_col_end
+                                    ):
+                                        self.playlist_add_most_request = True
+                                        return None
                                     most_idx = self.most_selected
                                     now = time.monotonic()
                                     if (
                                         self._last_click_panel == "most"
                                         and self._last_click_row == most_idx
-                                        and (now - self._last_click_ts) <= 0.35
+                                        and (now - self._last_click_ts) <= self.DOUBLE_CLICK_SECONDS
                                     ):
                                         self.most_add = True
                                     self._last_click_panel = "most"
@@ -1368,12 +1517,22 @@ class CursesTUI:
                         self.queue_selected = min(max(0, self.queue_len - 1), drop_idx)
                         if drop_idx == self.queue_drag_start:
                             # treat as click; allow toggle if click in mode column
-                            self.queue_click_row = drop_idx
-                            self.queue_click_x = mx
+                            if (
+                                self.queue_drag_started_selected
+                                and self.queue_add_col_start <= mx < self.queue_add_col_end
+                            ):
+                                self.playlist_add_queue_request = True
+                                self.queue_click_row = None
+                                self.queue_click_x = None
+                            else:
+                                self.queue_click_row = drop_idx
+                                self.queue_click_x = mx
                             self.queue_drag_commit_target = None
                         else:
                             self.queue_drag_commit_target = drop_idx
                 self.queue_drag_start = None
+                self.queue_drag_started_selected = False
+                self._handle_playlist_release(mx, my)
             elif bstate & curses.BUTTON1_CLICKED:
                 if (
                     my == 0
@@ -1397,21 +1556,35 @@ class CursesTUI:
                 ):
                     self.current_play_once_toggle_request = True
                     return None
+                if (
+                    my == 1
+                    and self.current_add_col_start <= mx < self.current_add_col_end
+                ):
+                    self.playlist_add_current_request = True
+                    return None
                 x, y, w, h = self.queue_bounds
                 if x <= mx < x + w and y + 1 <= my < y + h:
                     row = my - (y + 1)
+                    idx = self.queue_scroll + row
+                    was_selected = idx == self.queue_selected
                     self.focus_panel = "queue"
-                    self.queue_selected = min(
-                        max(0, self.queue_len - 1), self.queue_scroll + row
-                    )
-                    self.queue_click_row = self.queue_scroll + row
+                    self.queue_selected = min(max(0, self.queue_len - 1), idx)
+                    self.queue_click_row = idx
                     self.queue_click_x = mx
+                    if (
+                        was_selected
+                        and self.queue_add_col_start <= mx < self.queue_add_col_end
+                    ):
+                        self.playlist_add_queue_request = True
+                        self.queue_click_row = None
+                        self.queue_click_x = None
+                        return None
                     # double click to remove from queue
                     now = time.monotonic()
                     if (
                         self._last_click_panel == "queue"
                         and self._last_click_row == self.queue_click_row
-                        and (now - self._last_click_ts) <= 0.35
+                        and (now - self._last_click_ts) <= self.DOUBLE_CLICK_SECONDS
                     ):
                         # only delete when double-clicking on the name column
                         if self.queue_name_col_start <= mx < self.queue_name_col_end:
@@ -1425,16 +1598,21 @@ class CursesTUI:
                     sx, sy, sw, sh = self.similar_bounds
                     if sx <= mx < sx + sw and sy + 1 <= my < sy + sh:
                         row = my - (sy + 1)
+                        idx = self.similar_scroll + row
+                        was_selected = idx == self.similar_selected
                         self.focus_panel = "similar"
-                        self.similar_selected = min(
-                            max(0, self.similar_len - 1),
-                            self.similar_scroll + row,
-                        )
+                        self.similar_selected = min(max(0, self.similar_len - 1), idx)
+                        if (
+                            was_selected
+                            and self.similar_add_col_start <= mx < self.similar_add_col_end
+                        ):
+                            self.playlist_add_similar_request = True
+                            return None
                         now = time.monotonic()
                         if (
                             self._last_click_panel == "similar"
                             and self._last_click_row == self.similar_selected
-                            and (now - self._last_click_ts) <= 0.35
+                            and (now - self._last_click_ts) <= self.DOUBLE_CLICK_SECONDS
                         ):
                             self.similar_add = True
                         self._last_click_panel = "similar"
@@ -1465,7 +1643,7 @@ class CursesTUI:
                                 if (
                                     self._last_click_panel == "tags"
                                     and self._last_click_row == self.tag_selected
-                                    and (now - self._last_click_ts) <= 0.35
+                                    and (now - self._last_click_ts) <= self.DOUBLE_CLICK_SECONDS
                                 ):
                                     self.tag_edit_request = True
                                 self._last_click_panel = "tags"
@@ -1473,23 +1651,8 @@ class CursesTUI:
                                 self._last_click_ts = now
                         else:
                             px, py, pw, ph = self.playlist_bounds
-                            if px <= mx < px + pw and py + 1 <= my < py + ph:
-                                row = my - (py + 1)
-                                self.focus_panel = "playlists"
-                                self.playlist_selected = min(
-                                    max(0, self.playlist_len - 1),
-                                    self.playlist_scroll + row,
-                                )
-                                now = time.monotonic()
-                                if (
-                                    self._last_click_panel == "playlists"
-                                    and self._last_click_row == self.playlist_selected
-                                    and (now - self._last_click_ts) <= 0.35
-                                ):
-                                    self.playlist_activate = True
-                                self._last_click_panel = "playlists"
-                                self._last_click_row = self.playlist_selected
-                                self._last_click_ts = now
+                            if px <= mx < px + pw and py <= my < py + ph:
+                                self._handle_playlist_click(mx, my)
                             else:
                                 mx0, my0, mw, mh = self.most_bounds
                                 if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
@@ -1501,18 +1664,26 @@ class CursesTUI:
                                         self.most_toggle_request = True
                                         return None
                                     row = my - (my0 + 1)
+                                    most_idx = self.most_scroll + row
+                                    was_selected = most_idx == self.most_selected
                                     if row >= 0:
                                         self.most_selected = min(
-                                            max(0, self.most_scroll + row),
+                                            max(0, most_idx),
                                             max(0, self.most_len - 1),
                                         )
+                                    if (
+                                        was_selected
+                                        and self.most_add_col_start <= mx < self.most_add_col_end
+                                    ):
+                                        self.playlist_add_most_request = True
+                                        return None
                                     # double click in Most to add to queue
                                     most_idx = self.most_selected
                                     now = time.monotonic()
                                     if (
                                         self._last_click_panel == "most"
                                         and self._last_click_row == most_idx
-                                        and (now - self._last_click_ts) <= 0.35
+                                        and (now - self._last_click_ts) <= self.DOUBLE_CLICK_SECONDS
                                     ):
                                         self.most_add = True
                                     self._last_click_panel = "most"
@@ -1530,7 +1701,10 @@ class CursesTUI:
             elif self.focus_panel == "similar":
                 self.similar_selected = max(0, self.similar_selected - 1)
             elif self.focus_panel == "playlists":
-                self.playlist_selected = max(0, self.playlist_selected - 1)
+                if self.playlist_editor_open:
+                    self.playlist_track_selected = max(0, self.playlist_track_selected - 1)
+                else:
+                    self.playlist_selected = max(0, self.playlist_selected - 1)
             elif self.focus_panel == "tags":
                 self.tag_selected = max(0, self.tag_selected - 1)
             else:
@@ -1547,9 +1721,15 @@ class CursesTUI:
                     max(0, self.similar_len - 1), self.similar_selected + 1
                 )
             elif self.focus_panel == "playlists":
-                self.playlist_selected = min(
-                    max(0, self.playlist_len - 1), self.playlist_selected + 1
-                )
+                if self.playlist_editor_open:
+                    self.playlist_track_selected = min(
+                        max(0, self.playlist_track_len - 1),
+                        self.playlist_track_selected + 1,
+                    )
+                else:
+                    self.playlist_selected = min(
+                        max(0, self.playlist_len - 1), self.playlist_selected + 1
+                    )
             elif self.focus_panel == "tags":
                 self.tag_selected = min(
                     max(0, self.tag_len - 1), self.tag_selected + 1
@@ -1565,7 +1745,10 @@ class CursesTUI:
             elif self.focus_panel == "similar":
                 self.similar_selected = max(0, self.similar_selected - page)
             elif self.focus_panel == "playlists":
-                self.playlist_selected = max(0, self.playlist_selected - page)
+                if self.playlist_editor_open:
+                    self.playlist_track_selected = max(0, self.playlist_track_selected - page)
+                else:
+                    self.playlist_selected = max(0, self.playlist_selected - page)
             elif self.focus_panel == "tags":
                 self.tag_selected = max(0, self.tag_selected - page)
             else:
@@ -1585,10 +1768,16 @@ class CursesTUI:
                     self.similar_selected + page,
                 )
             elif self.focus_panel == "playlists":
-                self.playlist_selected = min(
-                    max(0, self.playlist_len - 1),
-                    self.playlist_selected + page,
-                )
+                if self.playlist_editor_open:
+                    self.playlist_track_selected = min(
+                        max(0, self.playlist_track_len - 1),
+                        self.playlist_track_selected + page,
+                    )
+                else:
+                    self.playlist_selected = min(
+                        max(0, self.playlist_len - 1),
+                        self.playlist_selected + page,
+                    )
             elif self.focus_panel == "tags":
                 self.tag_selected = min(
                     max(0, self.tag_len - 1),
@@ -1619,6 +1808,8 @@ class CursesTUI:
             self.status_msg = "Stopped. Waiting for mood..."
         elif key == self.CTRL_X and self.focus_panel == "queue":
             self.queue_delete = True
+        elif key == self.CTRL_X and self.focus_panel == "playlists" and self.playlist_editor_open:
+            self.playlist_item_remove_request = self.playlist_track_selected
         elif key == self.CTRL_X and self.focus_panel == "tags":
             self.tag_delete_request = True
         elif key in (self.CTRL_S, self.CTRL_W) and self.focus_panel == "playlists":
@@ -1682,6 +1873,8 @@ class CursesTUI:
         playlists: Optional[List[Tuple[str, int]]],
         current_tags: Optional[List[str]] = None,
         pending_tags: Optional[List[str]] = None,
+        active_playlist_name: Optional[str] = None,
+        active_playlist_items: Optional[List[dict]] = None,
     ) -> Optional[str]:
         if not self.enable or not self.stdscr:
             return None
@@ -1733,6 +1926,7 @@ class CursesTUI:
         self._draw(0, chip_x, mode_chip)
         current_chip = ""
         tag_chip = ""
+        add_chip = ""
         if now_playing and current_play_once is not None:
             current_chip = f"[{'once' if current_play_once else 'loop'}]"
             current_chip_x = max(0, w - len(current_chip) - 2)
@@ -1742,19 +1936,34 @@ class CursesTUI:
             tag_chip_x = max(0, current_chip_x - len(tag_chip) - 1)
             self.tag_chip_col_start = tag_chip_x
             self.tag_chip_col_end = tag_chip_x + len(tag_chip)
+            if active_playlist_name:
+                add_chip = "[add]"
+                add_chip_x = max(0, tag_chip_x - len(add_chip) - 1)
+                self.current_add_col_start = add_chip_x
+                self.current_add_col_end = add_chip_x + len(add_chip)
+            else:
+                add_chip_x = tag_chip_x
+                self.current_add_col_start = 0
+                self.current_add_col_end = 0
         else:
             current_chip_x = 0
             tag_chip_x = 0
+            add_chip_x = 0
             self.current_mode_col_start = 0
             self.current_mode_col_end = 0
             self.tag_chip_col_start = 0
             self.tag_chip_col_end = 0
+            self.current_add_col_start = 0
+            self.current_add_col_end = 0
 
         track_line = f"Track: {now_playing or '(none)'}"
-        if current_chip or tag_chip:
-            max_track_len = max(0, (tag_chip_x or current_chip_x) - 4)
+        if current_chip or tag_chip or add_chip:
+            first_chip_x = add_chip_x if add_chip else (tag_chip_x or current_chip_x)
+            max_track_len = max(0, first_chip_x - 4)
             track_line = track_line[:max_track_len]
         self._draw(1, 2, track_line)
+        if add_chip:
+            self._draw(1, add_chip_x, add_chip)
         if tag_chip:
             self._draw(1, tag_chip_x, tag_chip)
         if current_chip:
@@ -1883,8 +2092,20 @@ class CursesTUI:
                     default=len("(0.0h)"),
                 ),
             )
+            playlist_add_chip = "[add]" if active_playlist_name else ""
             m_count_w = m_count_num_w + 1 + m_time_tok_w
-            m_name_w = max(1, left_w - (2 + 3 + 3 + m_count_w + 5))
+            m_add_space = len(playlist_add_chip) + 1 if playlist_add_chip else 0
+            m_name_w = max(1, left_w - (2 + 3 + 3 + m_count_w + 5 + m_add_space))
+            self.most_add_col_start = (
+                left_x + left_w - len(playlist_add_chip) - 1
+                if playlist_add_chip
+                else 0
+            )
+            self.most_add_col_end = (
+                self.most_add_col_start + len(playlist_add_chip)
+                if playlist_add_chip
+                else 0
+            )
             for offset, (name, cnt) in enumerate(m_visible_entries):
                 i = self.most_scroll + offset
                 sel = ">" if self.focus_panel == "most" and i == self.most_selected else " "
@@ -1896,9 +2117,13 @@ class CursesTUI:
                 time_col = f"({hours:.1f}h)"
                 count_col = f"{cnt:>{m_count_num_w}} {time_col:>{m_time_tok_w}}"
                 name = str(name)[:m_name_w].ljust(m_name_w)
-                m_rows.append(
-                    f"{sel} {i+1:>3} | {count_col} | {name}"
-                )
+                row = f"{sel} {i+1:>3} | {count_col} | {name}"
+                if playlist_add_chip:
+                    row_add_chip = playlist_add_chip if i == self.most_selected else ""
+                    row = row[: max(0, left_w - len(playlist_add_chip) - 1)].ljust(
+                        max(0, left_w - len(playlist_add_chip) - 1)
+                    ) + row_add_chip
+                m_rows.append(row)
             m_focus = "[Most]" if self.focus_panel == "most" else " Most "
             m_sort_chip = f"[by:{self.most_sort_mode}]"
             m_title = f"{m_focus} {m_sort_chip}"
@@ -1924,12 +2149,29 @@ class CursesTUI:
                 self.similar_scroll = self.similar_selected - s_content_h + 1
             self.similar_scroll = min(self.similar_scroll, s_max_scroll)
             s_rows: List[str] = []
-            s_name_w = max(1, right_w - (2 + 3 + 3 + 6 + 5))
+            s_add_space = len(playlist_add_chip) + 1 if playlist_add_chip else 0
+            s_name_w = max(1, right_w - (2 + 3 + 3 + 6 + 5 + s_add_space))
+            self.similar_add_col_start = (
+                right_x + right_w - len(playlist_add_chip) - 1
+                if playlist_add_chip
+                else 0
+            )
+            self.similar_add_col_end = (
+                self.similar_add_col_start + len(playlist_add_chip)
+                if playlist_add_chip
+                else 0
+            )
             for i in range(self.similar_scroll, min(len(entries), self.similar_scroll + s_content_h)):
                 base, score = entries[i]
                 sel = ">" if i == self.similar_selected and self.focus_panel == "similar" else " "
                 base = str(base)[:s_name_w].ljust(s_name_w)
-                s_rows.append(f"{sel} {i+1:>3} | {base}| {score:>6.3f}  ")
+                row = f"{sel} {i+1:>3} | {base}| {score:>6.3f}  "
+                if playlist_add_chip:
+                    row_add_chip = playlist_add_chip if i == self.similar_selected else ""
+                    row = row[: max(0, right_w - len(playlist_add_chip) - 1)].ljust(
+                        max(0, right_w - len(playlist_add_chip) - 1)
+                    ) + row_add_chip
+                s_rows.append(row)
             s_title = "[Similar]" if self.focus_panel == "similar" else " Similar "
             if similar_mood:
                 s_title = (s_title[: max(0, right_w - len(similar_mood) - 3)] + f" ({similar_mood})")[:right_w]
@@ -1947,11 +2189,22 @@ class CursesTUI:
                 self.queue_scroll = self.queue_selected - q_content_h + 1
             self.queue_scroll = min(self.queue_scroll, q_max_scroll)
             q_rows: List[str] = []
-            q_name_w = max(1, right_w - (2 + 3 + 3 + 4 + 5))
+            q_add_space = len(playlist_add_chip) + 1 if playlist_add_chip else 0
+            q_name_w = max(1, right_w - (2 + 3 + 3 + 4 + 5 + q_add_space))
             self.queue_name_col_start = right_x + 8
             self.queue_name_col_end = self.queue_name_col_start + q_name_w
             self.queue_mode_col_start = self.queue_name_col_end + 2
             self.queue_mode_col_end = self.queue_mode_col_start + 4
+            self.queue_add_col_start = (
+                right_x + right_w - len(playlist_add_chip) - 1
+                if playlist_add_chip
+                else 0
+            )
+            self.queue_add_col_end = (
+                self.queue_add_col_start + len(playlist_add_chip)
+                if playlist_add_chip
+                else 0
+            )
             order = list(range(self.queue_len))
             if self.queue_drag_start is not None and self.queue_drag_target is not None:
                 start = max(0, min(self.queue_len - 1, self.queue_drag_start))
@@ -1969,7 +2222,13 @@ class CursesTUI:
                 else:
                     sel = ">" if i == self.queue_selected and self.focus_panel == "queue" else " "
                 name = name[:q_name_w].ljust(q_name_w)
-                q_rows.append(f"{sel} {i+1:>3} | {name}| {mode:>4}  ")
+                row = f"{sel} {i+1:>3} | {name}| {mode:>4}  "
+                if playlist_add_chip:
+                    row_add_chip = playlist_add_chip if i == self.queue_selected else ""
+                    row = row[: max(0, right_w - len(playlist_add_chip) - 1)].ljust(
+                        max(0, right_w - len(playlist_add_chip) - 1)
+                    ) + row_add_chip
+                q_rows.append(row)
             q_title = "[Queue]" if self.focus_panel == "queue" else " Queue "
             render_pane(q_title.ljust(right_w), q_rows, right_x, mid_y, right_w, mid_h)
             self.queue_bounds = (right_x, mid_y, right_w, mid_h)
@@ -2020,25 +2279,101 @@ class CursesTUI:
             else:
                 self.tag_len = 0
                 self.tag_bounds = (0, 0, 0, 0)
-                if self.playlist_selected >= len(playlists):
-                    self.playlist_selected = max(0, len(playlists) - 1)
-                p_content_h = max(0, bot_h - 1)
-                p_max_scroll = max(0, len(playlists) - p_content_h)
-                if self.playlist_selected < self.playlist_scroll:
-                    self.playlist_scroll = self.playlist_selected
-                if self.playlist_selected >= self.playlist_scroll + p_content_h:
-                    self.playlist_scroll = self.playlist_selected - p_content_h + 1
-                self.playlist_scroll = min(self.playlist_scroll, p_max_scroll)
-                p_rows: List[str] = []
-                p_name_w = max(1, right_w - (2 + 3 + 3 + 4 + 5))
-                for i in range(self.playlist_scroll, min(len(playlists), self.playlist_scroll + p_content_h)):
-                    name, count = playlists[i]
-                    sel = ">" if i == self.playlist_selected and self.focus_panel == "playlists" else " "
-                    name = str(name)[:p_name_w].ljust(p_name_w)
-                    p_rows.append(f"{sel} {i+1:>3} | {name}| {count:>4}  ")
-                p_title = "[Playlists]" if self.focus_panel == "playlists" else " Playlists "
-                render_pane(p_title.ljust(right_w), p_rows, right_x, bot_y, right_w, bot_h)
-                self.playlist_bounds = (right_x, bot_y, right_w, bot_h)
+                if active_playlist_name:
+                    playlist_items = active_playlist_items or []
+                    self.playlist_track_len = len(playlist_items)
+                    if self.playlist_track_selected >= self.playlist_track_len:
+                        self.playlist_track_selected = max(0, self.playlist_track_len - 1)
+                    p_content_h = max(0, bot_h - 1)
+                    p_max_scroll = max(0, self.playlist_track_len - p_content_h)
+                    if self.playlist_track_selected < self.playlist_track_scroll:
+                        self.playlist_track_scroll = self.playlist_track_selected
+                    if self.playlist_track_selected >= self.playlist_track_scroll + p_content_h:
+                        self.playlist_track_scroll = self.playlist_track_selected - p_content_h + 1
+                    self.playlist_track_scroll = min(self.playlist_track_scroll, p_max_scroll)
+
+                    p_rows = []
+                    p_name_w = max(1, right_w - (2 + 3 + 3))
+                    order = list(range(self.playlist_track_len))
+                    if (
+                        self.playlist_item_drag_start is not None
+                        and self.playlist_item_drag_target is not None
+                    ):
+                        start = max(0, min(self.playlist_track_len - 1, self.playlist_item_drag_start))
+                        target = max(0, min(self.playlist_track_len - 1, self.playlist_item_drag_target))
+                        if start != target and order:
+                            item_idx = order.pop(start)
+                            order.insert(target, item_idx)
+                    for i in range(
+                        self.playlist_track_scroll,
+                        min(self.playlist_track_len, self.playlist_track_scroll + p_content_h),
+                    ):
+                        item = playlist_items[order[i]]
+                        base = str(item.get("base") or "(unknown)")
+                        if (
+                            self.playlist_item_drag_start is not None
+                            and order[i] == self.playlist_item_drag_start
+                        ):
+                            sel = "D"
+                        else:
+                            sel = ">" if i == self.playlist_track_selected and self.focus_panel == "playlists" else " "
+                        base = base[:p_name_w].ljust(p_name_w)
+                        row = f"{sel} {i+1:>3} | {base}"
+                        p_rows.append(row)
+                    if not playlist_items:
+                        p_rows.append("  (empty; click [add] on a track)")
+
+                    p_focused = self.focus_panel == "playlists"
+                    p_focus = "[Playlist:" if p_focused else " Playlist:"
+                    p_suffix = "]" if p_focused else ""
+                    load_chip = "[load]"
+                    done_chip = "[done]"
+                    title_name_w = max(
+                        1,
+                        right_w
+                        - len(p_focus)
+                        - len(p_suffix)
+                        - len(load_chip)
+                        - len(done_chip)
+                        - 4,
+                    )
+                    p_title = (
+                        f"{p_focus}{active_playlist_name[:title_name_w]}{p_suffix} "
+                        f"{load_chip} {done_chip}"
+                    )
+                    load_idx = p_title.find(load_chip)
+                    done_idx = p_title.find(done_chip)
+                    self.playlist_load_col_start = right_x + load_idx if load_idx >= 0 else 0
+                    self.playlist_load_col_end = self.playlist_load_col_start + len(load_chip)
+                    self.playlist_done_col_start = right_x + done_idx if done_idx >= 0 else 0
+                    self.playlist_done_col_end = self.playlist_done_col_start + len(done_chip)
+                    render_pane(p_title.ljust(right_w), p_rows, right_x, bot_y, right_w, bot_h)
+                    self.playlist_bounds = (right_x, bot_y, right_w, bot_h)
+                else:
+                    self.playlist_track_len = 0
+                    self.playlist_load_col_start = 0
+                    self.playlist_load_col_end = 0
+                    self.playlist_done_col_start = 0
+                    self.playlist_done_col_end = 0
+                    if self.playlist_selected >= len(playlists):
+                        self.playlist_selected = max(0, len(playlists) - 1)
+                    p_content_h = max(0, bot_h - 1)
+                    p_max_scroll = max(0, len(playlists) - p_content_h)
+                    if self.playlist_selected < self.playlist_scroll:
+                        self.playlist_scroll = self.playlist_selected
+                    if self.playlist_selected >= self.playlist_scroll + p_content_h:
+                        self.playlist_scroll = self.playlist_selected - p_content_h + 1
+                    self.playlist_scroll = min(self.playlist_scroll, p_max_scroll)
+                    p_rows: List[str] = []
+                    p_name_w = max(1, right_w - (2 + 3 + 3 + 4 + 5))
+                    for i in range(self.playlist_scroll, min(len(playlists), self.playlist_scroll + p_content_h)):
+                        name, count = playlists[i]
+                        sel = ">" if i == self.playlist_selected and self.focus_panel == "playlists" else " "
+                        name = str(name)[:p_name_w].ljust(p_name_w)
+                        p_rows.append(f"{sel} {i+1:>3} | {name}| {count:>4}  ")
+                    p_title = "[Playlists]" if self.focus_panel == "playlists" else " Playlists "
+                    render_pane(p_title.ljust(right_w), p_rows, right_x, bot_y, right_w, bot_h)
+                    self.playlist_bounds = (right_x, bot_y, right_w, bot_h)
 
             # Separator between left/right
             for i in range(table_height):
@@ -2072,7 +2407,7 @@ class CursesTUI:
         self._draw(
             h - 1,
             2,
-            "Click [tags] • Enter submit/load • TAB focus • Ctrl+S save • Ctrl+G stop • --help",
+            "Click playlist to edit • Double-click playlist to load • [add] adds to playlist • Ctrl+G stop • --help",
         )
 
         try:
@@ -2416,6 +2751,7 @@ def main(
     current_similar_mood: Optional[str] = None
     queue: List[Dict[str, object]] = []
     current_playing_item: Optional[Dict[str, object]] = None
+    active_playlist_name: Optional[str] = None
     skip_requeue_item: Optional[Dict[str, object]] = None
     last_completed_track_name: Optional[str] = None
     playback_mode = str(playback_mode)
@@ -2451,6 +2787,53 @@ def main(
             key=lambda x: x[0].lower(),
         )
 
+    def get_active_playlist_items(tui: Optional[CursesTUI]) -> Optional[List[dict]]:
+        if not tui or not tui.enable or not tui.playlist_editor_open:
+            return None
+        if not active_playlist_name:
+            return None
+        return playlists_db.get(active_playlist_name, [])
+
+    def open_playlist_editor(name: str, tui: Optional[CursesTUI]) -> None:
+        nonlocal active_playlist_name
+        if name not in playlists_db:
+            if tui and tui.enable:
+                tui.status_msg = f"Playlist not found: {name}"
+            return
+        active_playlist_name = name
+        if tui and tui.enable:
+            tui.playlist_editor_open = True
+            tui.focus_panel = "playlists"
+            tui.playlist_track_selected = 0
+            tui.playlist_track_scroll = 0
+            tui.status_msg = f"Editing playlist: {name}"
+
+    def add_base_to_active_playlist(
+        base: str,
+        play_once: bool,
+        tui: Optional[CursesTUI],
+    ) -> None:
+        if not active_playlist_name or active_playlist_name not in playlists_db:
+            if tui and tui.enable:
+                tui.status_msg = "Click a playlist first."
+            return
+        items = playlists_db.setdefault(active_playlist_name, [])
+        if any(str(item.get("base") or "") == base for item in items):
+            if tui and tui.enable:
+                tui.status_msg = f"Already in {active_playlist_name}: {base}"
+            return
+        items.append({"base": base, "play_once": bool(play_once)})
+        save_playlists(playlists_db, playlists_filename)
+        if tui and tui.enable:
+            tui.status_msg = f"Added to {active_playlist_name}: {base}"
+
+    def add_path_to_active_playlist(
+        path: Path,
+        play_once: bool,
+        tui: Optional[CursesTUI],
+    ) -> None:
+        add_base_to_active_playlist(path.stem, play_once, tui)
+
     def save_playlist(name: str, tui: Optional[CursesTUI]) -> None:
         nonlocal playlists_db, current_playing_item
         items: List[dict] = []
@@ -2480,9 +2863,13 @@ def main(
     def load_playlist(name: str, tui: Optional[CursesTUI], replace_queue: bool = True) -> None:
         nonlocal current_playing_item, skip_requeue_item
         items = playlists_db.get(name)
-        if not items:
+        if items is None:
             if tui and tui.enable:
                 tui.status_msg = f"Playlist not found: {name}"
+            return
+        if not items:
+            if tui and tui.enable:
+                tui.status_msg = f"Playlist is empty: {name}"
             return
         if replace_queue:
             queue.clear()
@@ -2516,12 +2903,17 @@ def main(
                 tui.status_msg = f"Loaded playlist: {name} ({len(paths)} tracks, {mode})"
 
     def delete_playlist(name: str, tui: Optional[CursesTUI]) -> None:
+        nonlocal active_playlist_name
         if name not in playlists_db:
             if tui and tui.enable:
                 tui.status_msg = f"Playlist not found: {name}"
             return
         del playlists_db[name]
         save_playlists(playlists_db, playlists_filename)
+        if active_playlist_name == name:
+            active_playlist_name = None
+            if tui and tui.enable:
+                tui.playlist_editor_open = False
         if tui and tui.enable:
             tui.status_msg = f"Deleted playlist: {name}"
 
@@ -2798,6 +3190,7 @@ def main(
                 tui.queue_drag_target = None
                 tui.queue_drag_commit_target = None
                 tui.queue_drag_commit_start = None
+                tui.queue_drag_started_selected = False
                 return
 
             if tui.queue_click_row is not None:
@@ -2904,6 +3297,127 @@ def main(
             )
             tui.status_msg = f"Added to queue: {name}"
 
+        def apply_playlist_editor_actions() -> None:
+            nonlocal active_playlist_name
+
+            if (
+                tui.playlist_open_pending_idx is not None
+                and not tui.playlist_editor_open
+                and (
+                    time.monotonic() - tui.playlist_open_pending_ts
+                ) > tui.DOUBLE_CLICK_SECONDS
+            ):
+                plist = get_playlists_list()
+                idx = tui.playlist_open_pending_idx
+                tui.playlist_open_pending_idx = None
+                tui.playlist_open_pending_ts = 0.0
+                if 0 <= idx < len(plist):
+                    tui.playlist_selected = idx
+                    open_playlist_editor(plist[idx][0], tui)
+
+            if tui.playlist_done_request:
+                tui.playlist_done_request = False
+                tui.playlist_editor_open = False
+                active_playlist_name = None
+                tui.status_msg = "Closed playlist."
+
+            if tui.playlist_load_request:
+                tui.playlist_load_request = False
+                if active_playlist_name:
+                    load_playlist(active_playlist_name, tui, replace_queue=True)
+                else:
+                    tui.status_msg = "No playlist is open."
+
+            if tui.playlist_add_current_request:
+                tui.playlist_add_current_request = False
+                if current_playing_item:
+                    path = current_playing_item.get("path")
+                    if isinstance(path, Path):
+                        add_path_to_active_playlist(
+                            path,
+                            item_effective_play_once(current_playing_item),
+                            tui,
+                        )
+                    else:
+                        tui.status_msg = "No current track to add."
+                else:
+                    tui.status_msg = "No current track to add."
+
+            if tui.playlist_add_queue_request:
+                tui.playlist_add_queue_request = False
+                if queue:
+                    idx = min(max(0, tui.queue_selected), len(queue) - 1)
+                    item = queue[idx]
+                    path = item.get("path")
+                    if isinstance(path, Path):
+                        add_path_to_active_playlist(
+                            path,
+                            item_effective_play_once(item),
+                            tui,
+                        )
+                    else:
+                        tui.status_msg = "Track not found on disk."
+                else:
+                    tui.status_msg = "No queued track to add."
+
+            if tui.playlist_add_similar_request:
+                tui.playlist_add_similar_request = False
+                entries = current_similar_entries or []
+                if entries:
+                    idx = min(max(0, tui.similar_selected), len(entries) - 1)
+                    base = entries[idx][0]
+                    path = mp3_folder / f"{base}.mp3"
+                    if path.exists():
+                        add_path_to_active_playlist(path, False, tui)
+                    else:
+                        tui.status_msg = "Track not found on disk."
+                else:
+                    tui.status_msg = "No similar track to add."
+
+            if tui.playlist_add_most_request:
+                tui.playlist_add_most_request = False
+                entries = get_most_entries()
+                if entries:
+                    idx = min(max(0, tui.most_selected), len(entries) - 1)
+                    name, _ = entries[idx]
+                    path = mp3_folder / f"{name}.mp3"
+                    if path.exists():
+                        add_path_to_active_playlist(path, False, tui)
+                    else:
+                        tui.status_msg = "Track not found on disk."
+                else:
+                    tui.status_msg = "No track to add."
+
+            items = playlists_db.get(active_playlist_name or "", [])
+            if tui.playlist_item_drag_commit_target is not None:
+                start_idx = (
+                    tui.playlist_item_drag_commit_start
+                    if tui.playlist_item_drag_commit_start is not None
+                    else tui.playlist_track_selected
+                )
+                target_idx = tui.playlist_item_drag_commit_target
+                if 0 <= start_idx < len(items):
+                    target_idx = max(0, min(len(items) - 1, target_idx))
+                    if target_idx != start_idx:
+                        item = items.pop(start_idx)
+                        items.insert(target_idx, item)
+                        save_playlists(playlists_db, playlists_filename)
+                        tui.playlist_track_selected = target_idx
+                        tui.status_msg = f"Reordered {active_playlist_name}."
+                tui.playlist_item_drag_commit_target = None
+                tui.playlist_item_drag_commit_start = None
+
+            if tui.playlist_item_remove_request is not None:
+                idx = tui.playlist_item_remove_request
+                tui.playlist_item_remove_request = None
+                if 0 <= idx < len(items):
+                    base = str(items[idx].get("base") or "track")
+                    del items[idx]
+                    save_playlists(playlists_db, playlists_filename)
+                    if idx >= len(items):
+                        tui.playlist_track_selected = max(0, len(items) - 1)
+                    tui.status_msg = f"Removed from {active_playlist_name}: {base}"
+
         def apply_most_sort_toggle() -> None:
             if not tui.most_toggle_request:
                 return
@@ -2942,20 +3456,28 @@ def main(
                 tui.status_msg = "Enter playlist name to save."
             if tui.playlist_activate:
                 tui.playlist_activate = False
-                plist = get_playlists_list()
-                if plist:
-                    idx = min(tui.playlist_selected, len(plist) - 1)
-                    load_playlist(plist[idx][0], tui, replace_queue=True)
+                tui.playlist_open_pending_idx = None
+                tui.playlist_open_pending_ts = 0.0
+                if tui.playlist_editor_open and active_playlist_name:
+                    load_playlist(active_playlist_name, tui, replace_queue=True)
                 else:
-                    tui.status_msg = "No playlists to load."
+                    plist = get_playlists_list()
+                    if plist:
+                        idx = min(tui.playlist_selected, len(plist) - 1)
+                        load_playlist(plist[idx][0], tui, replace_queue=True)
+                    else:
+                        tui.status_msg = "No playlists to load."
             if tui.playlist_delete_request:
                 tui.playlist_delete_request = False
-                plist = get_playlists_list()
-                if plist:
-                    idx = min(tui.playlist_selected, len(plist) - 1)
-                    delete_playlist(plist[idx][0], tui)
+                if tui.playlist_editor_open and active_playlist_name:
+                    delete_playlist(active_playlist_name, tui)
                 else:
-                    tui.status_msg = "No playlists to delete."
+                    plist = get_playlists_list()
+                    if plist:
+                        idx = min(tui.playlist_selected, len(plist) - 1)
+                        delete_playlist(plist[idx][0], tui)
+                    else:
+                        tui.status_msg = "No playlists to delete."
 
         def handle_common_actions() -> None:
             if tui.playback_mode_toggle_request:
@@ -2966,6 +3488,7 @@ def main(
             apply_queue_actions()
             apply_similar_actions()
             apply_most_actions()
+            apply_playlist_editor_actions()
             apply_tag_actions()
             handle_playlist_requests()
 
@@ -3010,6 +3533,10 @@ def main(
                     similar_mood=current_similar_mood,
                     queue_items=queue,
                     playlists=get_playlists_list(),
+                    active_playlist_name=active_playlist_name
+                    if tui.playlist_editor_open
+                    else None,
+                    active_playlist_items=get_active_playlist_items(tui),
                 )
                 if submitted:
                     if handle_save_playlist_input(submitted):
@@ -3067,6 +3594,10 @@ def main(
                         similar_mood=current_similar_mood,
                         queue_items=queue,
                         playlists=get_playlists_list(),
+                        active_playlist_name=active_playlist_name
+                        if tui.playlist_editor_open
+                        else None,
+                        active_playlist_items=get_active_playlist_items(tui),
                     )
                     if submitted:
                         if submitted.strip() == "--help":
@@ -3204,6 +3735,10 @@ def main(
                                     playlists=get_playlists_list(),
                                     current_tags=tag_session.existing_tags(),
                                     pending_tags=tag_session.pending_tags(),
+                                    active_playlist_name=active_playlist_name
+                                    if tui.playlist_editor_open
+                                    else None,
+                                    active_playlist_items=get_active_playlist_items(tui),
                                 )
                                 if submitted:
                                     if handle_save_playlist_input(submitted):

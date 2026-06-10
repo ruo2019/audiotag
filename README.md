@@ -13,3 +13,15 @@ Instructions:
 9. After tagging all mp3 files, run `python app.py -mood "some mood, some other mood, etc" -top 10 # top 10 mp3s that match`
 
 Note: will load a 110M sentence-transformers model to run locally.
+
+## MP3 trimming without re-encoding
+
+Run the interactive trimmer:
+
+```bash
+python mp3_trimmer.py
+```
+
+Then open `http://127.0.0.1:5050`.
+
+The trimmer uses FFmpeg copy mode (`-c copy`) so MP3 audio frames are not re-encoded. Output files go to `static/trimmed/`, and uploaded files go to `static/trim-uploads/`. Trim points are entered in milliseconds; the actual cut lands on MP3 frame boundaries, which is normally much smaller than half a second.

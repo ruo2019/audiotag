@@ -1,0 +1,888 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>MP3 Trimmer</title>
+        <style>
+            :root {
+                color-scheme: light;
+                --bg: #f6f7f8;
+                --panel: #ffffff;
+                --text: #181b20;
+                --muted: #606a78;
+                --line: #d8dde5;
+                --blue: #2563eb;
+                --blue-dark: #1d4ed8;
+                --green: #087f5b;
+                --red: #c92a2a;
+                --amber: #b7791f;
+                --shadow: 0 10px 28px rgba(20, 28, 40, 0.08);
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            body {
+                margin: 0;
+                background: var(--bg);
+                color: var(--text);
+                font-family:
+                    Inter, ui-sans-serif, system-ui, -apple-system,
+                    BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }
+
+            button,
+            input,
+            select {
+                font: inherit;
+            }
+
+            button {
+                min-height: 40px;
+                border: 1px solid var(--line);
+                border-radius: 7px;
+                background: #fff;
+                color: var(--text);
+                padding: 8px 12px;
+                cursor: pointer;
+            }
+
+            button:hover {
+                border-color: #aeb8c7;
+            }
+
+            button.primary {
+                border-color: var(--blue);
+                background: var(--blue);
+                color: #fff;
+            }
+
+            button.primary:hover {
+                background: var(--blue-dark);
+            }
+
+            button:disabled {
+                cursor: not-allowed;
+                opacity: 0.55;
+            }
+
+            input,
+            select {
+                width: 100%;
+                min-height: 40px;
+                border: 1px solid var(--line);
+                border-radius: 7px;
+                background: #fff;
+                color: var(--text);
+                padding: 8px 10px;
+            }
+
+            input[type="file"] {
+                padding: 7px;
+            }
+
+            label {
+                display: block;
+                margin-bottom: 6px;
+                color: var(--muted);
+                font-size: 13px;
+                font-weight: 650;
+            }
+
+            .shell {
+                width: min(1180px, calc(100vw - 28px));
+                margin: 24px auto 36px;
+            }
+
+            .topbar {
+                display: flex;
+                align-items: flex-end;
+                justify-content: space-between;
+                gap: 20px;
+                margin-bottom: 18px;
+            }
+
+            h1 {
+                margin: 0 0 4px;
+                font-size: clamp(28px, 4vw, 42px);
+                line-height: 1;
+                letter-spacing: 0;
+            }
+
+            .subtitle {
+                margin: 0;
+                color: var(--muted);
+                font-size: 14px;
+            }
+
+            .status {
+                min-height: 38px;
+                border: 1px solid var(--line);
+                border-radius: 7px;
+                background: #fff;
+                color: var(--muted);
+                padding: 9px 12px;
+                font-size: 13px;
+                text-align: right;
+                max-width: 420px;
+            }
+
+            .status.error {
+                border-color: #ffc9c9;
+                color: var(--red);
+                background: #fff5f5;
+            }
+
+            .status.ok {
+                border-color: #b2f2bb;
+                color: var(--green);
+                background: #ebfbee;
+            }
+
+            .grid {
+                display: grid;
+                grid-template-columns: minmax(270px, 340px) minmax(0, 1fr);
+                gap: 16px;
+                align-items: start;
+            }
+
+            .panel {
+                background: var(--panel);
+                border: 1px solid var(--line);
+                border-radius: 8px;
+                box-shadow: var(--shadow);
+                padding: 16px;
+            }
+
+            .panel h2 {
+                margin: 0 0 14px;
+                font-size: 15px;
+                line-height: 1.2;
+                letter-spacing: 0;
+            }
+
+            .field {
+                margin-bottom: 14px;
+            }
+
+            .row {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 10px;
+            }
+
+            .row.three {
+                grid-template-columns: 1fr 1fr 1fr;
+            }
+
+            .actions {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+
+            .meta {
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 8px;
+                margin: 14px 0;
+            }
+
+            .metric {
+                border: 1px solid var(--line);
+                border-radius: 7px;
+                padding: 10px;
+                min-width: 0;
+            }
+
+            .metric .k {
+                display: block;
+                color: var(--muted);
+                font-size: 12px;
+                margin-bottom: 4px;
+            }
+
+            .metric .v {
+                display: block;
+                font-size: 14px;
+                font-weight: 720;
+                overflow-wrap: anywhere;
+            }
+
+            audio {
+                width: 100%;
+                display: block;
+                margin-bottom: 14px;
+            }
+
+            .wave-wrap {
+                position: relative;
+                border: 1px solid var(--line);
+                border-radius: 8px;
+                overflow: hidden;
+                background: #eef2f7;
+            }
+
+            canvas {
+                display: block;
+                width: 100%;
+                height: 220px;
+                cursor: crosshair;
+            }
+
+            .time-strip {
+                display: flex;
+                justify-content: space-between;
+                gap: 12px;
+                color: var(--muted);
+                font-size: 12px;
+                margin-top: 8px;
+            }
+
+            .transport {
+                display: grid;
+                grid-template-columns: repeat(5, minmax(0, 1fr));
+                gap: 8px;
+                margin: 14px 0;
+            }
+
+            .segmented {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                border: 1px solid var(--line);
+                border-radius: 7px;
+                overflow: hidden;
+            }
+
+            .segmented button {
+                border: 0;
+                border-radius: 0;
+                min-height: 40px;
+            }
+
+            .segmented button.active {
+                background: #e7f0ff;
+                color: var(--blue-dark);
+                font-weight: 720;
+            }
+
+            .output {
+                display: none;
+                margin-top: 14px;
+                border: 1px solid #b2f2bb;
+                border-radius: 8px;
+                background: #ebfbee;
+                padding: 12px;
+            }
+
+            .output a {
+                color: var(--green);
+                font-weight: 720;
+                text-decoration: none;
+            }
+
+            .warn {
+                color: var(--amber);
+                font-size: 12px;
+                line-height: 1.35;
+                margin-top: 8px;
+            }
+
+            @media (max-width: 860px) {
+                .topbar,
+                .grid {
+                    display: block;
+                }
+
+                .status {
+                    max-width: none;
+                    text-align: left;
+                    margin-top: 12px;
+                }
+
+                .panel {
+                    margin-bottom: 14px;
+                }
+
+                .meta,
+                .transport,
+                .row.three {
+                    grid-template-columns: 1fr 1fr;
+                }
+            }
+
+            @media (max-width: 560px) {
+                .shell {
+                    width: min(100vw - 18px, 1180px);
+                    margin-top: 12px;
+                }
+
+                .row,
+                .meta,
+                .transport,
+                .row.three {
+                    grid-template-columns: 1fr;
+                }
+
+                canvas {
+                    height: 180px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <main class="shell">
+            <div class="topbar">
+                <div>
+                    <h1>MP3 Trimmer</h1>
+                    <p class="subtitle">Frame-copy output, millisecond controls, originals untouched.</p>
+                </div>
+                <div id="status" class="status">Loading MP3 list</div>
+            </div>
+
+            <div class="grid">
+                <section class="panel">
+                    <h2>Source</h2>
+                    <div class="field">
+                        <label for="fileSelect">MP3</label>
+                        <select id="fileSelect"></select>
+                    </div>
+                    <div class="field">
+                        <label for="uploadInput">Upload</label>
+                        <input id="uploadInput" type="file" accept="audio/mpeg,.mp3" />
+                    </div>
+                    <div class="actions">
+                        <button id="uploadBtn">Upload</button>
+                        <button id="refreshBtn">Refresh</button>
+                    </div>
+                    <div id="sourceMeta" class="meta"></div>
+                </section>
+
+                <section class="panel">
+                    <h2>Edit</h2>
+                    <audio id="audio" controls preload="metadata"></audio>
+                    <div class="wave-wrap">
+                        <canvas id="wave"></canvas>
+                    </div>
+                    <div class="time-strip">
+                        <span id="startReadout">Start 0:00.000</span>
+                        <span id="playheadReadout">Playhead 0:00.000</span>
+                        <span id="endReadout">End 0:00.000</span>
+                    </div>
+
+                    <div class="transport">
+                        <button id="playPauseBtn">Play</button>
+                        <button id="jumpStartBtn">Jump Start</button>
+                        <button id="jumpEndBtn">Jump End</button>
+                        <button id="setStartBtn">Set Start</button>
+                        <button id="setEndBtn">Set End</button>
+                    </div>
+
+                    <div class="row">
+                        <div class="field">
+                            <label for="startInput">Start seconds</label>
+                            <input id="startInput" type="number" min="0" step="0.001" value="0.000" />
+                        </div>
+                        <div class="field">
+                            <label for="endInput">End seconds</label>
+                            <input id="endInput" type="number" min="0" step="0.001" value="0.000" />
+                        </div>
+                    </div>
+
+                    <div class="row three">
+                        <div class="field">
+                            <label>Active edge</label>
+                            <div class="segmented">
+                                <button id="activeStartBtn" class="active">Start</button>
+                                <button id="activeEndBtn">End</button>
+                            </div>
+                        </div>
+                        <div class="field">
+                            <label for="nudgeStep">Nudge</label>
+                            <select id="nudgeStep">
+                                <option value="1">1 ms</option>
+                                <option value="10" selected>10 ms</option>
+                                <option value="100">100 ms</option>
+                                <option value="500">500 ms</option>
+                                <option value="1000">1 s</option>
+                            </select>
+                        </div>
+                        <div class="field">
+                            <label for="loopPreview">Preview</label>
+                            <select id="loopPreview">
+                                <option value="on" selected>Loop selection</option>
+                                <option value="off">Play through</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="actions">
+                        <button id="nudgeBackBtn">- Nudge</button>
+                        <button id="nudgeForwardBtn">+ Nudge</button>
+                        <button id="playSelectionBtn">Play Selection</button>
+                    </div>
+
+                    <div class="row" style="margin-top: 14px">
+                        <div class="field">
+                            <label for="outputName">Output name</label>
+                            <input id="outputName" type="text" value="" />
+                        </div>
+                        <div class="field">
+                            <label for="selectionLength">Selection length</label>
+                            <input id="selectionLength" type="text" readonly value="0:00.000" />
+                        </div>
+                    </div>
+
+                    <button id="trimBtn" class="primary">Trim MP3</button>
+                    <div class="warn">
+                        Copy mode does not re-encode. Exact requests are rounded by MP3 frame boundaries, usually far below half a second.
+                    </div>
+                    <div id="output" class="output"></div>
+                </section>
+            </div>
+        </main>
+
+        <script>
+            const state = {
+                files: [],
+                file: null,
+                durationMs: 0,
+                startMs: 0,
+                endMs: 0,
+                activeEdge: "start",
+                dragging: null,
+                audioBuffer: null,
+                decodeToken: 0,
+            };
+
+            const els = {
+                status: document.getElementById("status"),
+                fileSelect: document.getElementById("fileSelect"),
+                uploadInput: document.getElementById("uploadInput"),
+                uploadBtn: document.getElementById("uploadBtn"),
+                refreshBtn: document.getElementById("refreshBtn"),
+                sourceMeta: document.getElementById("sourceMeta"),
+                audio: document.getElementById("audio"),
+                wave: document.getElementById("wave"),
+                startReadout: document.getElementById("startReadout"),
+                playheadReadout: document.getElementById("playheadReadout"),
+                endReadout: document.getElementById("endReadout"),
+                playPauseBtn: document.getElementById("playPauseBtn"),
+                jumpStartBtn: document.getElementById("jumpStartBtn"),
+                jumpEndBtn: document.getElementById("jumpEndBtn"),
+                setStartBtn: document.getElementById("setStartBtn"),
+                setEndBtn: document.getElementById("setEndBtn"),
+                startInput: document.getElementById("startInput"),
+                endInput: document.getElementById("endInput"),
+                activeStartBtn: document.getElementById("activeStartBtn"),
+                activeEndBtn: document.getElementById("activeEndBtn"),
+                nudgeStep: document.getElementById("nudgeStep"),
+                loopPreview: document.getElementById("loopPreview"),
+                nudgeBackBtn: document.getElementById("nudgeBackBtn"),
+                nudgeForwardBtn: document.getElementById("nudgeForwardBtn"),
+                playSelectionBtn: document.getElementById("playSelectionBtn"),
+                outputName: document.getElementById("outputName"),
+                selectionLength: document.getElementById("selectionLength"),
+                trimBtn: document.getElementById("trimBtn"),
+                output: document.getElementById("output"),
+            };
+
+            function setStatus(message, kind = "") {
+                els.status.textContent = message;
+                els.status.className = `status ${kind}`.trim();
+            }
+
+            function fmt(ms) {
+                ms = Math.max(0, Math.round(ms || 0));
+                const totalSeconds = Math.floor(ms / 1000);
+                const minutes = Math.floor(totalSeconds / 60);
+                const seconds = totalSeconds % 60;
+                const millis = ms % 1000;
+                return `${minutes}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+            }
+
+            function secValue(ms) {
+                return (Math.round(ms) / 1000).toFixed(3);
+            }
+
+            function clampMs(ms) {
+                return Math.min(Math.max(0, Math.round(ms)), state.durationMs || 0);
+            }
+
+            function setActive(edge) {
+                state.activeEdge = edge;
+                els.activeStartBtn.classList.toggle("active", edge === "start");
+                els.activeEndBtn.classList.toggle("active", edge === "end");
+            }
+
+            function setStart(ms) {
+                state.startMs = Math.min(clampMs(ms), Math.max(0, state.endMs - 1));
+                syncControls();
+            }
+
+            function setEnd(ms) {
+                state.endMs = Math.max(clampMs(ms), Math.min(state.durationMs, state.startMs + 1));
+                syncControls();
+            }
+
+            function syncControls() {
+                els.startInput.value = secValue(state.startMs);
+                els.endInput.value = secValue(state.endMs);
+                els.startReadout.textContent = `Start ${fmt(state.startMs)}`;
+                els.endReadout.textContent = `End ${fmt(state.endMs)}`;
+                els.selectionLength.value = fmt(state.endMs - state.startMs);
+                drawWave();
+            }
+
+            function renderMeta(meta) {
+                const rows = [
+                    ["Duration", fmt(meta.duration_ms)],
+                    ["Bitrate", meta.bit_rate_label],
+                    ["Sample rate", meta.sample_rate ? `${meta.sample_rate} Hz` : "unknown"],
+                    ["Size", meta.size_label],
+                ];
+                els.sourceMeta.innerHTML = rows
+                    .map(([k, v]) => `<div class="metric"><span class="k">${k}</span><span class="v">${v}</span></div>`)
+                    .join("");
+            }
+
+            function defaultOutputName(file) {
+                const stem = (file?.name || "trimmed.mp3").replace(/\.mp3$/i, "");
+                return `${stem}_trim.mp3`;
+            }
+
+            async function loadFiles(selectPath = "") {
+                const res = await fetch("/api/files");
+                const data = await res.json();
+                state.files = data.files || [];
+                els.fileSelect.innerHTML = "";
+
+                if (!state.files.length) {
+                    const opt = document.createElement("option");
+                    opt.textContent = "No MP3 files found";
+                    els.fileSelect.appendChild(opt);
+                    setStatus("No MP3 files found", "error");
+                    return;
+                }
+
+                for (const file of state.files) {
+                    const opt = document.createElement("option");
+                    opt.value = file.path;
+                    opt.textContent = `${file.folder} / ${file.name}`;
+                    els.fileSelect.appendChild(opt);
+                }
+
+                els.fileSelect.value = selectPath || state.files[0].path;
+                await loadSelected(els.fileSelect.value);
+            }
+
+            async function loadSelected(path) {
+                setStatus("Loading MP3");
+                els.output.style.display = "none";
+                state.audioBuffer = null;
+                const res = await fetch(`/api/probe?path=${encodeURIComponent(path)}`);
+                const data = await res.json();
+                if (!res.ok) {
+                    setStatus(data.error || "Could not load MP3", "error");
+                    return;
+                }
+
+                state.file = data.file;
+                state.durationMs = data.file.duration_ms;
+                state.startMs = 0;
+                state.endMs = Math.max(1, state.durationMs);
+                els.audio.src = data.file.url;
+                els.audio.load();
+                els.outputName.value = defaultOutputName(data.file);
+                renderMeta(data.file);
+                syncControls();
+                setStatus(`Loaded ${data.file.name}`, "ok");
+                decodeWave(data.file.url);
+            }
+
+            async function decodeWave(url) {
+                const token = ++state.decodeToken;
+                try {
+                    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                    const res = await fetch(url);
+                    const arrayBuffer = await res.arrayBuffer();
+                    const decoded = await ctx.decodeAudioData(arrayBuffer);
+                    await ctx.close();
+                    if (token === state.decodeToken) {
+                        state.audioBuffer = decoded;
+                        drawWave();
+                    }
+                } catch (err) {
+                    if (token === state.decodeToken) {
+                        state.audioBuffer = null;
+                        drawWave();
+                    }
+                }
+            }
+
+            function resizeCanvas() {
+                const dpr = window.devicePixelRatio || 1;
+                const rect = els.wave.getBoundingClientRect();
+                const width = Math.max(320, Math.round(rect.width * dpr));
+                const height = Math.max(160, Math.round(rect.height * dpr));
+                if (els.wave.width !== width || els.wave.height !== height) {
+                    els.wave.width = width;
+                    els.wave.height = height;
+                    drawWave();
+                }
+            }
+
+            function timeToX(ms) {
+                if (!state.durationMs) return 0;
+                return (ms / state.durationMs) * els.wave.width;
+            }
+
+            function xToTime(x) {
+                if (!state.durationMs) return 0;
+                return clampMs((x / els.wave.width) * state.durationMs);
+            }
+
+            function drawWave() {
+                const canvas = els.wave;
+                const ctx = canvas.getContext("2d");
+                const w = canvas.width || 1;
+                const h = canvas.height || 1;
+                ctx.clearRect(0, 0, w, h);
+                ctx.fillStyle = "#eef2f7";
+                ctx.fillRect(0, 0, w, h);
+
+                const mid = h / 2;
+                ctx.strokeStyle = "#c7d0dd";
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(0, mid);
+                ctx.lineTo(w, mid);
+                ctx.stroke();
+
+                if (state.audioBuffer) {
+                    const data = state.audioBuffer.getChannelData(0);
+                    const step = Math.max(1, Math.floor(data.length / w));
+                    ctx.strokeStyle = "#4b5563";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    for (let x = 0; x < w; x += 1) {
+                        let min = 1;
+                        let max = -1;
+                        const offset = x * step;
+                        for (let i = 0; i < step && offset + i < data.length; i += 1) {
+                            const value = data[offset + i];
+                            if (value < min) min = value;
+                            if (value > max) max = value;
+                        }
+                        ctx.moveTo(x, mid + min * mid * 0.88);
+                        ctx.lineTo(x, mid + max * mid * 0.88);
+                    }
+                    ctx.stroke();
+                } else {
+                    ctx.fillStyle = "#7b8796";
+                    ctx.font = `${14 * (window.devicePixelRatio || 1)}px sans-serif`;
+                    ctx.textAlign = "center";
+                    ctx.fillText("Waveform", w / 2, mid);
+                }
+
+                const sx = timeToX(state.startMs);
+                const ex = timeToX(state.endMs);
+                const px = timeToX((els.audio.currentTime || 0) * 1000);
+
+                ctx.fillStyle = "rgba(15, 23, 42, 0.36)";
+                ctx.fillRect(0, 0, sx, h);
+                ctx.fillRect(ex, 0, Math.max(0, w - ex), h);
+                ctx.fillStyle = "rgba(37, 99, 235, 0.13)";
+                ctx.fillRect(sx, 0, Math.max(1, ex - sx), h);
+
+                drawHandle(ctx, sx, h, "#087f5b");
+                drawHandle(ctx, ex, h, "#c92a2a");
+                ctx.strokeStyle = "#111827";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(px, 0);
+                ctx.lineTo(px, h);
+                ctx.stroke();
+            }
+
+            function drawHandle(ctx, x, h, color) {
+                ctx.strokeStyle = color;
+                ctx.fillStyle = color;
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, h);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(x, 18, 7, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            function canvasPoint(evt) {
+                const rect = els.wave.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                return {
+                    x: (evt.clientX - rect.left) * dpr,
+                    y: (evt.clientY - rect.top) * dpr,
+                };
+            }
+
+            function moveEdge(edge, ms) {
+                if (edge === "start") {
+                    setStart(ms);
+                } else {
+                    setEnd(ms);
+                }
+            }
+
+            function currentMs() {
+                return clampMs((els.audio.currentTime || 0) * 1000);
+            }
+
+            function nudge(direction) {
+                const amount = Number(els.nudgeStep.value || 10) * direction;
+                if (state.activeEdge === "start") {
+                    setStart(state.startMs + amount);
+                } else {
+                    setEnd(state.endMs + amount);
+                }
+            }
+
+            async function uploadMp3() {
+                const file = els.uploadInput.files[0];
+                if (!file) {
+                    setStatus("Choose an MP3 file first", "error");
+                    return;
+                }
+                const body = new FormData();
+                body.append("file", file);
+                setStatus("Uploading MP3");
+                const res = await fetch("/api/upload", { method: "POST", body });
+                const data = await res.json();
+                if (!res.ok) {
+                    setStatus(data.error || "Upload failed", "error");
+                    return;
+                }
+                await loadFiles(data.file.path);
+            }
+
+            async function trimMp3() {
+                if (!state.file) return;
+                setStatus("Trimming with FFmpeg copy mode");
+                els.trimBtn.disabled = true;
+                try {
+                    const res = await fetch("/api/trim", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            path: state.file.path,
+                            start_ms: state.startMs,
+                            end_ms: state.endMs,
+                            output_name: els.outputName.value,
+                        }),
+                    });
+                    const data = await res.json();
+                    if (!res.ok) {
+                        throw new Error(data.error || "Trim failed");
+                    }
+                    await loadFiles(data.output.path);
+                    els.output.innerHTML = `
+                        <div><a href="${data.output.url}" download>${data.output.name}</a></div>
+                        <div>${fmt(data.output.duration_ms)} / ${data.output.bit_rate_label} / ${data.output.size_label}</div>
+                    `;
+                    els.output.style.display = "block";
+                    setStatus("Trim complete", "ok");
+                } catch (err) {
+                    setStatus(err.message || "Trim failed", "error");
+                } finally {
+                    els.trimBtn.disabled = false;
+                }
+            }
+
+            els.fileSelect.addEventListener("change", () => loadSelected(els.fileSelect.value));
+            els.uploadBtn.addEventListener("click", uploadMp3);
+            els.refreshBtn.addEventListener("click", () => loadFiles(els.fileSelect.value));
+            els.playPauseBtn.addEventListener("click", async () => {
+                if (els.audio.paused) {
+                    await els.audio.play();
+                } else {
+                    els.audio.pause();
+                }
+            });
+            els.jumpStartBtn.addEventListener("click", () => {
+                els.audio.currentTime = state.startMs / 1000;
+            });
+            els.jumpEndBtn.addEventListener("click", () => {
+                els.audio.currentTime = Math.max(0, state.endMs - 100) / 1000;
+            });
+            els.setStartBtn.addEventListener("click", () => {
+                setActive("start");
+                setStart(currentMs());
+            });
+            els.setEndBtn.addEventListener("click", () => {
+                setActive("end");
+                setEnd(currentMs());
+            });
+            els.startInput.addEventListener("change", () => setStart(Number(els.startInput.value) * 1000));
+            els.endInput.addEventListener("change", () => setEnd(Number(els.endInput.value) * 1000));
+            els.activeStartBtn.addEventListener("click", () => setActive("start"));
+            els.activeEndBtn.addEventListener("click", () => setActive("end"));
+            els.nudgeBackBtn.addEventListener("click", () => nudge(-1));
+            els.nudgeForwardBtn.addEventListener("click", () => nudge(1));
+            els.playSelectionBtn.addEventListener("click", async () => {
+                els.audio.currentTime = state.startMs / 1000;
+                await els.audio.play();
+            });
+            els.trimBtn.addEventListener("click", trimMp3);
+
+            els.wave.addEventListener("mousedown", (evt) => {
+                const point = canvasPoint(evt);
+                const startDistance = Math.abs(point.x - timeToX(state.startMs));
+                const endDistance = Math.abs(point.x - timeToX(state.endMs));
+                const edge = startDistance <= endDistance ? "start" : "end";
+                state.dragging = edge;
+                setActive(edge);
+                moveEdge(edge, xToTime(point.x));
+            });
+            window.addEventListener("mousemove", (evt) => {
+                if (!state.dragging) return;
+                moveEdge(state.dragging, xToTime(canvasPoint(evt).x));
+            });
+            window.addEventListener("mouseup", () => {
+                state.dragging = null;
+            });
+            els.wave.addEventListener("dblclick", (evt) => {
+                els.audio.currentTime = xToTime(canvasPoint(evt).x) / 1000;
+            });
+
+            els.audio.addEventListener("play", () => {
+                els.playPauseBtn.textContent = "Pause";
+            });
+            els.audio.addEventListener("pause", () => {
+                els.playPauseBtn.textContent = "Play";
+            });
+            els.audio.addEventListener("timeupdate", () => {
+                const playMs = currentMs();
+                els.playheadReadout.textContent = `Playhead ${fmt(playMs)}`;
+                if (els.loopPreview.value === "on" && playMs >= state.endMs) {
+                    els.audio.currentTime = state.startMs / 1000;
+                    if (els.audio.paused) els.audio.play();
+                }
+                drawWave();
+            });
+            els.audio.addEventListener("loadedmetadata", () => {
+                if (!state.durationMs && Number.isFinite(els.audio.duration)) {
+                    state.durationMs = Math.round(els.audio.duration * 1000);
+                    state.endMs = state.durationMs;
+                    syncControls();
+                }
+            });
+
+            window.addEventListener("resize", resizeCanvas);
+            resizeCanvas();
+            loadFiles().catch((err) => setStatus(err.message || "Could not load MP3 list", "error"));
+        </script>
+    </body>
+</html>

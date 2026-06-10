@@ -42,3 +42,4 @@ download_list.txt
 *.cache
 .loudness_cache.json
 .track_emb_cache.npz
+!templates/trimmer.html

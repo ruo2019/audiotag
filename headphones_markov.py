@@ -983,6 +983,7 @@ class CursesTUI:
         self.playlist_add_similar_request = False
         self.playlist_add_most_request = False
         self.playlist_item_remove_request: Optional[int] = None
+        self.playlist_item_toggle_request: Optional[int] = None
         self.playlist_item_drag_start: Optional[int] = None
         self.playlist_item_drag_target: Optional[int] = None
         self.playlist_item_drag_commit_target: Optional[int] = None
@@ -1032,6 +1033,8 @@ class CursesTUI:
         self.playlist_load_col_end = 0
         self.playlist_done_col_start = 0
         self.playlist_done_col_end = 0
+        self.playlist_item_mode_col_start = 0
+        self.playlist_item_mode_col_end = 0
         self.tag_bounds = (0, 0, 0, 0)  # x, y, w, h
         self.most_bounds = (0, 0, 0, 0)  # x, y, w, h
         self.most_add_col_start = 0
@@ -1191,7 +1194,7 @@ class CursesTUI:
             "Tags: click row, [edit], [delete], [close]",
             "Most: click [by:count/time] or Ctrl+T",
             "Playlists: click to edit, double-click to load; [add] adds tracks",
-            "Playlist edit: drag reorder, double-click track to remove, [load]/[done]",
+            "Playlist edit: click loop/once, drag reorder, double-click remove",
             "Ctrl+W: save queue (Playlists)",
             "Enter on Playlists: load selected",
             "Ctrl+D: delete selected playlist",
@@ -1282,6 +1285,8 @@ class CursesTUI:
                     max(0, self.playlist_track_len - 1), drop_idx
                 )
                 if drop_idx == self.playlist_item_drag_start:
+                    if self.playlist_item_mode_col_start <= mx < self.playlist_item_mode_col_end:
+                        self.playlist_item_toggle_request = drop_idx
                     self.playlist_item_drag_commit_target = None
                 else:
                     self.playlist_item_drag_commit_target = drop_idx
@@ -1304,6 +1309,9 @@ class CursesTUI:
             idx = self.playlist_track_scroll + row
             if row >= 0 and 0 <= idx < self.playlist_track_len:
                 self.playlist_track_selected = idx
+                if self.playlist_item_mode_col_start <= mx < self.playlist_item_mode_col_end:
+                    self.playlist_item_toggle_request = idx
+                    return True
                 now = time.monotonic()
                 if (
                     self._last_click_panel == "playlist_items"
@@ -1867,6 +1875,8 @@ class CursesTUI:
         current_play_once: Optional[bool],
         counts: Dict[str, int],
         listen_hours_for_stem: Optional[Callable[[str, int], float]],
+        total_listens: int,
+        total_listen_hours: float,
         similar_entries: Optional[List[Tuple[str, float]]],
         similar_mood: Optional[str],
         queue_items: Optional[List[Dict[str, object]]],
@@ -1977,7 +1987,13 @@ class CursesTUI:
         self._draw(2, 2, f"Target LUFS: {td}")
         self._draw(3, 2, f"Current LUFS: {cd}")
         self._draw(4, 2, f"LUFS Diff: {ld}")
-        self._draw(5, 2, f"Adjusted Volume: {vs}")
+        volume_line = f"Adjusted Volume: {vs}"
+        self._draw(5, 2, volume_line)
+        listen_word = "listen" if total_listens == 1 else "listens"
+        stats_line = f"Total: {total_listens:n} {listen_word}, {total_listen_hours:.1f} hours"
+        stats_x = max(len(volume_line) + 6, w - len(stats_line) - 2)
+        if stats_x + len(stats_line) < w:
+            self._draw(5, stats_x, stats_line)
 
         bar_y = 6
         bar_w = max(10, w - 20)
@@ -2149,10 +2165,9 @@ class CursesTUI:
                 self.similar_scroll = self.similar_selected - s_content_h + 1
             self.similar_scroll = min(self.similar_scroll, s_max_scroll)
             s_rows: List[str] = []
-            s_add_space = len(playlist_add_chip) + 1 if playlist_add_chip else 0
-            s_name_w = max(1, right_w - (2 + 3 + 3 + 6 + 5 + s_add_space))
+            s_name_w = max(1, right_w - (2 + 3 + 3 + 6 + 5))
             self.similar_add_col_start = (
-                right_x + right_w - len(playlist_add_chip) - 1
+                right_x + 8 + s_name_w - len(playlist_add_chip)
                 if playlist_add_chip
                 else 0
             )
@@ -2164,13 +2179,12 @@ class CursesTUI:
             for i in range(self.similar_scroll, min(len(entries), self.similar_scroll + s_content_h)):
                 base, score = entries[i]
                 sel = ">" if i == self.similar_selected and self.focus_panel == "similar" else " "
-                base = str(base)[:s_name_w].ljust(s_name_w)
+                if playlist_add_chip and i == self.similar_selected:
+                    base_w = max(1, s_name_w - len(playlist_add_chip) - 1)
+                    base = str(base)[:base_w].ljust(base_w) + " " + playlist_add_chip
+                else:
+                    base = str(base)[:s_name_w].ljust(s_name_w)
                 row = f"{sel} {i+1:>3} | {base}| {score:>6.3f}  "
-                if playlist_add_chip:
-                    row_add_chip = playlist_add_chip if i == self.similar_selected else ""
-                    row = row[: max(0, right_w - len(playlist_add_chip) - 1)].ljust(
-                        max(0, right_w - len(playlist_add_chip) - 1)
-                    ) + row_add_chip
                 s_rows.append(row)
             s_title = "[Similar]" if self.focus_panel == "similar" else " Similar "
             if similar_mood:
@@ -2189,14 +2203,13 @@ class CursesTUI:
                 self.queue_scroll = self.queue_selected - q_content_h + 1
             self.queue_scroll = min(self.queue_scroll, q_max_scroll)
             q_rows: List[str] = []
-            q_add_space = len(playlist_add_chip) + 1 if playlist_add_chip else 0
-            q_name_w = max(1, right_w - (2 + 3 + 3 + 4 + 5 + q_add_space))
+            q_name_w = max(1, right_w - (2 + 3 + 3 + 4 + 5))
             self.queue_name_col_start = right_x + 8
             self.queue_name_col_end = self.queue_name_col_start + q_name_w
             self.queue_mode_col_start = self.queue_name_col_end + 2
             self.queue_mode_col_end = self.queue_mode_col_start + 4
             self.queue_add_col_start = (
-                right_x + right_w - len(playlist_add_chip) - 1
+                right_x + 8 + q_name_w - len(playlist_add_chip)
                 if playlist_add_chip
                 else 0
             )
@@ -2221,13 +2234,12 @@ class CursesTUI:
                     sel = "D"
                 else:
                     sel = ">" if i == self.queue_selected and self.focus_panel == "queue" else " "
-                name = name[:q_name_w].ljust(q_name_w)
+                if playlist_add_chip and i == self.queue_selected:
+                    name_w = max(1, q_name_w - len(playlist_add_chip) - 1)
+                    name = name[:name_w].ljust(name_w) + " " + playlist_add_chip
+                else:
+                    name = name[:q_name_w].ljust(q_name_w)
                 row = f"{sel} {i+1:>3} | {name}| {mode:>4}  "
-                if playlist_add_chip:
-                    row_add_chip = playlist_add_chip if i == self.queue_selected else ""
-                    row = row[: max(0, right_w - len(playlist_add_chip) - 1)].ljust(
-                        max(0, right_w - len(playlist_add_chip) - 1)
-                    ) + row_add_chip
                 q_rows.append(row)
             q_title = "[Queue]" if self.focus_panel == "queue" else " Queue "
             render_pane(q_title.ljust(right_w), q_rows, right_x, mid_y, right_w, mid_h)
@@ -2276,6 +2288,8 @@ class CursesTUI:
                 render_pane(t_title.ljust(right_w), t_rows, right_x, bot_y, right_w, bot_h)
                 self.tag_bounds = (right_x, bot_y, right_w, bot_h)
                 self.playlist_bounds = (0, 0, 0, 0)
+                self.playlist_item_mode_col_start = 0
+                self.playlist_item_mode_col_end = 0
             else:
                 self.tag_len = 0
                 self.tag_bounds = (0, 0, 0, 0)
@@ -2293,7 +2307,9 @@ class CursesTUI:
                     self.playlist_track_scroll = min(self.playlist_track_scroll, p_max_scroll)
 
                     p_rows = []
-                    p_name_w = max(1, right_w - (2 + 3 + 3))
+                    p_name_w = max(1, right_w - (2 + 3 + 3 + 4 + 5))
+                    self.playlist_item_mode_col_start = right_x + 8 + p_name_w + 2
+                    self.playlist_item_mode_col_end = self.playlist_item_mode_col_start + 4
                     order = list(range(self.playlist_track_len))
                     if (
                         self.playlist_item_drag_start is not None
@@ -2310,6 +2326,7 @@ class CursesTUI:
                     ):
                         item = playlist_items[order[i]]
                         base = str(item.get("base") or "(unknown)")
+                        mode = "once" if bool(item.get("play_once")) else "loop"
                         if (
                             self.playlist_item_drag_start is not None
                             and order[i] == self.playlist_item_drag_start
@@ -2318,7 +2335,7 @@ class CursesTUI:
                         else:
                             sel = ">" if i == self.playlist_track_selected and self.focus_panel == "playlists" else " "
                         base = base[:p_name_w].ljust(p_name_w)
-                        row = f"{sel} {i+1:>3} | {base}"
+                        row = f"{sel} {i+1:>3} | {base}| {mode:>4}  "
                         p_rows.append(row)
                     if not playlist_items:
                         p_rows.append("  (empty; click [add] on a track)")
@@ -2355,6 +2372,8 @@ class CursesTUI:
                     self.playlist_load_col_end = 0
                     self.playlist_done_col_start = 0
                     self.playlist_done_col_end = 0
+                    self.playlist_item_mode_col_start = 0
+                    self.playlist_item_mode_col_end = 0
                     if self.playlist_selected >= len(playlists):
                         self.playlist_selected = max(0, len(playlists) - 1)
                     p_content_h = max(0, bot_h - 1)
@@ -2777,6 +2796,8 @@ def main(
             continue
         stem = Path(key).stem
         duration_by_stem[stem] = float(entry.get("duration") or 0.0)
+    for track_name, duration in history_duration_by_track_name.items():
+        duration_by_stem.setdefault(Path(track_name).stem, float(duration or 0.0))
 
     current_top_n = clamp_int(top_n, TOP_MIN, TOP_MAX)
     runtime_target_lufs: Optional[float] = target_lufs
@@ -3011,6 +3032,18 @@ def main(
                 dur = get_audio_duration_seconds(track_path)
                 duration_by_stem[stem] = dur
         return (max(0, int(listens)) * dur) / 3600.0
+
+    def total_listen_stats() -> Tuple[int, float]:
+        total_listens = 0
+        total_hours = 0.0
+        for stem, listens in counts.items():
+            try:
+                listen_count = max(0, int(listens))
+            except Exception:
+                listen_count = 0
+            total_listens += listen_count
+            total_hours += listen_hours_for_stem(stem, listen_count)
+        return total_listens, total_hours
 
     def apply_new_target_loudness(
         new_target: Optional[float],
@@ -3389,6 +3422,17 @@ def main(
                     tui.status_msg = "No track to add."
 
             items = playlists_db.get(active_playlist_name or "", [])
+            if tui.playlist_item_toggle_request is not None:
+                idx = tui.playlist_item_toggle_request
+                tui.playlist_item_toggle_request = None
+                if 0 <= idx < len(items):
+                    item = items[idx]
+                    play_once = not bool(item.get("play_once", False))
+                    item["play_once"] = play_once
+                    save_playlists(playlists_db, playlists_filename)
+                    mode = "once" if play_once else "loop"
+                    tui.status_msg = f"Set playlist item to {mode}."
+
             if tui.playlist_item_drag_commit_target is not None:
                 start_idx = (
                     tui.playlist_item_drag_commit_start
@@ -3517,6 +3561,7 @@ def main(
                     mac_is_locked_poll(), lock_since_wall, next_exit_dt
                 )
 
+                total_listens, total_hours = total_listen_stats()
                 submitted = tui.render(
                     now_playing="",
                     target_lufs=None,
@@ -3529,6 +3574,8 @@ def main(
                     current_play_once=None,
                     counts=counts,
                     listen_hours_for_stem=listen_hours_for_stem,
+                    total_listens=total_listens,
+                    total_listen_hours=total_hours,
                     similar_entries=current_similar_entries,
                     similar_mood=current_similar_mood,
                     queue_items=queue,
@@ -3578,6 +3625,7 @@ def main(
                     if not enable_tui:
                         time.sleep(0.2)
                         continue
+                    total_listens, total_hours = total_listen_stats()
                     submitted = tui.render(
                         now_playing="",
                         target_lufs=None,
@@ -3590,6 +3638,8 @@ def main(
                         current_play_once=None,
                         counts=counts,
                         listen_hours_for_stem=listen_hours_for_stem,
+                        total_listens=total_listens,
+                        total_listen_hours=total_hours,
                         similar_entries=current_similar_entries,
                         similar_mood=current_similar_mood,
                         queue_items=queue,
@@ -3713,6 +3763,7 @@ def main(
                                     max(0.0, time.monotonic() - started_ts),
                                     total_dur if total_dur > 0 else 0.0,
                                 )
+                                total_listens, total_hours = total_listen_stats()
                                 submitted = tui.render(
                                     now_playing=filename_ext,
                                     target_lufs=resolved_target_loudness,
@@ -3729,6 +3780,8 @@ def main(
                                     current_play_once=item_effective_play_once(current_item),
                                     counts=counts,
                                     listen_hours_for_stem=listen_hours_for_stem,
+                                    total_listens=total_listens,
+                                    total_listen_hours=total_hours,
                                     similar_entries=current_similar_entries,
                                     similar_mood=current_similar_mood,
                                     queue_items=queue,

@@ -48,10 +48,10 @@ DEFAULT_WINDOW_MINUTES = AUTOPLAY_WINDOW_SECONDS / 60.0
 DEFAULT_FALLBACK_PROBABILITY = 0.0
 DEFAULT_OUTPUT_TEMPLATE = "autoplay_graph_{folder}.html"
 DEFAULT_PAIRING_MODE = "consecutive"
-MIN_RELATIVE_DURATION_MULTIPLIER = 0.25
-MAX_RELATIVE_DURATION_MULTIPLIER = 4.0
-RELATIVE_DURATION_LOW_QUANTILE = 0.25
-RELATIVE_DURATION_HIGH_QUANTILE = 0.75
+PLAY_NODE_MIN_SIZE = 18
+PLAY_NODE_SIZE_RANGE = 28
+LISTEN_HOURS_NODE_MIN_SIZE = 12
+LISTEN_HOURS_NODE_SIZE_RANGE = 42
 VIS_NETWORK_CDN = "https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"
 LISTEN_COUNTS_FILE = "listen_counts.json"
 MID_LISTEN_COUNTS_FILE = "mid_listen_counts.json"
@@ -84,7 +84,10 @@ def parse_args() -> argparse.Namespace:
         "--window-minutes",
         type=float,
         default=DEFAULT_WINDOW_MINUTES,
-        help="Maximum time gap for linking plays (default: 10)",
+        help=(
+            "Maximum idle time after the source track duration for linking plays "
+            "(default: 10)"
+        ),
     )
     parser.add_argument(
         "--pairing",
@@ -295,16 +298,27 @@ def build_global_events(history_mapping):
     return events
 
 
-def build_transition_counts(events, window_seconds: int, pairing_mode: str, include_self_loops: bool):
+def build_transition_counts(
+    events,
+    window_seconds: int,
+    pairing_mode: str,
+    include_self_loops: bool,
+    durations=None,
+):
     edge_counts = Counter()
     edge_gaps = defaultdict(list)
+    durations = durations or {}
+
+    def max_start_gap_seconds(song_name: str) -> float:
+        duration_seconds = max(0.0, float(durations.get(song_name, 0.0) or 0.0))
+        return float(window_seconds) + duration_seconds
 
     if pairing_mode == "consecutive":
         for current_event, next_event in zip(events, events[1:]):
             current_timestamp, current_song = current_event
             next_timestamp, next_song = next_event
             gap_seconds = next_timestamp - current_timestamp
-            if gap_seconds < 0 or gap_seconds > window_seconds:
+            if gap_seconds < 0 or gap_seconds > max_start_gap_seconds(current_song):
                 continue
             if not include_self_loops and current_song == next_song:
                 continue
@@ -314,10 +328,11 @@ def build_transition_counts(events, window_seconds: int, pairing_mode: str, incl
 
     for start_index, (current_timestamp, current_song) in enumerate(events):
         next_index = start_index + 1
+        max_gap_seconds = max_start_gap_seconds(current_song)
         while next_index < len(events):
             next_timestamp, next_song = events[next_index]
             gap_seconds = next_timestamp - current_timestamp
-            if gap_seconds > window_seconds:
+            if gap_seconds > max_gap_seconds:
                 break
             if gap_seconds >= 0 and (include_self_loops or current_song != next_song):
                 edge_counts[(current_song, next_song)] += 1
@@ -329,20 +344,6 @@ def build_transition_counts(events, window_seconds: int, pairing_mode: str, incl
 
 def clamp_probability(value: float) -> float:
     return max(0.0, min(1.0, value))
-
-
-def percentile(sorted_values, quantile: float) -> float:
-    if not sorted_values:
-        return 0.0
-    quantile = max(0.0, min(1.0, quantile))
-    position = quantile * (len(sorted_values) - 1)
-    lower_index = int(math.floor(position))
-    upper_index = int(math.ceil(position))
-    if lower_index == upper_index:
-        return float(sorted_values[lower_index])
-    lower_value = float(sorted_values[lower_index])
-    upper_value = float(sorted_values[upper_index])
-    return lower_value + (upper_value - lower_value) * (position - lower_index)
 
 
 def build_graph_payload(
@@ -378,30 +379,11 @@ def build_graph_payload(
         song_name: max(0.0, float(durations.get(song_name, 0.0) or 0.0))
         for song_name in song_names
     }
-    positive_durations = sorted(value for value in duration_by_song.values() if value > 0)
-    low_duration_seconds = percentile(positive_durations, RELATIVE_DURATION_LOW_QUANTILE)
-    high_duration_seconds = percentile(positive_durations, RELATIVE_DURATION_HIGH_QUANTILE)
-    duration_range_seconds = max(0.0, high_duration_seconds - low_duration_seconds)
-    duration_weight_by_song = {}
-    duration_multiplier_by_song = {}
-    duration_position_by_song = {}
-    for song_name in song_names:
-        play_count = max(0, int(song_counts[song_name]))
-        duration_seconds = duration_by_song.get(song_name, 0.0)
-        if duration_range_seconds > 0 and duration_seconds > 0:
-            duration_position = (duration_seconds - low_duration_seconds) / duration_range_seconds
-            duration_position = max(0.0, min(1.0, duration_position))
-        else:
-            duration_position = 0.5
-        duration_multiplier = (
-            MIN_RELATIVE_DURATION_MULTIPLIER
-            + (MAX_RELATIVE_DURATION_MULTIPLIER - MIN_RELATIVE_DURATION_MULTIPLIER)
-            * duration_position
-        )
-        duration_position_by_song[song_name] = duration_position
-        duration_multiplier_by_song[song_name] = duration_multiplier
-        duration_weight_by_song[song_name] = play_count * duration_multiplier
-    max_duration_weight = max(duration_weight_by_song.values(), default=0.0)
+    listen_time_by_song = {
+        song_name: max(0, int(song_counts[song_name])) * duration_by_song.get(song_name, 0.0)
+        for song_name in song_names
+    }
+    max_listen_time_seconds = max(listen_time_by_song.values(), default=0.0)
     max_edge_count = max(edge_counts.values(), default=1)
 
     nodes = []
@@ -421,14 +403,18 @@ def build_graph_payload(
         fallback_per_song_probability = 0.0
 
         duration_seconds = duration_by_song.get(song_name, 0.0)
-        listen_time_seconds = max(0, int(play_count)) * duration_seconds
-        duration_multiplier = duration_multiplier_by_song.get(song_name, 1.0)
-        duration_position = duration_position_by_song.get(song_name, 0.5)
-        duration_weight = duration_weight_by_song.get(song_name, 0.0)
-        play_node_size = 18 + 28 * math.sqrt(play_count / max_play_count) if max_play_count > 0 else 18
-        duration_node_size = (
-            18 + 28 * math.sqrt(duration_weight / max_duration_weight)
-            if max_duration_weight > 0
+        listen_time_seconds = listen_time_by_song.get(song_name, 0.0)
+        play_node_size = (
+            PLAY_NODE_MIN_SIZE
+            + PLAY_NODE_SIZE_RANGE * math.sqrt(play_count / max_play_count)
+            if max_play_count > 0
+            else PLAY_NODE_MIN_SIZE
+        )
+        listen_time_node_size = (
+            LISTEN_HOURS_NODE_MIN_SIZE
+            + LISTEN_HOURS_NODE_SIZE_RANGE
+            * (listen_time_seconds / max_listen_time_seconds)
+            if max_listen_time_seconds > 0
             else play_node_size
         )
         nodes.append(
@@ -436,14 +422,11 @@ def build_graph_payload(
                 "id": song_name,
                 "label": display_label,
                 "sourceGroup": source_group,
-                "value": play_count,
                 "size": round(play_node_size, 2),
                 "playSize": round(play_node_size, 2),
-                "durationWeightedSize": round(duration_node_size, 2),
+                "listenTimeSize": round(listen_time_node_size, 2),
                 "playCount": play_count,
                 "durationSeconds": round(duration_seconds, 2),
-                "relativeDurationPosition": round(duration_position, 3),
-                "relativeDurationMultiplier": round(duration_multiplier, 3),
                 "listenTimeSeconds": round(listen_time_seconds, 2),
                 "historyCount": history_count,
                 "outgoingObservedCount": observed_outgoing_count,
@@ -458,7 +441,6 @@ def build_graph_payload(
                     f"{f'Folder: {source_group}<br>' if source_group else ''}"
                     f"Plays: {play_count}<br>"
                     f"Duration: {duration_seconds / 60:.2f} minutes<br>"
-                    f"Relative length multiplier: {duration_multiplier:.2f}x<br>"
                     f"Total listen time: {listen_time_seconds / 3600:.2f} hours<br>"
                     f"History entries: {history_count}<br>"
                     f"Observed outgoing transitions: {observed_outgoing_count}<br>"
@@ -506,10 +488,6 @@ def build_graph_payload(
             "pairingMode": pairing_mode,
             "generatedFrom": generated_from,
             "maxEdgeCount": max_edge_count,
-            "lowDurationSeconds": round(low_duration_seconds, 2),
-            "highDurationSeconds": round(high_duration_seconds, 2),
-            "minRelativeDurationMultiplier": MIN_RELATIVE_DURATION_MULTIPLIER,
-            "maxRelativeDurationMultiplier": MAX_RELATIVE_DURATION_MULTIPLIER,
         },
         "nodes": nodes,
         "edges": edges,
@@ -720,7 +698,7 @@ def build_html(graph_payload):
     </label>
     <label class=\"checkbox\">
       <input id=\"listen-time-size-toggle\" type=\"checkbox\">
-      Size by relative length
+      Size by listen hours
     </label>
   </div>
   <div class=\"layout\">
@@ -798,14 +776,30 @@ def build_html(graph_payload):
     }}
 
     function getNodeSize(node) {{
-      return listenTimeSizeToggle.checked ? node.durationWeightedSize : node.playSize;
+      return listenTimeSizeToggle.checked ? node.listenTimeSize : node.playSize;
+    }}
+
+    function buildVisibleNode(node) {{
+      return {{
+        ...node,
+        value: undefined,
+        size: getNodeSize(node),
+        font: {{ color: '#142130', size: 18, face: 'Inter' }},
+        color: node.id === selectedNodeId
+          ? {{
+              background: '#ff8a65',
+              border: '#eb5757',
+              highlight: {{ background: '#ff8a65', border: '#eb5757' }}
+            }}
+          : getNodeColor(node)
+      }};
     }}
 
     function describeSizingMode() {{
       if (!listenTimeSizeToggle.checked) {{
         return 'Sizing: play count';
       }}
-      return `Sizing: plays × relative length (${{graphData.summary.minRelativeDurationMultiplier}}x-${{graphData.summary.maxRelativeDurationMultiplier}}x)`;
+      return 'Sizing: listen hours';
     }}
 
     function refreshSizingSummary() {{
@@ -813,10 +807,7 @@ def build_html(graph_payload):
     }}
 
     const nodeDataSet = new vis.DataSet(allNodes.map((node) => ({{
-      ...node,
-      size: getNodeSize(node),
-      font: {{ color: '#142130', size: 18, face: 'Inter' }},
-      color: getNodeColor(node)
+      ...buildVisibleNode(node)
     }})));
     const edgeDataSet = new vis.DataSet([]);
 
@@ -913,17 +904,8 @@ def build_html(graph_payload):
       nodeDataSet.add(allNodes
         .filter((node) => !neighborhoodOnly || !selectedNodeId || connectedNodeIds.has(node.id) || node.id === selectedNodeId)
         .map((node) => ({{
-          ...node,
-          size: getNodeSize(node),
+          ...buildVisibleNode(node),
           hidden: neighborhoodOnly && selectedNodeId && !connectedNodeIds.has(node.id) && node.id !== selectedNodeId,
-          font: {{ color: '#142130', size: 18, face: 'Inter' }},
-          color: node.id === selectedNodeId
-            ? {{
-                background: '#ff8a65',
-                border: '#eb5757',
-                highlight: {{ background: '#ff8a65', border: '#eb5757' }}
-              }}
-            : getNodeColor(node)
         }})));
       edgeDataSet.clear();
       edgeDataSet.add(filteredEdges);
@@ -959,8 +941,6 @@ def build_html(graph_payload):
         <div class=\"metric-grid\">
           <div class=\"metric\"><div class=\"label\">Play count</div><div class=\"value\">${{node.playCount}}</div></div>
           <div class=\"metric\"><div class=\"label\">Duration</div><div class=\"value\">${{formatDuration(node.durationSeconds)}}</div></div>
-          <div class=\"metric\"><div class=\"label\">Length rank</div><div class=\"value\">${{Math.round(node.relativeDurationPosition * 100)}}%</div></div>
-          <div class=\"metric\"><div class=\"label\">Length multiplier</div><div class=\"value\">${{node.relativeDurationMultiplier.toFixed(2)}}x</div></div>
           <div class=\"metric\"><div class=\"label\">Listen time</div><div class=\"value\">${{formatListenTime(node.listenTimeSeconds)}}</div></div>
           <div class=\"metric\"><div class=\"label\">History entries</div><div class=\"value\">${{node.historyCount}}</div></div>
           <div class=\"metric\"><div class=\"label\">Observed outgoing</div><div class=\"value\">${{node.outgoingObservedCount}}</div></div>
@@ -1109,6 +1089,7 @@ def main() -> int:
         window_seconds=window_seconds,
         pairing_mode=args.pairing,
         include_self_loops=args.include_self_loops,
+        durations=durations,
     )
 
     graph_payload = build_graph_payload(

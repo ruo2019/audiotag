@@ -13,6 +13,11 @@ from datetime import datetime
 from pathlib import Path
 
 try:
+    from mutagen.mp3 import MP3
+except ModuleNotFoundError:  # pragma: no cover - duration data is optional
+    MP3 = None
+
+try:
     from cli_helpers import print_banner, print_message, require_console
 except ModuleNotFoundError:  # pragma: no cover - standalone fallback
     def print_banner(message: str, _console=None) -> None:
@@ -43,6 +48,10 @@ DEFAULT_WINDOW_MINUTES = AUTOPLAY_WINDOW_SECONDS / 60.0
 DEFAULT_FALLBACK_PROBABILITY = 0.0
 DEFAULT_OUTPUT_TEMPLATE = "autoplay_graph_{folder}.html"
 DEFAULT_PAIRING_MODE = "consecutive"
+MIN_RELATIVE_DURATION_MULTIPLIER = 0.25
+MAX_RELATIVE_DURATION_MULTIPLIER = 4.0
+RELATIVE_DURATION_LOW_QUANTILE = 0.25
+RELATIVE_DURATION_HIGH_QUANTILE = 0.75
 VIS_NETWORK_CDN = "https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"
 LISTEN_COUNTS_FILE = "listen_counts.json"
 MID_LISTEN_COUNTS_FILE = "mid_listen_counts.json"
@@ -151,6 +160,23 @@ def parse_repo_timestamp(value):
         return None
 
 
+def get_audio_duration_seconds(mp3_path: Path) -> float:
+    if MP3 is None:
+        return 0.0
+    try:
+        return max(0.0, float(MP3(str(mp3_path)).info.length or 0.0))
+    except Exception:
+        return 0.0
+
+
+def load_folder_durations(folder: Path):
+    durations = {}
+    for path in folder.iterdir():
+        if path.is_file() and path.suffix.lower() == ".mp3":
+            durations[path.name] = get_audio_duration_seconds(path)
+    return durations
+
+
 def load_repo_listen_counts(folder: Path, repo_root: Path):
     counts_path = repo_root / listen_counts_filename_for_folder(folder)
     raw = json.loads(counts_path.read_text(encoding="utf-8"))
@@ -202,6 +228,7 @@ def load_repo_history_mapping(folder: Path, repo_root: Path, song_counts):
 
 def load_folder_data(folder: Path):
     repo_root = Path(__file__).resolve().parent
+    durations = load_folder_durations(folder)
     meta_path = folder / META_FILENAME
     if meta_path.is_file():
         data = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -218,7 +245,7 @@ def load_folder_data(folder: Path):
             decoded_history = decode_play_history(raw_history_mapping.get(song_name, []))
             history_mapping[song_name] = decoded_history
 
-        return song_counts, history_mapping, meta_path
+        return song_counts, history_mapping, durations, meta_path
 
     song_counts, counts_path = load_repo_listen_counts(folder, repo_root)
     history_mapping, timestamps_path = load_repo_history_mapping(
@@ -227,7 +254,7 @@ def load_folder_data(folder: Path):
     source_description = Path(
         f"{counts_path.name} + {timestamps_path.name}"
     )
-    return song_counts, history_mapping, source_description
+    return song_counts, history_mapping, durations, source_description
 
 
 def prefix_mapping_keys(mapping, prefix: str):
@@ -237,6 +264,7 @@ def prefix_mapping_keys(mapping, prefix: str):
 def load_all_folder_data(repo_root: Path):
     combined_counts = {}
     combined_history = {}
+    combined_durations = {}
     sources = []
 
     for relative_folder in ALL_FOLDERS:
@@ -251,9 +279,10 @@ def load_all_folder_data(repo_root: Path):
         prefix = folder.name
         combined_counts.update(prefix_mapping_keys(song_counts, prefix))
         combined_history.update(prefix_mapping_keys(history_mapping, prefix))
+        combined_durations.update(prefix_mapping_keys(load_folder_durations(folder), prefix))
         sources.extend([counts_path.name, timestamps_path.name])
 
-    return combined_counts, combined_history, Path(" + ".join(sources))
+    return combined_counts, combined_history, combined_durations, Path(" + ".join(sources))
 
 
 def build_global_events(history_mapping):
@@ -302,10 +331,25 @@ def clamp_probability(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def percentile(sorted_values, quantile: float) -> float:
+    if not sorted_values:
+        return 0.0
+    quantile = max(0.0, min(1.0, quantile))
+    position = quantile * (len(sorted_values) - 1)
+    lower_index = int(math.floor(position))
+    upper_index = int(math.ceil(position))
+    if lower_index == upper_index:
+        return float(sorted_values[lower_index])
+    lower_value = float(sorted_values[lower_index])
+    upper_value = float(sorted_values[upper_index])
+    return lower_value + (upper_value - lower_value) * (position - lower_index)
+
+
 def build_graph_payload(
     folder: Path,
     song_counts,
     history_mapping,
+    durations,
     events,
     edge_counts,
     edge_gaps,
@@ -330,6 +374,34 @@ def build_graph_payload(
         incoming_neighbors[target_song].add(source_song)
 
     max_play_count = max(song_counts.values(), default=1)
+    duration_by_song = {
+        song_name: max(0.0, float(durations.get(song_name, 0.0) or 0.0))
+        for song_name in song_names
+    }
+    positive_durations = sorted(value for value in duration_by_song.values() if value > 0)
+    low_duration_seconds = percentile(positive_durations, RELATIVE_DURATION_LOW_QUANTILE)
+    high_duration_seconds = percentile(positive_durations, RELATIVE_DURATION_HIGH_QUANTILE)
+    duration_range_seconds = max(0.0, high_duration_seconds - low_duration_seconds)
+    duration_weight_by_song = {}
+    duration_multiplier_by_song = {}
+    duration_position_by_song = {}
+    for song_name in song_names:
+        play_count = max(0, int(song_counts[song_name]))
+        duration_seconds = duration_by_song.get(song_name, 0.0)
+        if duration_range_seconds > 0 and duration_seconds > 0:
+            duration_position = (duration_seconds - low_duration_seconds) / duration_range_seconds
+            duration_position = max(0.0, min(1.0, duration_position))
+        else:
+            duration_position = 0.5
+        duration_multiplier = (
+            MIN_RELATIVE_DURATION_MULTIPLIER
+            + (MAX_RELATIVE_DURATION_MULTIPLIER - MIN_RELATIVE_DURATION_MULTIPLIER)
+            * duration_position
+        )
+        duration_position_by_song[song_name] = duration_position
+        duration_multiplier_by_song[song_name] = duration_multiplier
+        duration_weight_by_song[song_name] = play_count * duration_multiplier
+    max_duration_weight = max(duration_weight_by_song.values(), default=0.0)
     max_edge_count = max(edge_counts.values(), default=1)
 
     nodes = []
@@ -348,15 +420,31 @@ def build_graph_payload(
         fallback_total_probability = 0.0
         fallback_per_song_probability = 0.0
 
-        node_size = 18 + 28 * math.sqrt(play_count / max_play_count) if max_play_count > 0 else 18
+        duration_seconds = duration_by_song.get(song_name, 0.0)
+        listen_time_seconds = max(0, int(play_count)) * duration_seconds
+        duration_multiplier = duration_multiplier_by_song.get(song_name, 1.0)
+        duration_position = duration_position_by_song.get(song_name, 0.5)
+        duration_weight = duration_weight_by_song.get(song_name, 0.0)
+        play_node_size = 18 + 28 * math.sqrt(play_count / max_play_count) if max_play_count > 0 else 18
+        duration_node_size = (
+            18 + 28 * math.sqrt(duration_weight / max_duration_weight)
+            if max_duration_weight > 0
+            else play_node_size
+        )
         nodes.append(
             {
                 "id": song_name,
                 "label": display_label,
                 "sourceGroup": source_group,
                 "value": play_count,
-                "size": round(node_size, 2),
+                "size": round(play_node_size, 2),
+                "playSize": round(play_node_size, 2),
+                "durationWeightedSize": round(duration_node_size, 2),
                 "playCount": play_count,
+                "durationSeconds": round(duration_seconds, 2),
+                "relativeDurationPosition": round(duration_position, 3),
+                "relativeDurationMultiplier": round(duration_multiplier, 3),
+                "listenTimeSeconds": round(listen_time_seconds, 2),
                 "historyCount": history_count,
                 "outgoingObservedCount": observed_outgoing_count,
                 "incomingObservedCount": incoming_counts.get(song_name, 0),
@@ -369,6 +457,9 @@ def build_graph_payload(
                     f"<b>{display_label}</b><br>"
                     f"{f'Folder: {source_group}<br>' if source_group else ''}"
                     f"Plays: {play_count}<br>"
+                    f"Duration: {duration_seconds / 60:.2f} minutes<br>"
+                    f"Relative length multiplier: {duration_multiplier:.2f}x<br>"
+                    f"Total listen time: {listen_time_seconds / 3600:.2f} hours<br>"
                     f"History entries: {history_count}<br>"
                     f"Observed outgoing transitions: {observed_outgoing_count}<br>"
                     f"Observed incoming transitions: {incoming_counts.get(song_name, 0)}"
@@ -415,6 +506,10 @@ def build_graph_payload(
             "pairingMode": pairing_mode,
             "generatedFrom": generated_from,
             "maxEdgeCount": max_edge_count,
+            "lowDurationSeconds": round(low_duration_seconds, 2),
+            "highDurationSeconds": round(high_duration_seconds, 2),
+            "minRelativeDurationMultiplier": MIN_RELATIVE_DURATION_MULTIPLIER,
+            "maxRelativeDurationMultiplier": MAX_RELATIVE_DURATION_MULTIPLIER,
         },
         "nodes": nodes,
         "edges": edges,
@@ -623,6 +718,10 @@ def build_html(graph_payload):
       <input id=\"neighborhood-toggle\" type=\"checkbox\">
       Selected-node neighborhood only
     </label>
+    <label class=\"checkbox\">
+      <input id=\"listen-time-size-toggle\" type=\"checkbox\">
+      Size by relative length
+    </label>
   </div>
   <div class=\"layout\">
     <div class=\"network-panel\">
@@ -641,6 +740,7 @@ def build_html(graph_payload):
         </div>
         <div style=\"margin-top: 12px;\">
           <span class=\"pill\" id=\"summary-pairing\"></span>
+          <span class=\"pill\" id=\"summary-sizing\"></span>
         </div>
       </section>
       <section class=\"card\">
@@ -660,6 +760,7 @@ def build_html(graph_payload):
 
     const container = document.getElementById('network');
     const networkStatus = document.getElementById('network-status');
+    const listenTimeSizeToggle = document.getElementById('listen-time-size-toggle');
 
     function getNodeColor(node) {{
       if (node.sourceGroup === 'mid-mp3s') {{
@@ -696,8 +797,24 @@ def build_html(graph_payload):
       throw new Error('vis-network failed to load');
     }}
 
+    function getNodeSize(node) {{
+      return listenTimeSizeToggle.checked ? node.durationWeightedSize : node.playSize;
+    }}
+
+    function describeSizingMode() {{
+      if (!listenTimeSizeToggle.checked) {{
+        return 'Sizing: play count';
+      }}
+      return `Sizing: plays × relative length (${{graphData.summary.minRelativeDurationMultiplier}}x-${{graphData.summary.maxRelativeDurationMultiplier}}x)`;
+    }}
+
+    function refreshSizingSummary() {{
+      document.getElementById('summary-sizing').textContent = describeSizingMode();
+    }}
+
     const nodeDataSet = new vis.DataSet(allNodes.map((node) => ({{
       ...node,
+      size: getNodeSize(node),
       font: {{ color: '#142130', size: 18, face: 'Inter' }},
       color: getNodeColor(node)
     }})));
@@ -734,6 +851,25 @@ def build_html(graph_payload):
 
     function formatMinutes(seconds) {{
       return `${{(seconds / 60).toFixed(2)}} min`;
+    }}
+
+    function formatDuration(seconds) {{
+      if (!Number.isFinite(seconds) || seconds <= 0) {{
+        return 'Unknown';
+      }}
+      const minutes = Math.floor(seconds / 60);
+      const remainingSeconds = Math.round(seconds % 60).toString().padStart(2, '0');
+      return `${{minutes}}:${{remainingSeconds}}`;
+    }}
+
+    function formatListenTime(seconds) {{
+      if (!Number.isFinite(seconds) || seconds <= 0) {{
+        return '0m';
+      }}
+      if (seconds < 3600) {{
+        return `${{Math.round(seconds / 60)}}m`;
+      }}
+      return `${{(seconds / 3600).toFixed(1)}}h`;
     }}
 
     function describePairingMode(pairingMode) {{
@@ -778,6 +914,7 @@ def build_html(graph_payload):
         .filter((node) => !neighborhoodOnly || !selectedNodeId || connectedNodeIds.has(node.id) || node.id === selectedNodeId)
         .map((node) => ({{
           ...node,
+          size: getNodeSize(node),
           hidden: neighborhoodOnly && selectedNodeId && !connectedNodeIds.has(node.id) && node.id !== selectedNodeId,
           font: {{ color: '#142130', size: 18, face: 'Inter' }},
           color: node.id === selectedNodeId
@@ -821,6 +958,10 @@ def build_html(graph_payload):
       document.getElementById('selection-content').innerHTML = `
         <div class=\"metric-grid\">
           <div class=\"metric\"><div class=\"label\">Play count</div><div class=\"value\">${{node.playCount}}</div></div>
+          <div class=\"metric\"><div class=\"label\">Duration</div><div class=\"value\">${{formatDuration(node.durationSeconds)}}</div></div>
+          <div class=\"metric\"><div class=\"label\">Length rank</div><div class=\"value\">${{Math.round(node.relativeDurationPosition * 100)}}%</div></div>
+          <div class=\"metric\"><div class=\"label\">Length multiplier</div><div class=\"value\">${{node.relativeDurationMultiplier.toFixed(2)}}x</div></div>
+          <div class=\"metric\"><div class=\"label\">Listen time</div><div class=\"value\">${{formatListenTime(node.listenTimeSeconds)}}</div></div>
           <div class=\"metric\"><div class=\"label\">History entries</div><div class=\"value\">${{node.historyCount}}</div></div>
           <div class=\"metric\"><div class=\"label\">Observed outgoing</div><div class=\"value\">${{node.outgoingObservedCount}}</div></div>
           <div class=\"metric\"><div class=\"label\">Observed incoming</div><div class=\"value\">${{node.incomingObservedCount}}</div></div>
@@ -875,6 +1016,10 @@ def build_html(graph_payload):
     }});
     document.getElementById('labels-toggle').addEventListener('change', refreshGraph);
     document.getElementById('neighborhood-toggle').addEventListener('change', refreshGraph);
+    listenTimeSizeToggle.addEventListener('change', () => {{
+      refreshSizingSummary();
+      refreshGraph();
+    }});
     document.getElementById('focus-button').addEventListener('click', focusSong);
     document.getElementById('song-search').addEventListener('keydown', (event) => {{
       if (event.key === 'Enter') {{
@@ -910,6 +1055,7 @@ def build_html(graph_payload):
     document.getElementById('summary-window').textContent = `${{graphData.summary.windowMinutes}}m`;
     document.getElementById('summary-pairing').textContent =
       `Pairing: ${{graphData.summary.pairingMode}} (${{describePairingMode(graphData.summary.pairingMode)}})`;
+    refreshSizingSummary();
     refreshGraph();
     network.fit({{ animation: {{ duration: 600, easingFunction: 'easeInOutQuad' }} }});
   </script>
@@ -949,9 +1095,9 @@ def main() -> int:
 
     try:
         if use_all_folders:
-            song_counts, history_mapping, meta_path = load_all_folder_data(repo_root)
+            song_counts, history_mapping, durations, meta_path = load_all_folder_data(repo_root)
         else:
-            song_counts, history_mapping, meta_path = load_folder_data(folder)
+            song_counts, history_mapping, durations, meta_path = load_folder_data(folder)
     except (FileNotFoundError, ValueError) as exc:
         emit(f"Error: {exc}")
         return 1
@@ -969,6 +1115,7 @@ def main() -> int:
         folder=folder,
         song_counts=song_counts,
         history_mapping=history_mapping,
+        durations=durations,
         events=events,
         edge_counts=edge_counts,
         edge_gaps=edge_gaps,

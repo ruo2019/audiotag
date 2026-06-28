@@ -43,3 +43,8 @@ download_list.txt
 .loudness_cache.json
 .track_emb_cache.npz
 !templates/trimmer.html
+*.midi
+*.pdf
+*.mscz
+static/.mscbackup/.everything_I_wanted_-_billie_eilish.mscz~
+*.DS_Store

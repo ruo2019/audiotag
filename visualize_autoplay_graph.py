@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
 import webbrowser
 from collections import Counter, defaultdict
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 try:
     from mutagen.mp3 import MP3
@@ -55,12 +58,20 @@ VIS_NETWORK_CDN = "https://unpkg.com/vis-network/standalone/umd/vis-network.min.
 LISTEN_COUNTS_FILE = "listen_counts.json"
 MID_LISTEN_COUNTS_FILE = "mid_listen_counts.json"
 ALL_FOLDERS = (Path("static/mp3"), Path("static/mid-mp3s"))
+GRAPH_VIEW_OPTIONS = (
+    ("mp3", "MP3", Path("static/mp3"), False),
+    ("mid-mp3s", "Mid MP3s", Path("static/mid-mp3s"), False),
+    ("all", "All", Path("all"), True),
+)
 
 console = None
+audio_duration_cache = {}
 
 
 def emit(message: str) -> None:
     print_message(message, console)
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,7 +116,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_FALLBACK_PROBABILITY,
         help=(
             "Reserved probability mass for unseen outgoing edges. "
-            "Defaults to 0 so observed transitions sum to 100%."
+            "Defaults to 0 so observed transitions sum to 100%%."
         ),
     )
     parser.add_argument(
@@ -123,6 +134,33 @@ def parse_args() -> argparse.Namespace:
         "--no-open",
         action="store_true",
         help="Write the HTML but do not open it in a browser",
+    )
+    parser.add_argument(
+        "--live",
+        "--watch",
+        dest="live",
+        action="store_true",
+        help=(
+            "Start a local live-updating graph server. The browser checks for "
+            "new listen data and updates without rerunning this script."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-seconds",
+        type=float,
+        default=2.0,
+        help="How often --live checks for new listen data (default: 2)",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host for --live mode (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Port for --live mode; 0 chooses an available port (default: 0)",
     )
     return parser.parse_args()
 
@@ -166,9 +204,23 @@ def get_audio_duration_seconds(mp3_path: Path) -> float:
     if MP3 is None:
         return 0.0
     try:
-        return max(0.0, float(MP3(str(mp3_path)).info.length or 0.0))
-    except Exception:
+        stat_result = mp3_path.stat()
+    except OSError:
         return 0.0
+
+    cache_key = str(mp3_path.resolve())
+    cache_signature = (stat_result.st_mtime_ns, stat_result.st_size)
+    cached_duration = audio_duration_cache.get(cache_key)
+    if cached_duration and cached_duration[0] == cache_signature:
+        return cached_duration[1]
+
+    try:
+        duration_seconds = max(0.0, float(MP3(str(mp3_path)).info.length or 0.0))
+    except Exception:
+        duration_seconds = 0.0
+
+    audio_duration_cache[cache_key] = (cache_signature, duration_seconds)
+    return duration_seconds
 
 
 def load_folder_durations(folder: Path):
@@ -492,8 +544,137 @@ def build_graph_payload(
     return payload
 
 
-def build_html(graph_payload):
+def build_graph_payload_from_options(
+    args: argparse.Namespace,
+    repo_root: Path,
+    folder: Path,
+    use_all_folders: bool,
+    fallback_probability: float,
+    view_key: str | None = None,
+    view_label: str | None = None,
+):
+    if use_all_folders:
+        song_counts, history_mapping, durations, meta_path = load_all_folder_data(repo_root)
+    else:
+        song_counts, history_mapping, durations, meta_path = load_folder_data(folder)
+
+    events = build_global_events(history_mapping)
+    window_seconds = int(round(args.window_minutes * 60))
+    edge_counts, edge_gaps = build_transition_counts(
+        events=events,
+        window_seconds=window_seconds,
+        pairing_mode=args.pairing,
+        include_self_loops=args.include_self_loops,
+        durations=durations,
+    )
+
+    graph_payload = build_graph_payload(
+        folder=folder,
+        song_counts=song_counts,
+        history_mapping=history_mapping,
+        durations=durations,
+        events=events,
+        edge_counts=edge_counts,
+        edge_gaps=edge_gaps,
+        window_minutes=args.window_minutes,
+        pairing_mode=args.pairing,
+        fallback_probability=fallback_probability,
+        generated_from=str(meta_path),
+    )
+    if view_key is not None:
+        graph_payload["summary"]["viewKey"] = view_key
+    if view_label is not None:
+        graph_payload["summary"]["viewLabel"] = view_label
+    return graph_payload, meta_path
+
+
+def graph_view_definitions():
+    return [
+        {
+            "key": key,
+            "label": label,
+        }
+        for key, label, _path, _use_all_folders in GRAPH_VIEW_OPTIONS
+    ]
+
+
+def graph_view_keys():
+    return {key for key, _label, _path, _use_all_folders in GRAPH_VIEW_OPTIONS}
+
+
+def graph_view_for_key(repo_root: Path, view_key: str):
+    for key, label, path, use_all_folders in GRAPH_VIEW_OPTIONS:
+        if key == view_key:
+            folder = path if use_all_folders else (repo_root / path)
+            return {
+                "key": key,
+                "label": label,
+                "folder": folder,
+                "use_all_folders": use_all_folders,
+            }
+    raise KeyError(view_key)
+
+
+def initial_graph_view_key(folder: Path, use_all_folders: bool) -> str:
+    if use_all_folders:
+        return "all"
+    if folder.name == "mid-mp3s":
+        return "mid-mp3s"
+    if folder.name == "mp3":
+        return "mp3"
+    return "all"
+
+
+def hash_graph_payload(graph_payload) -> str:
+    encoded_payload = json.dumps(
+        graph_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded_payload).hexdigest()
+
+
+def source_paths_for_folder(repo_root: Path, folder: Path, use_all_folders: bool):
+    if use_all_folders:
+        source_paths = []
+        for relative_folder in ALL_FOLDERS:
+            source_folder = repo_root / relative_folder
+            source_paths.extend(
+                [
+                    repo_root / listen_counts_filename_for_folder(source_folder),
+                    repo_root / listen_timestamps_filename_for_folder(source_folder),
+                ]
+            )
+        return source_paths
+
+    meta_path = folder / META_FILENAME
+    if meta_path.is_file():
+        return [meta_path]
+
+    return [
+        repo_root / listen_counts_filename_for_folder(folder),
+        repo_root / listen_timestamps_filename_for_folder(folder),
+    ]
+
+
+def source_signature_for_paths(source_paths):
+    signature = []
+    for source_path in source_paths:
+        try:
+            stat_result = source_path.stat()
+            signature.append(
+                (
+                    str(source_path),
+                    stat_result.st_mtime_ns,
+                    stat_result.st_size,
+                )
+            )
+        except OSError:
+            signature.append((str(source_path), None, None))
+    return tuple(signature)
+
+
+def build_html(graph_payload, live_config=None):
     graph_json = json.dumps(graph_payload, ensure_ascii=False)
+    live_config_json = json.dumps(live_config or {"enabled": False})
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
 <head>
@@ -552,6 +733,22 @@ def build_html(graph_payload):
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 8px 10px;
+    }}
+    .graph-tabs {{
+      display: none;
+      align-items: center;
+      gap: 6px;
+      padding-right: 4px;
+    }}
+    .graph-tabs.visible {{ display: flex; }}
+    .graph-tabs button {{
+      min-width: 76px;
+      cursor: pointer;
+    }}
+    .graph-tabs button.active {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #ffffff;
     }}
     .toolbar input[type=range] {{ padding: 0; }}
     .toolbar .checkbox {{
@@ -670,6 +867,7 @@ def build_html(graph_payload):
 </head>
 <body>
   <div class=\"toolbar\">
+    <div id=\"graph-tabs\" class=\"graph-tabs\" aria-label=\"Graph views\"></div>
     <label>
       Search song
       <input id=\"song-search\" type=\"text\" placeholder=\"Type part of a song name\">
@@ -706,7 +904,8 @@ def build_html(graph_payload):
     <aside class=\"sidebar\">
       <section class=\"card\">
         <h2>Autoplay Graph</h2>
-        <div class=\"muted\">Built from global play history in <code>{graph_payload['summary']['folder']}</code>.</div>
+        <div class=\"muted\">Built from global play history in <code id=\"summary-folder\"></code>.</div>
+        <div id=\"live-status\" class=\"muted\" style=\"display: none; margin-top: 6px;\"></div>
         <div class=\"metric-grid\" style=\"margin-top: 12px;\">
           <div class=\"metric\"><div class=\"label\">Songs</div><div class=\"value\" id=\"summary-song-count\"></div></div>
           <div class=\"metric\"><div class=\"label\">Play Events</div><div class=\"value\" id=\"summary-event-count\"></div></div>
@@ -726,11 +925,15 @@ def build_html(graph_payload):
     </aside>
   </div>
   <script>
-    const graphData = {graph_json};
-    const allNodes = graphData.nodes;
-    const allEdges = graphData.edges;
-    const nodeLookup = new Map(allNodes.map((node) => [node.id, node]));
-    const edgeLookup = new Map(allEdges.map((edge) => [edge.id, edge]));
+    let graphData = {graph_json};
+    const liveConfig = {live_config_json};
+    let activeViewKey = liveConfig.initialViewKey || graphData.summary.viewKey || 'all';
+    const graphHashesByView = new Map([[activeViewKey, liveConfig.initialHash || null]]);
+    let currentGraphHash = graphHashesByView.get(activeViewKey) || null;
+    let allNodes = graphData.nodes;
+    let allEdges = graphData.edges;
+    let nodeLookup = new Map(allNodes.map((node) => [node.id, node]));
+    let edgeLookup = new Map(allEdges.map((edge) => [edge.id, edge]));
     let selectedNodeId = null;
 
     const container = document.getElementById('network');
@@ -803,12 +1006,11 @@ def build_html(graph_payload):
       document.getElementById('summary-sizing').textContent = describeSizingMode();
     }}
 
-    const nodeDataSet = new vis.DataSet(allNodes.map((node) => ({{
-      ...buildVisibleNode(node)
-    }})));
-    const edgeDataSet = new vis.DataSet([]);
+    let nodeDataSet = new vis.DataSet([]);
+    let edgeDataSet = new vis.DataSet([]);
+    let network = null;
 
-    const network = new vis.Network(container, {{ nodes: nodeDataSet, edges: edgeDataSet }}, {{
+    const networkOptions = {{
       autoResize: true,
       height: '100%',
       width: '100%',
@@ -828,10 +1030,7 @@ def build_html(graph_payload):
         stabilization: {{ iterations: 250 }},
         barnesHut: {{ gravitationalConstant: -3200, springLength: 135, springConstant: 0.03, damping: 0.18 }}
       }}
-    }});
-    if (networkStatus) {{
-      networkStatus.classList.remove('visible');
-    }}
+    }};
 
     function formatPercent(probability) {{
       return `${{(probability * 100).toFixed(2)}}%`;
@@ -870,6 +1069,123 @@ def build_html(graph_payload):
       return pairingMode;
     }}
 
+    function getViewLabel(viewKey) {{
+      const view = (liveConfig.views || []).find((item) => item.key === viewKey);
+      return view ? view.label : viewKey;
+    }}
+
+    function graphDataUrl(viewKey) {{
+      return `/graph-data.json?view=${{encodeURIComponent(viewKey)}}`;
+    }}
+
+    function setActiveGraphTab() {{
+      document.querySelectorAll('#graph-tabs button').forEach((button) => {{
+        button.classList.toggle('active', button.dataset.viewKey === activeViewKey);
+      }});
+    }}
+
+    async function loadGraphView(viewKey) {{
+      if (!liveConfig.enabled || viewKey === activeViewKey) {{
+        return;
+      }}
+      setLiveStatus(`Live: loading ${{getViewLabel(viewKey)}}...`);
+      try {{
+        const response = await fetch(graphDataUrl(viewKey), {{ cache: 'no-store' }});
+        if (!response.ok) {{
+          throw new Error(`HTTP ${{response.status}}`);
+        }}
+        const nextPayload = await response.json();
+        activeViewKey = nextPayload.view || viewKey;
+        currentGraphHash = nextPayload.hash || null;
+        graphHashesByView.set(activeViewKey, currentGraphHash);
+        setActiveGraphTab();
+        applyGraphData(nextPayload.graph, {{ clearSelection: true, rebuild: true }});
+        setLiveStatus(`Live: showing ${{getViewLabel(activeViewKey)}} after ${{graphData.summary.eventCount}} play events.`);
+      }} catch (error) {{
+        setLiveStatus(`Could not load ${{getViewLabel(viewKey)}}: ${{error.message}}`, true);
+      }}
+    }}
+
+    function renderGraphTabs() {{
+      const tabs = document.getElementById('graph-tabs');
+      const views = liveConfig.views || [];
+      if (!tabs || !views.length) {{
+        return;
+      }}
+      tabs.innerHTML = views.map((view) => `
+        <button type=\"button\" data-view-key=\"${{view.key}}\">${{view.label}}</button>
+      `).join('');
+      tabs.classList.add('visible');
+      tabs.querySelectorAll('button').forEach((button) => {{
+        button.addEventListener('click', () => loadGraphView(button.dataset.viewKey));
+      }});
+      setActiveGraphTab();
+    }}
+
+    function rebuildLookups() {{
+      nodeLookup = new Map(allNodes.map((node) => [node.id, node]));
+      edgeLookup = new Map(allEdges.map((edge) => [edge.id, edge]));
+    }}
+
+    function updateSummary() {{
+      const maxEdgeCount = Math.max(1, Number(graphData.summary.maxEdgeCount || 1));
+      const countFilter = document.getElementById('count-filter');
+      countFilter.max = String(maxEdgeCount);
+      if (Number(countFilter.value) > maxEdgeCount) {{
+        countFilter.value = String(maxEdgeCount);
+        document.getElementById('count-filter-value').textContent = countFilter.value;
+      }}
+
+      document.getElementById('summary-song-count').textContent = graphData.summary.songCount;
+      document.getElementById('summary-event-count').textContent = graphData.summary.eventCount;
+      document.getElementById('summary-edge-count').textContent = graphData.summary.edgeCount;
+      document.getElementById('summary-window').textContent = `${{graphData.summary.windowMinutes}}m`;
+      document.getElementById('summary-folder').textContent = graphData.summary.folder;
+      document.getElementById('summary-pairing').textContent =
+        `Pairing: ${{graphData.summary.pairingMode}} (${{describePairingMode(graphData.summary.pairingMode)}})`;
+      refreshSizingSummary();
+    }}
+
+    function setLiveStatus(message, isError = false) {{
+      const liveStatus = document.getElementById('live-status');
+      if (!liveStatus) {{
+        return;
+      }}
+      if (!liveConfig.enabled) {{
+        liveStatus.style.display = 'none';
+        return;
+      }}
+      liveStatus.style.display = 'block';
+      liveStatus.style.color = isError ? '#b42318' : '';
+      liveStatus.textContent = message;
+    }}
+
+    function applyGraphData(nextGraphData, options = {{}}) {{
+      graphData = nextGraphData;
+      allNodes = graphData.nodes || [];
+      allEdges = graphData.edges || [];
+      rebuildLookups();
+
+      if (options.clearSelection || (selectedNodeId && !nodeLookup.has(selectedNodeId))) {{
+        selectedNodeId = null;
+        network.unselectAll();
+        document.getElementById('selection-summary').textContent = 'Select a node or edge to inspect it.';
+        document.getElementById('selection-content').innerHTML = '';
+      }}
+
+      updateSummary();
+      if (options.rebuild) {{
+        createNetwork();
+      }} else {{
+        refreshGraph({{ relayout: Boolean(options.relayout) }});
+      }}
+
+      if (selectedNodeId) {{
+        network.selectNodes([selectedNodeId]);
+        showNodeDetails(selectedNodeId);
+      }}
+    }}
+
     function getFilteredEdges() {{
       const minimumCount = Number(document.getElementById('count-filter').value);
       const minimumProbability = Number(document.getElementById('probability-filter').value) / 100;
@@ -888,7 +1204,78 @@ def build_html(graph_payload):
       }}));
     }}
 
-    function refreshGraph() {{
+    function reconcileDataSet(dataSet, nextItems) {{
+      const nextIds = new Set(nextItems.map((item) => item.id));
+      const idsToRemove = dataSet.getIds().filter((id) => !nextIds.has(id));
+      if (idsToRemove.length) {{
+        dataSet.remove(idsToRemove);
+      }}
+      if (nextItems.length) {{
+        dataSet.update(nextItems);
+      }}
+    }}
+
+    function settleGraphLayout() {{
+      if (!network) {{
+        return;
+      }}
+      network.setOptions({{
+        physics: {{
+          enabled: true,
+          stabilization: {{ iterations: 180 }},
+          barnesHut: {{ gravitationalConstant: -3200, springLength: 135, springConstant: 0.03, damping: 0.18 }}
+        }}
+      }});
+      network.once('stabilized', () => {{
+        network.setOptions({{ physics: false }});
+        network.fit({{ animation: {{ duration: 350, easingFunction: 'easeInOutQuad' }} }});
+      }});
+      network.stabilize(180);
+    }}
+
+    function attachNetworkEvents() {{
+      network.on('selectNode', (params) => {{
+        selectedNodeId = params.nodes[0] || null;
+        refreshGraph();
+        if (selectedNodeId) {{
+          showNodeDetails(selectedNodeId);
+        }}
+      }});
+
+      network.on('deselectNode', () => {{
+        selectedNodeId = null;
+        refreshGraph();
+        document.getElementById('selection-summary').textContent = 'Select a node or edge to inspect it.';
+        document.getElementById('selection-content').innerHTML = '';
+      }});
+
+      network.on('selectEdge', (params) => {{
+        const edgeId = params.edges[0];
+        if (edgeId) {{
+          showEdgeDetails(edgeId);
+        }}
+      }});
+    }}
+
+    function createNetwork() {{
+      if (network) {{
+        network.destroy();
+      }}
+      nodeDataSet = new vis.DataSet([]);
+      edgeDataSet = new vis.DataSet([]);
+      refreshGraph();
+      network = new vis.Network(container, {{ nodes: nodeDataSet, edges: edgeDataSet }}, networkOptions);
+      attachNetworkEvents();
+      network.once('stabilized', () => {{
+        network.setOptions({{ physics: false }});
+        network.fit({{ animation: {{ duration: 350, easingFunction: 'easeInOutQuad' }} }});
+      }});
+      if (networkStatus) {{
+        networkStatus.classList.remove('visible');
+      }}
+    }}
+
+    function refreshGraph(options = {{}}) {{
       const filteredEdges = getFilteredEdges();
       const connectedNodeIds = new Set();
       filteredEdges.forEach((edge) => {{
@@ -897,15 +1284,15 @@ def build_html(graph_payload):
       }});
 
       const neighborhoodOnly = document.getElementById('neighborhood-toggle').checked;
-      nodeDataSet.clear();
-      nodeDataSet.add(allNodes
-        .filter((node) => !neighborhoodOnly || !selectedNodeId || connectedNodeIds.has(node.id) || node.id === selectedNodeId)
-        .map((node) => ({{
-          ...buildVisibleNode(node),
-          hidden: neighborhoodOnly && selectedNodeId && !connectedNodeIds.has(node.id) && node.id !== selectedNodeId,
-        }})));
-      edgeDataSet.clear();
-      edgeDataSet.add(filteredEdges);
+      const visibleNodes = allNodes.map((node) => ({{
+        ...buildVisibleNode(node),
+        hidden: neighborhoodOnly && selectedNodeId && !connectedNodeIds.has(node.id) && node.id !== selectedNodeId,
+      }}));
+      reconcileDataSet(nodeDataSet, visibleNodes);
+      reconcileDataSet(edgeDataSet, filteredEdges);
+      if (options.relayout) {{
+        settleGraphLayout();
+      }}
     }}
 
     function renderTopEdgeList(edges, heading) {{
@@ -1004,41 +1391,241 @@ def build_html(graph_payload):
       }}
     }});
 
-    network.on('selectNode', (params) => {{
-      selectedNodeId = params.nodes[0] || null;
-      refreshGraph();
-      if (selectedNodeId) {{
-        showNodeDetails(selectedNodeId);
+    async function pollGraphData() {{
+      if (!liveConfig.enabled) {{
+        return;
       }}
-    }});
-
-    network.on('deselectNode', () => {{
-      selectedNodeId = null;
-      refreshGraph();
-      document.getElementById('selection-summary').textContent = 'Select a node or edge to inspect it.';
-      document.getElementById('selection-content').innerHTML = '';
-    }});
-
-    network.on('selectEdge', (params) => {{
-      const edgeId = params.edges[0];
-      if (edgeId) {{
-        showEdgeDetails(edgeId);
+      try {{
+        const response = await fetch(graphDataUrl(activeViewKey), {{ cache: 'no-store' }});
+        if (!response.ok) {{
+          throw new Error(`HTTP ${{response.status}}`);
+        }}
+        const nextPayload = await response.json();
+        if (nextPayload.hash && nextPayload.hash !== currentGraphHash) {{
+          currentGraphHash = nextPayload.hash;
+          graphHashesByView.set(activeViewKey, currentGraphHash);
+          applyGraphData(nextPayload.graph);
+          setLiveStatus(`Live: updated ${{getViewLabel(activeViewKey)}} after ${{graphData.summary.eventCount}} play events.`);
+        }} else {{
+          setLiveStatus(`Live: watching ${{getViewLabel(activeViewKey)}} every ${{liveConfig.refreshSeconds}}s.`);
+        }}
+      }} catch (error) {{
+        setLiveStatus(`Live update failed: ${{error.message}}`, true);
       }}
-    }});
+    }}
 
-    document.getElementById('summary-song-count').textContent = graphData.summary.songCount;
-    document.getElementById('summary-event-count').textContent = graphData.summary.eventCount;
-    document.getElementById('summary-edge-count').textContent = graphData.summary.edgeCount;
-    document.getElementById('summary-window').textContent = `${{graphData.summary.windowMinutes}}m`;
-    document.getElementById('summary-pairing').textContent =
-      `Pairing: ${{graphData.summary.pairingMode}} (${{describePairingMode(graphData.summary.pairingMode)}})`;
-    refreshSizingSummary();
-    refreshGraph();
-    network.fit({{ animation: {{ duration: 600, easingFunction: 'easeInOutQuad' }} }});
+    function startLiveUpdates() {{
+      if (!liveConfig.enabled) {{
+        return;
+      }}
+      const refreshMilliseconds = Math.max(250, Number(liveConfig.refreshSeconds || 2) * 1000);
+      setLiveStatus(`Live: watching ${{getViewLabel(activeViewKey)}} every ${{liveConfig.refreshSeconds}}s.`);
+      window.setInterval(pollGraphData, refreshMilliseconds);
+    }}
+
+    renderGraphTabs();
+    updateSummary();
+    createNetwork();
+    startLiveUpdates();
   </script>
 </body>
 </html>
 """
+
+
+def make_live_graph_handler(
+    args: argparse.Namespace,
+    repo_root: Path,
+    folder: Path,
+    use_all_folders: bool,
+    fallback_probability: float,
+):
+    initial_view_key = initial_graph_view_key(folder, use_all_folders)
+    view_keys = graph_view_keys()
+    view_definitions = {
+        key: graph_view_for_key(repo_root, key)
+        for key in view_keys
+    }
+    view_source_paths = {
+        key: source_paths_for_folder(
+            repo_root,
+            view_definition["folder"],
+            view_definition["use_all_folders"],
+        )
+        for key, view_definition in view_definitions.items()
+    }
+    cached_responses = {
+        key: {
+            "signature": None,
+            "graph_payload": None,
+            "meta_path": None,
+            "graph_hash": None,
+        }
+        for key in view_keys
+    }
+
+    def get_graph_response(view_key: str):
+        if view_key not in view_keys:
+            raise KeyError(view_key)
+
+        view_definition = view_definitions[view_key]
+        cached_response = cached_responses[view_key]
+        source_paths = view_source_paths[view_key]
+        current_signature = source_signature_for_paths(source_paths)
+        if (
+            cached_response["signature"] == current_signature
+            and cached_response["graph_payload"] is not None
+        ):
+            return (
+                cached_response["graph_payload"],
+                cached_response["meta_path"],
+                cached_response["graph_hash"],
+            )
+
+        graph_payload, meta_path = build_graph_payload_from_options(
+            args=args,
+            repo_root=repo_root,
+            folder=view_definition["folder"],
+            use_all_folders=view_definition["use_all_folders"],
+            fallback_probability=fallback_probability,
+            view_key=view_definition["key"],
+            view_label=view_definition["label"],
+        )
+        graph_hash = hash_graph_payload(graph_payload)
+        cached_response.update(
+            {
+                "signature": current_signature,
+                "graph_payload": graph_payload,
+                "meta_path": meta_path,
+                "graph_hash": graph_hash,
+            }
+        )
+        return graph_payload, meta_path, graph_hash
+
+    class LiveGraphHandler(BaseHTTPRequestHandler):
+        def send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_json(self, status: int, payload) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_bytes(status, body, "application/json; charset=utf-8")
+
+        def do_GET(self) -> None:
+            parsed_url = urlparse(self.path)
+            route = parsed_url.path
+            query = parse_qs(parsed_url.query)
+            requested_view = query.get("view", [initial_view_key])[0]
+            if route in ("/", "/index.html"):
+                try:
+                    graph_payload, _meta_path, graph_hash = get_graph_response(
+                        requested_view
+                    )
+                    html = build_html(
+                        graph_payload,
+                        live_config={
+                            "enabled": True,
+                            "refreshSeconds": args.refresh_seconds,
+                            "initialHash": graph_hash,
+                            "initialViewKey": requested_view,
+                            "views": graph_view_definitions(),
+                        },
+                    )
+                    self.send_bytes(
+                        200,
+                        html.encode("utf-8"),
+                        "text/html; charset=utf-8",
+                    )
+                except Exception as exc:
+                    self.send_json(500, {"error": str(exc)})
+                return
+
+            if route == "/graph-data.json":
+                try:
+                    graph_payload, _meta_path, graph_hash = get_graph_response(
+                        requested_view
+                    )
+                    self.send_json(
+                        200,
+                        {
+                            "view": requested_view,
+                            "hash": graph_hash,
+                            "graph": graph_payload,
+                        },
+                    )
+                except KeyError:
+                    self.send_json(404, {"error": f"Unknown graph view: {requested_view}"})
+                except Exception as exc:
+                    self.send_json(500, {"error": str(exc)})
+                return
+
+            self.send_json(404, {"error": "Not found"})
+
+        def log_message(self, _format, *args) -> None:
+            return
+
+    return LiveGraphHandler
+
+
+def serve_live_graph(
+    args: argparse.Namespace,
+    repo_root: Path,
+    folder: Path,
+    use_all_folders: bool,
+    fallback_probability: float,
+) -> int:
+    try:
+        graph_payload, meta_path = build_graph_payload_from_options(
+            args=args,
+            repo_root=repo_root,
+            folder=folder,
+            use_all_folders=use_all_folders,
+            fallback_probability=fallback_probability,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        emit(f"Error: {exc}")
+        return 1
+
+    handler_class = make_live_graph_handler(
+        args=args,
+        repo_root=repo_root,
+        folder=folder,
+        use_all_folders=use_all_folders,
+        fallback_probability=fallback_probability,
+    )
+    server = ThreadingHTTPServer((args.host, args.port), handler_class)
+    server.daemon_threads = True
+    server_host, server_port = server.server_address[:2]
+    browser_host = "127.0.0.1" if server_host in ("", "0.0.0.0") else server_host
+    url = f"http://{browser_host}:{server_port}/"
+
+    emit(f"Read metadata from '{meta_path}'.")
+    emit(
+        f"Serving live graph at {url} with {graph_payload['summary']['songCount']} songs and {graph_payload['summary']['edgeCount']} observed edges."
+    )
+    emit(
+        f"Pairing mode: {args.pairing}; window: {args.window_minutes} minutes; self loops: {'on' if args.include_self_loops else 'off'}."
+    )
+    emit(f"Live refresh: every {args.refresh_seconds} seconds. Press Ctrl+C to stop.")
+
+    if args.no_open:
+        emit("Skipped opening the browser (--no-open).")
+    else:
+        webbrowser.open(url)
+        emit("Opened the live visualization in your default browser.")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        emit("Stopped live graph server.")
+    finally:
+        server.server_close()
+
+    return 0
 
 
 def get_default_output_path(folder: Path) -> Path:
@@ -1064,44 +1651,36 @@ def main() -> int:
         emit("Error: --window-minutes must be positive.")
         return 1
 
+    if args.refresh_seconds <= 0:
+        emit("Error: --refresh-seconds must be positive.")
+        return 1
+
     fallback_probability = clamp_probability(args.fallback_probability)
     if fallback_probability != args.fallback_probability:
         emit(
             f"Clamped fallback probability from {args.fallback_probability} to {fallback_probability}."
         )
 
+    if args.live:
+        return serve_live_graph(
+            args=args,
+            repo_root=repo_root,
+            folder=folder,
+            use_all_folders=use_all_folders,
+            fallback_probability=fallback_probability,
+        )
+
     try:
-        if use_all_folders:
-            song_counts, history_mapping, durations, meta_path = load_all_folder_data(repo_root)
-        else:
-            song_counts, history_mapping, durations, meta_path = load_folder_data(folder)
+        graph_payload, meta_path = build_graph_payload_from_options(
+            args=args,
+            repo_root=repo_root,
+            folder=folder,
+            use_all_folders=use_all_folders,
+            fallback_probability=fallback_probability,
+        )
     except (FileNotFoundError, ValueError) as exc:
         emit(f"Error: {exc}")
         return 1
-
-    events = build_global_events(history_mapping)
-    window_seconds = int(round(args.window_minutes * 60))
-    edge_counts, edge_gaps = build_transition_counts(
-        events=events,
-        window_seconds=window_seconds,
-        pairing_mode=args.pairing,
-        include_self_loops=args.include_self_loops,
-        durations=durations,
-    )
-
-    graph_payload = build_graph_payload(
-        folder=folder,
-        song_counts=song_counts,
-        history_mapping=history_mapping,
-        durations=durations,
-        events=events,
-        edge_counts=edge_counts,
-        edge_gaps=edge_gaps,
-        window_minutes=args.window_minutes,
-        pairing_mode=args.pairing,
-        fallback_probability=fallback_probability,
-        generated_from=str(meta_path),
-    )
 
     output_path = (
         Path(args.output).expanduser()

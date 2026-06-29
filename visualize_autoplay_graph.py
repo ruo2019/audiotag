@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import sys
+import time
 import webbrowser
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -51,6 +52,8 @@ DEFAULT_WINDOW_MINUTES = AUTOPLAY_WINDOW_SECONDS / 60.0
 DEFAULT_FALLBACK_PROBABILITY = 0.0
 DEFAULT_OUTPUT_TEMPLATE = "autoplay_graph_{folder}.html"
 DEFAULT_PAIRING_MODE = "consecutive"
+TRENDING_HALF_LIFE_SECONDS = 2 * 24 * 60 * 60
+TRENDING_BASELINE_DURATION_SECONDS = 3 * 60 + 30
 NODE_MIN_SIZE = 7
 NODE_SIZE_RANGE = 63
 NODE_SIZE_POWER = 1.25
@@ -63,6 +66,7 @@ GRAPH_VIEW_OPTIONS = (
     ("mid-mp3s", "Mid MP3s", Path("static/mid-mp3s"), False),
     ("all", "All", Path("all"), True),
 )
+GRAPH_VIEW_KEYS = tuple(key for key, _label, _path, _use_all_folders in GRAPH_VIEW_OPTIONS)
 
 console = None
 audio_duration_cache = {}
@@ -84,10 +88,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "folder",
         nargs="?",
-        default="mp3s",
+        default="mp3",
+        choices=GRAPH_VIEW_KEYS,
         help=(
-            "Folder containing MP3 files and .mp3meta.json (default: mp3s). "
-            "Use 'all' to combine static/mp3 and static/mid-mp3s."
+            "Dataset to visualize: mp3, mid-mp3s, or all (default: mp3)."
         ),
     )
     parser.add_argument(
@@ -404,6 +408,84 @@ def scale_node_size(value: float, max_value: float) -> float:
     return NODE_MIN_SIZE + NODE_SIZE_RANGE * (normalized ** NODE_SIZE_POWER)
 
 
+def encode_timestamps(timestamps):
+    encoded = []
+    previous = None
+    for timestamp in sorted(int(timestamp) for timestamp in timestamps):
+        if previous is None:
+            encoded.append(timestamp)
+        else:
+            encoded.append(timestamp - previous)
+        previous = timestamp
+    return encoded
+
+
+def trending_weight(duration_seconds: float | None) -> float:
+    if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
+        return 1.0
+    return max(0.0, float(duration_seconds) / TRENDING_BASELINE_DURATION_SECONDS)
+
+
+def build_trending_payload(
+    folder: Path,
+    song_counts,
+    history_mapping,
+    durations,
+    events,
+    generated_from: str,
+):
+    rows = []
+    historyless_play_count = 0
+    mismatched_history_count = 0
+    for song_name in sorted(song_counts, key=str.casefold):
+        play_count = max(0, int(song_counts.get(song_name, 0) or 0))
+        timestamps = [
+            int(timestamp)
+            for timestamp in history_mapping.get(song_name, [])
+            if isinstance(timestamp, (int, float))
+        ]
+        timestamps.sort()
+        history_count = len(timestamps)
+        if play_count and not timestamps:
+            historyless_play_count += 1
+        if play_count != history_count:
+            mismatched_history_count += 1
+        duration_seconds = max(0.0, float(durations.get(song_name, 0.0) or 0.0))
+        rows.append(
+            {
+                "name": song_name,
+                "playCount": play_count,
+                "historyCount": history_count,
+                "history": encode_timestamps(timestamps),
+                "durationSeconds": round(duration_seconds, 3),
+                "trendingWeight": round(trending_weight(duration_seconds), 6),
+            }
+        )
+
+    timeline = [timestamp for timestamp, _song_name in events]
+    return {
+        "summary": {
+            "folder": str(folder),
+            "songCount": len(rows),
+            "metadataPlayCount": sum(
+                max(0, int(count or 0)) for count in song_counts.values()
+            ),
+            "historyEventCount": len(events),
+            "timelinePointCount": len(timeline),
+            "firstTimestamp": timeline[0] if timeline else None,
+            "lastTimestamp": timeline[-1] if timeline else None,
+            "generatedTimestamp": int(time.time()),
+            "generatedFrom": generated_from,
+            "trendingHalfLifeSeconds": TRENDING_HALF_LIFE_SECONDS,
+            "trendingBaselineDurationSeconds": TRENDING_BASELINE_DURATION_SECONDS,
+            "historylessPlayCount": historyless_play_count,
+            "mismatchedHistoryCount": mismatched_history_count,
+        },
+        "timeline": encode_timestamps(sorted(set(timeline))),
+        "songs": rows,
+    }
+
+
 def build_graph_payload(
     folder: Path,
     song_counts,
@@ -588,6 +670,63 @@ def build_graph_payload_from_options(
     return graph_payload, meta_path
 
 
+def build_combined_payload_from_options(
+    args: argparse.Namespace,
+    repo_root: Path,
+    folder: Path,
+    use_all_folders: bool,
+    fallback_probability: float,
+    view_key: str | None = None,
+    view_label: str | None = None,
+):
+    if use_all_folders:
+        song_counts, history_mapping, durations, meta_path = load_all_folder_data(repo_root)
+    else:
+        song_counts, history_mapping, durations, meta_path = load_folder_data(folder)
+
+    events = build_global_events(history_mapping)
+    window_seconds = int(round(args.window_minutes * 60))
+    edge_counts, edge_gaps = build_transition_counts(
+        events=events,
+        window_seconds=window_seconds,
+        pairing_mode=args.pairing,
+        include_self_loops=args.include_self_loops,
+        durations=durations,
+    )
+
+    graph_payload = build_graph_payload(
+        folder=folder,
+        song_counts=song_counts,
+        history_mapping=history_mapping,
+        durations=durations,
+        events=events,
+        edge_counts=edge_counts,
+        edge_gaps=edge_gaps,
+        window_minutes=args.window_minutes,
+        pairing_mode=args.pairing,
+        fallback_probability=fallback_probability,
+        generated_from=str(meta_path),
+    )
+    trending_payload = build_trending_payload(
+        folder=folder,
+        song_counts=song_counts,
+        history_mapping=history_mapping,
+        durations=durations,
+        events=events,
+        generated_from=str(meta_path),
+    )
+    if view_key is not None:
+        graph_payload["summary"]["viewKey"] = view_key
+        trending_payload["summary"]["viewKey"] = view_key
+    if view_label is not None:
+        graph_payload["summary"]["viewLabel"] = view_label
+        trending_payload["summary"]["viewLabel"] = view_label
+    return {
+        "graph": graph_payload,
+        "trending": trending_payload,
+    }, meta_path
+
+
 def graph_view_definitions():
     return [
         {
@@ -599,7 +738,7 @@ def graph_view_definitions():
 
 
 def graph_view_keys():
-    return {key for key, _label, _path, _use_all_folders in GRAPH_VIEW_OPTIONS}
+    return set(GRAPH_VIEW_KEYS)
 
 
 def graph_view_for_key(repo_root: Path, view_key: str):
@@ -613,6 +752,14 @@ def graph_view_for_key(repo_root: Path, view_key: str):
                 "use_all_folders": use_all_folders,
             }
     raise KeyError(view_key)
+
+
+def resolve_cli_folder(repo_root: Path, folder_arg: str) -> tuple[Path, bool]:
+    view_definition = graph_view_for_key(repo_root, folder_arg)
+    folder = view_definition["folder"]
+    if view_definition["use_all_folders"]:
+        return folder, True
+    return folder.resolve(), False
 
 
 def initial_graph_view_key(folder: Path, use_all_folders: bool) -> str:
@@ -639,8 +786,10 @@ def source_paths_for_folder(repo_root: Path, folder: Path, use_all_folders: bool
             source_folder = repo_root / relative_folder
             source_paths.extend(
                 [
+                    source_folder,
                     repo_root / listen_counts_filename_for_folder(source_folder),
                     repo_root / listen_timestamps_filename_for_folder(source_folder),
+                    source_folder / ".loudness_cache.json",
                 ]
             )
         return source_paths
@@ -650,8 +799,10 @@ def source_paths_for_folder(repo_root: Path, folder: Path, use_all_folders: bool
         return [meta_path]
 
     return [
+        folder,
         repo_root / listen_counts_filename_for_folder(folder),
         repo_root / listen_timestamps_filename_for_folder(folder),
+        folder / ".loudness_cache.json",
     ]
 
 
@@ -672,8 +823,24 @@ def source_signature_for_paths(source_paths):
     return tuple(signature)
 
 
-def build_html(graph_payload, live_config=None):
+def build_html(graph_payload, trending_payload=None, live_config=None):
     graph_json = json.dumps(graph_payload, ensure_ascii=False)
+    trending_json = json.dumps(
+        trending_payload
+        or {
+            "summary": {
+                "folder": graph_payload.get("summary", {}).get("folder", ""),
+                "songCount": 0,
+                "historyEventCount": 0,
+                "timelinePointCount": 0,
+                "trendingHalfLifeSeconds": TRENDING_HALF_LIFE_SECONDS,
+                "trendingBaselineDurationSeconds": TRENDING_BASELINE_DURATION_SECONDS,
+            },
+            "timeline": [],
+            "songs": [],
+        },
+        ensure_ascii=False,
+    )
     live_config_json = json.dumps(live_config or {"enabled": False})
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
@@ -693,6 +860,10 @@ def build_html(graph_payload, live_config=None):
       --muted: #5d7288;
       --accent: #2f80ed;
       --accent-2: #eb5757;
+      --trend-accent: #64748b;
+      --trend-accent-2: #8aa6a0;
+      --trend-track: #e8eef5;
+      --trend-track-border: #cbd7e5;
     }}
     * {{ box-sizing: border-box; }}
     html, body {{
@@ -749,6 +920,283 @@ def build_html(graph_payload, live_config=None):
       background: var(--accent);
       border-color: var(--accent);
       color: #ffffff;
+    }}
+    .app-tabs {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.72);
+    }}
+    .app-tabs button {{
+      min-width: 92px;
+      cursor: pointer;
+    }}
+    .app-tabs button.active {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #ffffff;
+    }}
+    body.trending-mode .layout {{
+      display: none;
+    }}
+    body.graph-mode .trending-layout {{
+      display: none;
+    }}
+    body.trending-mode {{
+      overflow: auto;
+      padding-bottom: 132px;
+    }}
+    body.graph-mode .trending-timeline-dock {{
+      display: none;
+    }}
+    .trending-layout {{
+      padding: 12px 16px 30px;
+      max-width: 1220px;
+      width: 100%;
+      margin: 0 auto;
+      overflow: visible;
+      --trending-row-height: 58px;
+      --trending-row-gap: 7px;
+    }}
+    .trending-hero {{
+      margin-bottom: 12px;
+    }}
+    .trending-intro {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 2px;
+      color: var(--text);
+    }}
+    .trending-ranking {{
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 8px 26px rgba(20, 33, 48, 0.05);
+    }}
+    .trending-intro h2, .trending-ranking h3 {{
+      margin: 0 0 8px;
+    }}
+    .trending-intro h2 {{
+      margin: 0;
+      font-size: 20px;
+    }}
+    .trending-subtitle {{
+      min-width: min(100%, 320px);
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .trending-metrics {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      justify-content: flex-end;
+    }}
+    .trending-card {{
+      display: inline-flex;
+      gap: 5px;
+      align-items: baseline;
+      border: 1px solid rgba(200, 216, 232, 0.9);
+      border-radius: 999px;
+      padding: 4px 8px;
+      background: rgba(255, 255, 255, 0.62);
+    }}
+    .trending-card .label {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .trending-card .value {{
+      font-size: 12px;
+      font-weight: 750;
+    }}
+    .trending-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: end;
+      margin-bottom: 14px;
+    }}
+    .trending-controls label {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 160px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .trending-controls input, .trending-timeline-label select {{
+      font: inherit;
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+    }}
+    .trending-ranking {{
+      overflow: visible;
+      min-height: 440px;
+    }}
+    .trending-ranking-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: start;
+      margin-bottom: 12px;
+    }}
+    .trending-stage {{
+      position: relative;
+      min-height: var(--trending-row-height);
+      transition: height 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
+      isolation: isolate;
+    }}
+    .trending-empty {{
+      padding: 18px;
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      color: var(--muted);
+      text-align: center;
+      background: rgba(245, 249, 253, 0.86);
+    }}
+    .trending-row {{
+      --song-trend-a: var(--trend-accent);
+      --song-trend-b: var(--trend-accent-2);
+      position: absolute;
+      left: 0;
+      right: 0;
+      display: grid;
+      grid-template-columns: 58px minmax(0, 1fr) 118px 112px;
+      gap: 12px;
+      align-items: center;
+      height: var(--trending-row-height);
+      padding: 9px 16px;
+      border-radius: 0;
+      background: transparent;
+      opacity: 1;
+      transform: translateY(0);
+      transition:
+        transform 520ms cubic-bezier(0.2, 0.8, 0.2, 1),
+        opacity 260ms ease,
+        background 260ms ease;
+      will-change: transform;
+    }}
+    .trending-row.is-leader {{
+      background: linear-gradient(90deg, color-mix(in srgb, var(--song-trend-a) 16%, transparent), rgba(255, 255, 255, 0));
+    }}
+    .trending-row:hover {{
+      background: linear-gradient(90deg, color-mix(in srgb, var(--song-trend-a) 13%, transparent), rgba(255, 255, 255, 0.5));
+    }}
+    .trending-row.is-exiting {{
+      opacity: 0;
+    }}
+    .trending-rank {{
+      color: var(--song-trend-a);
+      font-variant-numeric: tabular-nums;
+      font-weight: 800;
+    }}
+    .trending-track {{
+      display: grid;
+      gap: 7px;
+      min-width: 0;
+    }}
+    .trending-name {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 720;
+    }}
+    .trending-bar {{
+      height: 9px;
+      border-radius: 999px;
+      overflow: hidden;
+      border: 1px solid var(--trend-track-border);
+      background: var(--trend-track);
+    }}
+    .trending-fill {{
+      width: 0%;
+      height: 100%;
+      background: linear-gradient(90deg, var(--song-trend-a), var(--song-trend-b));
+      border-radius: inherit;
+      transition: width 520ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    }}
+    .trending-score, .trending-plays {{
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }}
+    .trending-score strong, .trending-plays strong {{
+      display: block;
+    }}
+    .trending-score span, .trending-plays span {{
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .trending-timeline-dock {{
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 3000;
+      display: grid;
+      gap: 10px;
+      padding: 14px 16px 16px;
+      border-top: 1px solid var(--border);
+      background: rgba(248, 251, 255, 0.94);
+      backdrop-filter: blur(12px);
+      box-shadow: 0 -10px 30px rgba(20, 33, 48, 0.08);
+    }}
+    .trending-timeline-top {{
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+    }}
+    .trending-timeline-meta {{
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }}
+    .trending-timeline-date {{
+      font-weight: 750;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .trending-timeline-count {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .trending-play-button {{
+      width: 42px;
+      height: 42px;
+      border: 1px solid rgba(100, 116, 139, 0.45);
+      border-radius: 999px;
+      color: #334155;
+      background: rgba(100, 116, 139, 0.1);
+      cursor: pointer;
+      font-weight: 800;
+    }}
+    .trending-play-button:hover {{
+      background: rgba(100, 116, 139, 0.16);
+    }}
+    .trending-timeline-label {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 150px;
+      font-size: 13px;
+      color: var(--muted);
+    }}
+    #trending-timeline {{
+      width: 100%;
+      accent-color: var(--trend-accent);
     }}
     .toolbar input[type=range] {{ padding: 0; }}
     .toolbar .checkbox {{
@@ -863,10 +1311,35 @@ def build_html(graph_payload, live_config=None):
       }}
       .sidebar {{ border-left: none; border-top: 1px solid var(--border); }}
     }}
+    @media (max-width: 680px) {{
+      body.trending-mode {{
+        padding-bottom: 156px;
+      }}
+      .trending-row {{
+        grid-template-columns: 42px minmax(0, 1fr);
+      }}
+      .trending-score, .trending-plays {{
+        grid-column: 2;
+        text-align: left;
+      }}
+      .trending-name {{
+        white-space: normal;
+      }}
+      .trending-timeline-top {{
+        grid-template-columns: 1fr;
+      }}
+      .trending-timeline-label {{
+        min-width: 0;
+      }}
+    }}
   </style>
 </head>
-<body>
+<body class=\"graph-mode\">
   <div class=\"toolbar\">
+    <div class=\"app-tabs\" aria-label=\"Dashboard mode\">
+      <button id=\"graph-mode-button\" class=\"active\" type=\"button\">Graph</button>
+      <button id=\"trending-mode-button\" type=\"button\">Trending</button>
+    </div>
     <div id=\"graph-tabs\" class=\"graph-tabs\" aria-label=\"Graph views\"></div>
     <label>
       Search song
@@ -924,8 +1397,62 @@ def build_html(graph_payload, live_config=None):
       </section>
     </aside>
   </div>
+  <main class=\"trending-layout\">
+    <section class=\"trending-hero\">
+      <div class=\"trending-intro\">
+        <div>
+          <h2>Trending MP3s</h2>
+          <div class=\"trending-subtitle\" id=\"trending-subtitle\"></div>
+        </div>
+        <div class=\"trending-metrics\">
+          <span class=\"trending-card\"><span class=\"label\">Songs</span><span class=\"value\" id=\"trending-song-count\"></span></span>
+          <span class=\"trending-card\"><span class=\"label\">Events</span><span class=\"value\" id=\"trending-event-count\"></span></span>
+          <span class=\"trending-card\"><span class=\"label\">Half-life</span><span class=\"value\">2d</span></span>
+          <span class=\"trending-card\"><span class=\"label\">Baseline</span><span class=\"value\">3:30</span></span>
+        </div>
+      </div>
+    </section>
+    <section class=\"trending-controls\">
+      <label>
+        Top songs
+        <input id=\"trending-top-limit\" type=\"number\" min=\"1\" max=\"200\" step=\"1\" value=\"40\">
+      </label>
+    </section>
+    <section class=\"trending-ranking\">
+      <div class=\"trending-ranking-head\">
+        <div>
+          <h3>Trending Bar Race</h3>
+          <div class=\"muted\" id=\"trending-through\"></div>
+        </div>
+        <div class=\"muted\" id=\"trending-rank-caption\"></div>
+      </div>
+      <div class=\"trending-empty\" id=\"trending-empty\" hidden>No timestamped plays at this point in the timeline.</div>
+      <div class=\"trending-stage\" id=\"trending-stage\"></div>
+    </section>
+  </main>
+  <section class=\"trending-timeline-dock\">
+    <div class=\"trending-timeline-top\">
+      <button id=\"trending-play-toggle\" class=\"trending-play-button\" type=\"button\" title=\"Play timeline\">▶</button>
+      <div class=\"trending-timeline-meta\">
+        <div class=\"trending-timeline-date\" id=\"trending-timeline-date\"></div>
+        <div class=\"trending-timeline-count\" id=\"trending-timeline-count\"></div>
+      </div>
+      <label class=\"trending-timeline-label\">
+        Playback speed
+        <select id=\"trending-play-speed\">
+          <option value=\"2\">Relaxed · 2s/day</option>
+          <option value=\"1\">Fast · 1s/day</option>
+          <option value=\"0.5\" selected>Very fast · 0.5s/day</option>
+          <option value=\"0.25\">Sprint · 0.25s/day</option>
+          <option value=\"0.1\">Max · 0.1s/day</option>
+        </select>
+      </label>
+    </div>
+    <input id=\"trending-timeline\" type=\"range\" min=\"0\" max=\"1000\" step=\"1\" value=\"1000\">
+  </section>
   <script>
     let graphData = {graph_json};
+    let trendingData = {trending_json};
     const liveConfig = {live_config_json};
     let activeViewKey = liveConfig.initialViewKey || graphData.summary.viewKey || 'all';
     const graphHashesByView = new Map([[activeViewKey, liveConfig.initialHash || null]]);
@@ -935,10 +1462,24 @@ def build_html(graph_payload, live_config=None):
     let nodeLookup = new Map(allNodes.map((node) => [node.id, node]));
     let edgeLookup = new Map(allEdges.map((edge) => [edge.id, edge]));
     let selectedNodeId = null;
+    let trendingSongs = [];
+    let trendingFirstTimestamp = 0;
+    let trendingLastTimestamp = 0;
+    let trendingRows = new Map();
+    let trendingIsPlaying = false;
+    let trendingPlayAnimationFrame = null;
+    let trendingLastPlaybackFrame = null;
 
     const container = document.getElementById('network');
     const networkStatus = document.getElementById('network-status');
     const listenTimeSizeToggle = document.getElementById('listen-time-size-toggle');
+    const trendingTopLimit = document.getElementById('trending-top-limit');
+    const trendingTimeline = document.getElementById('trending-timeline');
+    const trendingStage = document.getElementById('trending-stage');
+    const trendingEmpty = document.getElementById('trending-empty');
+    const trendingPlayToggle = document.getElementById('trending-play-toggle');
+    const trendingPlaySpeed = document.getElementById('trending-play-speed');
+    const secondsPerDay = 86400;
 
     function getNodeColor(node) {{
       if (node.sourceGroup === 'mid-mp3s') {{
@@ -1059,6 +1600,307 @@ def build_html(graph_payload, live_config=None):
       return `${{(seconds / 3600).toFixed(1)}}h`;
     }}
 
+    function formatScore(value) {{
+      const score = Number(value || 0);
+      if (score >= 100) {{
+        return score.toFixed(0);
+      }}
+      if (score >= 10) {{
+        return score.toFixed(1);
+      }}
+      return score.toFixed(2);
+    }}
+
+    function formatDateTime(timestamp) {{
+      if (!Number.isFinite(timestamp) || timestamp <= 0) {{
+        return '-';
+      }}
+      return new Intl.DateTimeFormat(undefined, {{
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      }}).format(new Date(timestamp * 1000));
+    }}
+
+    function formatNumber(value) {{
+      return new Intl.NumberFormat().format(value || 0);
+    }}
+
+    function escapeHtml(value) {{
+      return String(value).replace(/[&<>\"']/g, (ch) => ({{
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '\"': '&quot;',
+        "'": '&#39;',
+      }}[ch]));
+    }}
+
+    function hashString(value) {{
+      let hash = 2166136261;
+      for (let index = 0; index < value.length; index += 1) {{
+        hash ^= value.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+      }}
+      return hash >>> 0;
+    }}
+
+    function mutedSongColors(songName) {{
+      const palette = [
+        ['#5f7fa3', '#92a9bd'],
+        ['#6f9588', '#9db5ad'],
+        ['#92789a', '#b2a1b8'],
+        ['#9b8062', '#bba992'],
+        ['#7680aa', '#a2a9c4'],
+        ['#a07069', '#bd9d98'],
+        ['#5f8b72', '#95ad9d'],
+        ['#7b8795', '#a6afb9'],
+        ['#8b7aa2', '#ada2bd'],
+        ['#5f8e9e', '#95b1ba'],
+      ];
+      const index = hashString(songName) % palette.length;
+      return {{ a: palette[index][0], b: palette[index][1] }};
+    }}
+
+    function decodeTrendingTimestamps(encoded) {{
+      const out = [];
+      let current = null;
+      for (let index = 0; index < (encoded || []).length; index += 1) {{
+        const value = Number(encoded[index]);
+        if (!Number.isFinite(value)) {{
+          continue;
+        }}
+        current = current === null || index === 0 ? value : current + value;
+        out.push(current);
+      }}
+      return out;
+    }}
+
+    function timestampForTrendingSlider() {{
+      const ratio = Math.max(0, Math.min(1, Number(trendingTimeline.value || 0) / Number(trendingTimeline.max || 1)));
+      return trendingFirstTimestamp + ((trendingLastTimestamp - trendingFirstTimestamp) * ratio);
+    }}
+
+    function scoreTrendingSong(song, timestamp) {{
+      let score = 0;
+      let count = 0;
+      let lastListen = null;
+      const halfLifeSeconds = Math.max(1, Number(trendingData.summary.trendingHalfLifeSeconds || 172800));
+      const baselineSeconds = Math.max(1, Number(trendingData.summary.trendingBaselineDurationSeconds || 210));
+      const duration = Math.max(0, Number(song.durationSeconds || 0));
+      const weight = duration > 0 ? duration / baselineSeconds : 1;
+      for (const playedAt of song.timestamps) {{
+        if (playedAt > timestamp) {{
+          break;
+        }}
+        count += 1;
+        lastListen = playedAt;
+        const age = Math.max(0, timestamp - playedAt);
+        score += Math.pow(2, -age / halfLifeSeconds) * weight;
+      }}
+      return {{ score, count, lastListen, weight }};
+    }}
+
+    function applyTrendingData(nextTrendingData) {{
+      const keepAtEnd = Number(trendingTimeline.value || 0) >= Number(trendingTimeline.max || 1);
+      trendingData = nextTrendingData || trendingData;
+      const summary = trendingData.summary || {{}};
+      trendingSongs = (trendingData.songs || []).map((song) => ({{
+        ...song,
+        timestamps: decodeTrendingTimestamps(song.history),
+      }}));
+      trendingFirstTimestamp = Number(summary.firstTimestamp || summary.generatedTimestamp || 0);
+      trendingLastTimestamp = Math.max(
+        Number(summary.lastTimestamp || 0),
+        Number(summary.generatedTimestamp || 0),
+        trendingFirstTimestamp,
+      );
+      document.getElementById('trending-subtitle').textContent =
+        `${{summary.folder || '-'}} · duration-weighted 2d decay`;
+      document.getElementById('trending-song-count').textContent = formatNumber(summary.songCount);
+      document.getElementById('trending-event-count').textContent = formatNumber(summary.historyEventCount);
+      trendingTimeline.disabled = !summary.timelinePointCount;
+      if (keepAtEnd) {{
+        trendingTimeline.value = trendingTimeline.max;
+      }}
+      if (trendingTimeline.disabled) {{
+        stopTrendingPlayback();
+      }}
+      renderTrending();
+    }}
+
+    function renderTrending() {{
+      const timestamp = timestampForTrendingSlider();
+      const limit = Math.max(1, Math.min(200, Number(trendingTopLimit.value || 1)));
+      trendingTopLimit.value = limit;
+      const ranked = [];
+      for (const song of trendingSongs) {{
+        const scored = scoreTrendingSong(song, timestamp);
+        if (scored.score <= 0) {{
+          continue;
+        }}
+        ranked.push({{ ...song, ...scored }});
+      }}
+      ranked.sort((left, right) => right.score - left.score || left.name.localeCompare(right.name));
+      const selected = ranked.slice(0, limit);
+      const maxScore = Math.max(1, ...selected.map((song) => song.score));
+      document.getElementById('trending-through').textContent =
+        `Through ${{formatDateTime(timestamp)}}`;
+      document.getElementById('trending-rank-caption').textContent =
+        `${{formatNumber(selected.length)}} of ${{formatNumber(ranked.length)}} active`;
+      const selectedScore = selected.reduce((sum, song) => sum + song.score, 0);
+      const totalScore = ranked.reduce((sum, song) => sum + song.score, 0);
+      document.getElementById('trending-timeline-date').textContent =
+        `Through ${{formatDateTime(timestamp)}}`;
+      document.getElementById('trending-timeline-count').textContent =
+        selected[0]
+          ? `Leader: ${{selected[0].name}} · +${{formatScore(totalScore)}} weighted score · ${{formatNumber(ranked.length)}} active`
+          : `+${{formatScore(totalScore)}} weighted score · ${{formatNumber(ranked.length)}} active`;
+
+      if (!selected.length) {{
+        trendingEmpty.hidden = false;
+      }} else {{
+        trendingEmpty.hidden = true;
+      }}
+
+      const selectedNames = new Set(selected.map((song) => song.name));
+      const rowHeight = Number.parseFloat(getComputedStyle(document.querySelector('.trending-layout')).getPropertyValue('--trending-row-height')) || 58;
+      const rowGap = Number.parseFloat(getComputedStyle(document.querySelector('.trending-layout')).getPropertyValue('--trending-row-gap')) || 7;
+      const totalHeight = selected.length
+        ? selected.length * rowHeight + Math.max(0, selected.length - 1) * rowGap
+        : rowHeight;
+      trendingStage.style.height = `${{totalHeight}}px`;
+
+      selected.forEach((song, index) => {{
+        const yPosition = index * (rowHeight + rowGap);
+        let row = trendingRows.get(song.name);
+        if (!row) {{
+          row = createTrendingRow(song.name);
+          trendingRows.set(song.name, row);
+          row.style.transform = `translateY(${{yPosition + 10}}px)`;
+          requestAnimationFrame(() => updateTrendingRow(row, song, index + 1, maxScore, yPosition));
+        }} else {{
+          updateTrendingRow(row, song, index + 1, maxScore, yPosition);
+        }}
+      }});
+
+      for (const [songName, row] of trendingRows.entries()) {{
+        if (selectedNames.has(songName)) {{
+          continue;
+        }}
+        row.classList.add('is-exiting');
+        row.style.opacity = '0';
+        window.setTimeout(() => {{
+          if (!trendingRows.has(songName)) {{
+            return;
+          }}
+          const currentRow = trendingRows.get(songName);
+          if (currentRow === row && row.classList.contains('is-exiting')) {{
+            row.remove();
+            trendingRows.delete(songName);
+          }}
+        }}, 280);
+      }}
+    }}
+
+    function createTrendingRow(songName) {{
+      const row = document.createElement('article');
+      row.className = 'trending-row';
+      row.dataset.songName = songName;
+      row.innerHTML = `
+        <div class=\"trending-rank\"></div>
+        <div class=\"trending-track\">
+          <div class=\"trending-name\"></div>
+          <div class=\"trending-bar\"><div class=\"trending-fill\"></div></div>
+          <div class=\"muted trending-meta\"></div>
+        </div>
+        <div class=\"trending-score\"><strong></strong><span></span></div>
+        <div class=\"trending-plays\"><strong></strong><span></span></div>
+      `;
+      row.style.opacity = '0';
+      trendingStage.appendChild(row);
+      return row;
+    }}
+
+    function updateTrendingRow(row, song, rank, maxScore, yPosition) {{
+      const width = Math.max(1, 100 * song.score / maxScore).toFixed(2);
+      const colors = mutedSongColors(song.name);
+      row.style.setProperty('--song-trend-a', colors.a);
+      row.style.setProperty('--song-trend-b', colors.b);
+      row.classList.toggle('is-leader', rank === 1);
+      row.classList.remove('is-exiting');
+      row.style.transform = `translateY(${{yPosition}}px)`;
+      row.style.zIndex = String(1000 - rank);
+      row.style.opacity = '1';
+      row.querySelector('.trending-rank').textContent = `#${{rank}}`;
+      const nameEl = row.querySelector('.trending-name');
+      nameEl.textContent = song.name;
+      nameEl.title = song.name;
+      row.querySelector('.trending-meta').textContent =
+        `last ${{formatDateTime(song.lastListen)}} · duration ${{formatDuration(song.durationSeconds)}} · weight ${{song.weight.toFixed(2)}}x`;
+      row.querySelector('.trending-fill').style.width = `${{width}}%`;
+      row.querySelector('.trending-score strong').textContent = `+${{formatScore(song.score)}}`;
+      row.querySelector('.trending-score span').textContent = 'weighted decay';
+      row.querySelector('.trending-plays strong').textContent = formatNumber(song.count);
+      row.querySelector('.trending-plays span').textContent = 'timestamped';
+    }}
+
+    function stopTrendingPlayback() {{
+      trendingIsPlaying = false;
+      trendingPlayToggle.textContent = '▶';
+      trendingPlayToggle.title = 'Play timeline';
+      trendingLastPlaybackFrame = null;
+      if (trendingPlayAnimationFrame !== null) {{
+        cancelAnimationFrame(trendingPlayAnimationFrame);
+        trendingPlayAnimationFrame = null;
+      }}
+    }}
+
+    function stepTrendingPlayback(frameTimestamp) {{
+      if (!trendingIsPlaying || trendingTimeline.disabled) {{
+        return;
+      }}
+      if (trendingLastPlaybackFrame === null) {{
+        trendingLastPlaybackFrame = frameTimestamp;
+      }}
+      const elapsedMs = Math.max(0, frameTimestamp - trendingLastPlaybackFrame);
+      trendingLastPlaybackFrame = frameTimestamp;
+      const current = Number(trendingTimeline.value) || 0;
+      const sliderMax = Number(trendingTimeline.max) || 1000;
+      if (current >= sliderMax) {{
+        stopTrendingPlayback();
+        return;
+      }}
+      const secondsPerTimelineDay = Math.max(0.1, Number(trendingPlaySpeed.value) || 5);
+      const timelineSpanSeconds = Math.max(1, trendingLastTimestamp - trendingFirstTimestamp);
+      const advancedTimelineSeconds = elapsedMs * secondsPerDay / (secondsPerTimelineDay * 1000);
+      const sliderDelta = sliderMax * advancedTimelineSeconds / timelineSpanSeconds;
+      trendingTimeline.value = Math.min(sliderMax, current + sliderDelta);
+      renderTrending();
+      trendingPlayAnimationFrame = requestAnimationFrame(stepTrendingPlayback);
+    }}
+
+    function toggleTrendingPlayback() {{
+      if (trendingIsPlaying) {{
+        stopTrendingPlayback();
+        return;
+      }}
+      if (trendingTimeline.disabled) {{
+        return;
+      }}
+      const sliderMax = Number(trendingTimeline.max) || 1000;
+      if (Number(trendingTimeline.value) >= sliderMax) {{
+        trendingTimeline.value = 0;
+      }}
+      trendingIsPlaying = true;
+      trendingLastPlaybackFrame = null;
+      trendingPlayToggle.textContent = '❚❚';
+      trendingPlayToggle.title = 'Pause timeline';
+      trendingPlayAnimationFrame = requestAnimationFrame(stepTrendingPlayback);
+    }}
+
     function describePairingMode(pairingMode) {{
       if (pairingMode === 'consecutive') {{
         return 'immediate next song only';
@@ -1100,6 +1942,7 @@ def build_html(graph_payload, live_config=None):
         graphHashesByView.set(activeViewKey, currentGraphHash);
         setActiveGraphTab();
         applyGraphData(nextPayload.graph, {{ clearSelection: true, rebuild: true }});
+        applyTrendingData(nextPayload.trending);
         setLiveStatus(`Live: showing ${{getViewLabel(activeViewKey)}} after ${{graphData.summary.eventCount}} play events.`);
       }} catch (error) {{
         setLiveStatus(`Could not load ${{getViewLabel(viewKey)}}: ${{error.message}}`, true);
@@ -1120,6 +1963,24 @@ def build_html(graph_payload, live_config=None):
         button.addEventListener('click', () => loadGraphView(button.dataset.viewKey));
       }});
       setActiveGraphTab();
+    }}
+
+    function setAppMode(mode) {{
+      const isTrending = mode === 'trending';
+      document.body.classList.toggle('trending-mode', isTrending);
+      document.body.classList.toggle('graph-mode', !isTrending);
+      document.getElementById('graph-mode-button').classList.toggle('active', !isTrending);
+      document.getElementById('trending-mode-button').classList.toggle('active', isTrending);
+      if (!isTrending && network) {{
+        stopTrendingPlayback();
+        window.setTimeout(() => {{
+          network.redraw();
+          network.fit({{ animation: {{ duration: 220, easingFunction: 'easeInOutQuad' }} }});
+        }}, 0);
+      }}
+      if (isTrending) {{
+        renderTrending();
+      }}
     }}
 
     function rebuildLookups() {{
@@ -1390,6 +2251,19 @@ def build_html(graph_payload, live_config=None):
         focusSong();
       }}
     }});
+    document.getElementById('graph-mode-button').addEventListener('click', () => setAppMode('graph'));
+    document.getElementById('trending-mode-button').addEventListener('click', () => setAppMode('trending'));
+    trendingTopLimit.addEventListener('input', renderTrending);
+    trendingTimeline.addEventListener('input', () => {{
+      stopTrendingPlayback();
+      renderTrending();
+    }});
+    trendingPlayToggle.addEventListener('click', toggleTrendingPlayback);
+    trendingPlaySpeed.addEventListener('change', () => {{
+      if (trendingIsPlaying) {{
+        trendingLastPlaybackFrame = null;
+      }}
+    }});
 
     async function pollGraphData() {{
       if (!liveConfig.enabled) {{
@@ -1405,6 +2279,7 @@ def build_html(graph_payload, live_config=None):
           currentGraphHash = nextPayload.hash;
           graphHashesByView.set(activeViewKey, currentGraphHash);
           applyGraphData(nextPayload.graph);
+          applyTrendingData(nextPayload.trending);
           setLiveStatus(`Live: updated ${{getViewLabel(activeViewKey)}} after ${{graphData.summary.eventCount}} play events.`);
         }} else {{
           setLiveStatus(`Live: watching ${{getViewLabel(activeViewKey)}} every ${{liveConfig.refreshSeconds}}s.`);
@@ -1425,6 +2300,7 @@ def build_html(graph_payload, live_config=None):
 
     renderGraphTabs();
     updateSummary();
+    applyTrendingData(trendingData);
     createNetwork();
     startLiveUpdates();
   </script>
@@ -1457,9 +2333,9 @@ def make_live_graph_handler(
     cached_responses = {
         key: {
             "signature": None,
-            "graph_payload": None,
+            "combined_payload": None,
             "meta_path": None,
-            "graph_hash": None,
+            "payload_hash": None,
         }
         for key in view_keys
     }
@@ -1474,15 +2350,15 @@ def make_live_graph_handler(
         current_signature = source_signature_for_paths(source_paths)
         if (
             cached_response["signature"] == current_signature
-            and cached_response["graph_payload"] is not None
+            and cached_response["combined_payload"] is not None
         ):
             return (
-                cached_response["graph_payload"],
+                cached_response["combined_payload"],
                 cached_response["meta_path"],
-                cached_response["graph_hash"],
+                cached_response["payload_hash"],
             )
 
-        graph_payload, meta_path = build_graph_payload_from_options(
+        combined_payload, meta_path = build_combined_payload_from_options(
             args=args,
             repo_root=repo_root,
             folder=view_definition["folder"],
@@ -1491,16 +2367,16 @@ def make_live_graph_handler(
             view_key=view_definition["key"],
             view_label=view_definition["label"],
         )
-        graph_hash = hash_graph_payload(graph_payload)
+        payload_hash = hash_graph_payload(combined_payload)
         cached_response.update(
             {
                 "signature": current_signature,
-                "graph_payload": graph_payload,
+                "combined_payload": combined_payload,
                 "meta_path": meta_path,
-                "graph_hash": graph_hash,
+                "payload_hash": payload_hash,
             }
         )
-        return graph_payload, meta_path, graph_hash
+        return combined_payload, meta_path, payload_hash
 
     class LiveGraphHandler(BaseHTTPRequestHandler):
         def send_bytes(self, status: int, body: bytes, content_type: str) -> None:
@@ -1522,15 +2398,16 @@ def make_live_graph_handler(
             requested_view = query.get("view", [initial_view_key])[0]
             if route in ("/", "/index.html"):
                 try:
-                    graph_payload, _meta_path, graph_hash = get_graph_response(
+                    combined_payload, _meta_path, payload_hash = get_graph_response(
                         requested_view
                     )
                     html = build_html(
-                        graph_payload,
+                        combined_payload["graph"],
+                        combined_payload["trending"],
                         live_config={
                             "enabled": True,
                             "refreshSeconds": args.refresh_seconds,
-                            "initialHash": graph_hash,
+                            "initialHash": payload_hash,
                             "initialViewKey": requested_view,
                             "views": graph_view_definitions(),
                         },
@@ -1546,15 +2423,16 @@ def make_live_graph_handler(
 
             if route == "/graph-data.json":
                 try:
-                    graph_payload, _meta_path, graph_hash = get_graph_response(
+                    combined_payload, _meta_path, payload_hash = get_graph_response(
                         requested_view
                     )
                     self.send_json(
                         200,
                         {
                             "view": requested_view,
-                            "hash": graph_hash,
-                            "graph": graph_payload,
+                            "hash": payload_hash,
+                            "graph": combined_payload["graph"],
+                            "trending": combined_payload["trending"],
                         },
                     )
                 except KeyError:
@@ -1579,7 +2457,7 @@ def serve_live_graph(
     fallback_probability: float,
 ) -> int:
     try:
-        graph_payload, meta_path = build_graph_payload_from_options(
+        combined_payload, meta_path = build_combined_payload_from_options(
             args=args,
             repo_root=repo_root,
             folder=folder,
@@ -1605,7 +2483,7 @@ def serve_live_graph(
 
     emit(f"Read metadata from '{meta_path}'.")
     emit(
-        f"Serving live graph at {url} with {graph_payload['summary']['songCount']} songs and {graph_payload['summary']['edgeCount']} observed edges."
+        f"Serving live graph/trending dashboard at {url} with {combined_payload['graph']['summary']['songCount']} songs and {combined_payload['graph']['summary']['edgeCount']} observed edges."
     )
     emit(
         f"Pairing mode: {args.pairing}; window: {args.window_minutes} minutes; self loops: {'on' if args.include_self_loops else 'off'}."
@@ -1629,7 +2507,7 @@ def serve_live_graph(
 
 
 def get_default_output_path(folder: Path) -> Path:
-    folder_label = folder.name or folder.parent.name or "mp3s"
+    folder_label = folder.name or folder.parent.name or "mp3"
     safe_folder_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in folder_label)
     return Path(DEFAULT_OUTPUT_TEMPLATE.format(folder=safe_folder_label))
 
@@ -1641,8 +2519,7 @@ def main() -> int:
 
     args = parse_args()
     repo_root = Path(__file__).resolve().parent
-    use_all_folders = args.folder == "all"
-    folder = Path("all") if use_all_folders else Path(args.folder).expanduser().resolve()
+    folder, use_all_folders = resolve_cli_folder(repo_root, args.folder)
     if not use_all_folders and not folder.is_dir():
         emit(f"Error: folder '{folder}' does not exist.")
         return 1
@@ -1671,7 +2548,7 @@ def main() -> int:
         )
 
     try:
-        graph_payload, meta_path = build_graph_payload_from_options(
+        combined_payload, meta_path = build_combined_payload_from_options(
             args=args,
             repo_root=repo_root,
             folder=folder,
@@ -1687,12 +2564,12 @@ def main() -> int:
         if args.output
         else get_default_output_path(folder)
     )
-    html = build_html(graph_payload)
+    html = build_html(combined_payload["graph"], combined_payload["trending"])
     output_path.write_text(html, encoding="utf-8")
 
     emit(f"Read metadata from '{meta_path}'.")
     emit(
-        f"Wrote graph to '{output_path}' with {graph_payload['summary']['songCount']} songs and {graph_payload['summary']['edgeCount']} observed edges."
+        f"Wrote graph/trending dashboard to '{output_path}' with {combined_payload['graph']['summary']['songCount']} songs and {combined_payload['graph']['summary']['edgeCount']} observed edges."
     )
     emit(
         f"Pairing mode: {args.pairing}; window: {args.window_minutes} minutes; self loops: {'on' if args.include_self_loops else 'off'}."

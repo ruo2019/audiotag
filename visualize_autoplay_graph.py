@@ -48,10 +48,9 @@ DEFAULT_WINDOW_MINUTES = AUTOPLAY_WINDOW_SECONDS / 60.0
 DEFAULT_FALLBACK_PROBABILITY = 0.0
 DEFAULT_OUTPUT_TEMPLATE = "autoplay_graph_{folder}.html"
 DEFAULT_PAIRING_MODE = "consecutive"
-PLAY_NODE_MIN_SIZE = 18
-PLAY_NODE_SIZE_RANGE = 28
-LISTEN_HOURS_NODE_MIN_SIZE = 12
-LISTEN_HOURS_NODE_SIZE_RANGE = 42
+NODE_MIN_SIZE = 7
+NODE_SIZE_RANGE = 63
+NODE_SIZE_POWER = 1.25
 VIS_NETWORK_CDN = "https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"
 LISTEN_COUNTS_FILE = "listen_counts.json"
 MID_LISTEN_COUNTS_FILE = "mid_listen_counts.json"
@@ -346,6 +345,13 @@ def clamp_probability(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def scale_node_size(value: float, max_value: float) -> float:
+    if max_value <= 0 or value <= 0:
+        return float(NODE_MIN_SIZE)
+    normalized = max(0.0, min(1.0, value / max_value))
+    return NODE_MIN_SIZE + NODE_SIZE_RANGE * (normalized ** NODE_SIZE_POWER)
+
+
 def build_graph_payload(
     folder: Path,
     song_counts,
@@ -404,18 +410,9 @@ def build_graph_payload(
 
         duration_seconds = duration_by_song.get(song_name, 0.0)
         listen_time_seconds = listen_time_by_song.get(song_name, 0.0)
-        play_node_size = (
-            PLAY_NODE_MIN_SIZE
-            + PLAY_NODE_SIZE_RANGE * math.sqrt(play_count / max_play_count)
-            if max_play_count > 0
-            else PLAY_NODE_MIN_SIZE
-        )
-        listen_time_node_size = (
-            LISTEN_HOURS_NODE_MIN_SIZE
-            + LISTEN_HOURS_NODE_SIZE_RANGE
-            * (listen_time_seconds / max_listen_time_seconds)
-            if max_listen_time_seconds > 0
-            else play_node_size
+        play_node_size = scale_node_size(play_count, max_play_count)
+        listen_time_node_size = scale_node_size(
+            listen_time_seconds, max_listen_time_seconds
         )
         nodes.append(
             {

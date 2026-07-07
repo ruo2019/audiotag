@@ -1071,7 +1071,7 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
       left: 0;
       right: 0;
       display: grid;
-      grid-template-columns: 58px minmax(0, 1fr) 118px 112px;
+      grid-template-columns: 58px 34px minmax(0, 1fr) 118px 112px;
       gap: 12px;
       align-items: center;
       height: var(--trending-row-height);
@@ -1099,6 +1099,27 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
       color: var(--song-trend-a);
       font-variant-numeric: tabular-nums;
       font-weight: 800;
+    }}
+    .trending-color {{
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      border: 1px solid var(--trend-track-border);
+      border-radius: 999px;
+      background: transparent;
+      cursor: pointer;
+      overflow: hidden;
+    }}
+    .trending-color::-webkit-color-swatch-wrapper {{
+      padding: 0;
+    }}
+    .trending-color::-webkit-color-swatch {{
+      border: 0;
+      border-radius: 999px;
+    }}
+    .trending-color::-moz-color-swatch {{
+      border: 0;
+      border-radius: 999px;
     }}
     .trending-track {{
       display: grid;
@@ -1316,10 +1337,10 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
         padding-bottom: 156px;
       }}
       .trending-row {{
-        grid-template-columns: 42px minmax(0, 1fr);
+        grid-template-columns: 42px 32px minmax(0, 1fr);
       }}
       .trending-score, .trending-plays {{
-        grid-column: 2;
+        grid-column: 3;
         text-align: left;
       }}
       .trending-name {{
@@ -1440,11 +1461,9 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
       <label class=\"trending-timeline-label\">
         Playback speed
         <select id=\"trending-play-speed\">
-          <option value=\"2\">Relaxed · 2s/day</option>
-          <option value=\"1\">Fast · 1s/day</option>
-          <option value=\"0.5\" selected>Very fast · 0.5s/day</option>
-          <option value=\"0.25\">Sprint · 0.25s/day</option>
-          <option value=\"0.1\">Max · 0.1s/day</option>
+          <option value=\"0.5\">0.5s/day</option>
+          <option value=\"0.38\" selected>0.38s/day</option>
+          <option value=\"0.25\">0.25s/day</option>
         </select>
       </label>
     </div>
@@ -1469,6 +1488,8 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
     let trendingIsPlaying = false;
     let trendingPlayAnimationFrame = null;
     let trendingLastPlaybackFrame = null;
+    const trendingColorStorageKey = 'audiotagTrendingSongColors:v1';
+    let trendingColorOverrides = loadTrendingColorOverrides();
 
     const container = document.getElementById('network');
     const networkStatus = document.getElementById('network-status');
@@ -1521,6 +1542,7 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
     }}
 
     function buildVisibleNode(node) {{
+      const rememberedPosition = nodePositions.get(node.id);
       return {{
         ...node,
         value: undefined,
@@ -1532,7 +1554,9 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
               border: '#eb5757',
               highlight: {{ background: '#ff8a65', border: '#eb5757' }}
             }}
-          : getNodeColor(node)
+          : getNodeColor(node),
+        ...(rememberedPosition ? {{ x: rememberedPosition.x, y: rememberedPosition.y }} : {{}}),
+        fixed: {{ x: false, y: false }}
       }};
     }}
 
@@ -1550,6 +1574,8 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
     let nodeDataSet = new vis.DataSet([]);
     let edgeDataSet = new vis.DataSet([]);
     let network = null;
+    let graphWasManuallyMoved = false;
+    const nodePositions = new Map();
 
     const networkOptions = {{
       autoResize: true,
@@ -1568,8 +1594,11 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
       }},
       interaction: {{ hover: true, tooltipDelay: 120, navigationButtons: true, keyboard: true }},
       physics: {{
-        stabilization: {{ iterations: 250 }},
-        barnesHut: {{ gravitationalConstant: -3200, springLength: 135, springConstant: 0.03, damping: 0.18 }}
+        enabled: true,
+        stabilization: {{ iterations: 180, updateInterval: 25 }},
+        timestep: 0.3,
+        minVelocity: 1.05,
+        barnesHut: {{ gravitationalConstant: -2300, springLength: 135, springConstant: 0.011, damping: 0.78, avoidOverlap: 0.05 }}
       }}
     }};
 
@@ -1647,7 +1676,78 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
       return hash >>> 0;
     }}
 
+    function loadTrendingColorOverrides() {{
+      try {{
+        const parsed = JSON.parse(localStorage.getItem(trendingColorStorageKey) || '{{}}');
+        return parsed && typeof parsed === 'object' ? parsed : {{}};
+      }} catch (_error) {{
+        return {{}};
+      }}
+    }}
+
+    function saveTrendingColorOverrides() {{
+      try {{
+        localStorage.setItem(trendingColorStorageKey, JSON.stringify(trendingColorOverrides));
+      }} catch (_error) {{
+        // Ignore private-mode or quota errors; the picker still works for this session.
+      }}
+    }}
+
+    function hexToRgb(hex) {{
+      const match = /^#?([a-f\\d]{{2}})([a-f\\d]{{2}})([a-f\\d]{{2}})$/i.exec(hex || '');
+      if (!match) {{
+        return null;
+      }}
+      return {{
+        r: Number.parseInt(match[1], 16),
+        g: Number.parseInt(match[2], 16),
+        b: Number.parseInt(match[3], 16),
+      }};
+    }}
+
+    function rgbToHex({{ r, g, b }}) {{
+      return `#${{[r, g, b].map((value) => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, '0')).join('')}}`;
+    }}
+
+    function mixHex(leftHex, rightHex, amount) {{
+      const left = hexToRgb(leftHex);
+      const right = hexToRgb(rightHex);
+      if (!left || !right) {{
+        return leftHex;
+      }}
+      return rgbToHex({{
+        r: left.r + (right.r - left.r) * amount,
+        g: left.g + (right.g - left.g) * amount,
+        b: left.b + (right.b - left.b) * amount,
+      }});
+    }}
+
+    function trendingColorKey(songName) {{
+      if (songName.includes('/')) {{
+        return songName;
+      }}
+      const viewKey = trendingData.summary.viewKey || activeViewKey;
+      if (viewKey === 'mp3' || viewKey === 'mid-mp3s') {{
+        return `${{viewKey}}/${{songName}}`;
+      }}
+      return songName;
+    }}
+
+    function fallbackColorKeys(songName) {{
+      const keys = [trendingColorKey(songName), songName];
+      if (songName.includes('/')) {{
+        keys.push(songName.split('/').slice(1).join('/'));
+      }}
+      return Array.from(new Set(keys));
+    }}
+
     function mutedSongColors(songName) {{
+      const override = fallbackColorKeys(songName)
+        .map((key) => trendingColorOverrides[key])
+        .find((value) => /^#[0-9a-f]{{6}}$/i.test(value || ''));
+      if (/^#[0-9a-f]{{6}}$/i.test(override || '')) {{
+        return {{ a: override, b: mixHex(override, '#ffffff', 0.42) }};
+      }}
       const palette = [
         ['#5f7fa3', '#92a9bd'],
         ['#6f9588', '#9db5ad'],
@@ -1811,6 +1911,7 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
       row.dataset.songName = songName;
       row.innerHTML = `
         <div class=\"trending-rank\"></div>
+        <input class=\"trending-color\" type=\"color\" title=\"Set track color\" aria-label=\"Set track color\">
         <div class=\"trending-track\">
           <div class=\"trending-name\"></div>
           <div class=\"trending-bar\"><div class=\"trending-fill\"></div></div>
@@ -1820,6 +1921,16 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
         <div class=\"trending-plays\"><strong></strong><span></span></div>
       `;
       row.style.opacity = '0';
+      row.querySelector('.trending-color').addEventListener('input', (event) => {{
+        const nextColor = String(event.target.value || '').toLowerCase();
+        if (/^#[0-9a-f]{{6}}$/i.test(nextColor)) {{
+          trendingColorOverrides[trendingColorKey(row.dataset.songName)] = nextColor;
+          saveTrendingColorOverrides();
+          const colors = mutedSongColors(row.dataset.songName);
+          row.style.setProperty('--song-trend-a', colors.a);
+          row.style.setProperty('--song-trend-b', colors.b);
+        }}
+      }});
       trendingStage.appendChild(row);
       return row;
     }}
@@ -1829,6 +1940,7 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
       const colors = mutedSongColors(song.name);
       row.style.setProperty('--song-trend-a', colors.a);
       row.style.setProperty('--song-trend-b', colors.b);
+      row.querySelector('.trending-color').value = colors.a;
       row.classList.toggle('is-leader', rank === 1);
       row.classList.remove('is-exiting');
       row.style.transform = `translateY(${{yPosition}}px)`;
@@ -1975,7 +2087,6 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
         stopTrendingPlayback();
         window.setTimeout(() => {{
           network.redraw();
-          network.fit({{ animation: {{ duration: 220, easingFunction: 'easeInOutQuad' }} }});
         }}, 0);
       }}
       if (isTrending) {{
@@ -2029,7 +2140,9 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
 
       if (options.clearSelection || (selectedNodeId && !nodeLookup.has(selectedNodeId))) {{
         selectedNodeId = null;
-        network.unselectAll();
+        if (network) {{
+          network.unselectAll();
+        }}
         document.getElementById('selection-summary').textContent = 'Select a node or edge to inspect it.';
         document.getElementById('selection-content').innerHTML = '';
       }}
@@ -2076,6 +2189,40 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
       }}
     }}
 
+    function rememberNodePositions(nodeIds = null) {{
+      if (!network) {{
+        return;
+      }}
+      const ids = nodeIds || nodeDataSet.getIds();
+      if (!ids.length) {{
+        return;
+      }}
+      const positions = network.getPositions(ids);
+      ids.forEach((nodeId) => {{
+        const position = positions[nodeId];
+        if (position && Number.isFinite(position.x) && Number.isFinite(position.y)) {{
+          nodePositions.set(nodeId, {{ x: position.x, y: position.y }});
+        }}
+      }});
+    }}
+
+    function updateNodeAppearance(nodeId) {{
+      const node = nodeLookup.get(nodeId);
+      if (!node || !nodeDataSet.get(nodeId)) {{
+        return;
+      }}
+      const visibleNode = buildVisibleNode(node);
+      nodeDataSet.update({{
+        id: nodeId,
+        color: visibleNode.color,
+        size: visibleNode.size,
+      }});
+    }}
+
+    function updateSelectedNodeStyles(previousNodeId, nextNodeId) {{
+      new Set([previousNodeId, nextNodeId].filter(Boolean)).forEach(updateNodeAppearance);
+    }}
+
     function settleGraphLayout() {{
       if (!network) {{
         return;
@@ -2083,29 +2230,40 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
       network.setOptions({{
         physics: {{
           enabled: true,
-          stabilization: {{ iterations: 180 }},
-          barnesHut: {{ gravitationalConstant: -3200, springLength: 135, springConstant: 0.03, damping: 0.18 }}
+          stabilization: {{ iterations: 120, updateInterval: 25 }},
+          timestep: 0.3,
+          minVelocity: 1.05,
+          barnesHut: {{ gravitationalConstant: -2300, springLength: 135, springConstant: 0.011, damping: 0.78, avoidOverlap: 0.05 }}
         }}
       }});
       network.once('stabilized', () => {{
-        network.setOptions({{ physics: false }});
-        network.fit({{ animation: {{ duration: 350, easingFunction: 'easeInOutQuad' }} }});
+        rememberNodePositions();
       }});
-      network.stabilize(180);
+      network.stabilize(120);
     }}
 
     function attachNetworkEvents() {{
       network.on('selectNode', (params) => {{
+        const previousNodeId = selectedNodeId;
         selectedNodeId = params.nodes[0] || null;
-        refreshGraph();
+        if (document.getElementById('neighborhood-toggle').checked) {{
+          refreshGraph();
+        }} else {{
+          updateSelectedNodeStyles(previousNodeId, selectedNodeId);
+        }}
         if (selectedNodeId) {{
           showNodeDetails(selectedNodeId);
         }}
       }});
 
       network.on('deselectNode', () => {{
+        const previousNodeId = selectedNodeId;
         selectedNodeId = null;
-        refreshGraph();
+        if (document.getElementById('neighborhood-toggle').checked) {{
+          refreshGraph();
+        }} else {{
+          updateSelectedNodeStyles(previousNodeId, null);
+        }}
         document.getElementById('selection-summary').textContent = 'Select a node or edge to inspect it.';
         document.getElementById('selection-content').innerHTML = '';
       }});
@@ -2116,20 +2274,53 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
           showEdgeDetails(edgeId);
         }}
       }});
+
+      network.on('dragStart', () => {{
+        graphWasManuallyMoved = true;
+        network.setOptions({{
+          physics: {{
+            enabled: true,
+            timestep: 0.3,
+            minVelocity: 0.8,
+            barnesHut: {{ gravitationalConstant: -2300, springLength: 135, springConstant: 0.015, damping: 0.72, avoidOverlap: 0.05 }}
+          }}
+        }});
+      }});
+
+      network.on('dragEnd', (params) => {{
+        rememberNodePositions(params.nodes);
+        network.setOptions({{
+          physics: {{
+            enabled: true,
+            timestep: 0.28,
+            minVelocity: 1.25,
+            barnesHut: {{ gravitationalConstant: -2300, springLength: 135, springConstant: 0.0075, damping: 0.84, avoidOverlap: 0.05 }}
+          }}
+        }});
+      }});
+
+      network.on('zoom', () => {{
+        graphWasManuallyMoved = true;
+      }});
     }}
 
     function createNetwork() {{
+      const shouldKeepManualView = graphWasManuallyMoved || nodePositions.size > 0;
       if (network) {{
+        rememberNodePositions();
         network.destroy();
       }}
       nodeDataSet = new vis.DataSet([]);
       edgeDataSet = new vis.DataSet([]);
+      graphWasManuallyMoved = shouldKeepManualView;
       refreshGraph();
       network = new vis.Network(container, {{ nodes: nodeDataSet, edges: edgeDataSet }}, networkOptions);
       attachNetworkEvents();
       network.once('stabilized', () => {{
-        network.setOptions({{ physics: false }});
-        network.fit({{ animation: {{ duration: 350, easingFunction: 'easeInOutQuad' }} }});
+        rememberNodePositions();
+        if (!graphWasManuallyMoved) {{
+          network.fit({{ animation: {{ duration: 350, easingFunction: 'easeInOutQuad' }} }});
+        }}
       }});
       if (networkStatus) {{
         networkStatus.classList.remove('visible');
@@ -2137,6 +2328,7 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
     }}
 
     function refreshGraph(options = {{}}) {{
+      rememberNodePositions();
       const filteredEdges = getFilteredEdges();
       const connectedNodeIds = new Set();
       filteredEdges.forEach((edge) => {{
@@ -2224,8 +2416,13 @@ def build_html(graph_payload, trending_payload=None, live_config=None):
         document.getElementById('selection-content').innerHTML = '';
         return;
       }}
+      const previousNodeId = selectedNodeId;
       selectedNodeId = match.id;
-      refreshGraph();
+      if (document.getElementById('neighborhood-toggle').checked) {{
+        refreshGraph();
+      }} else {{
+        updateSelectedNodeStyles(previousNodeId, selectedNodeId);
+      }}
       network.selectNodes([match.id]);
       network.focus(match.id, {{ scale: 1.1, animation: {{ duration: 500, easingFunction: 'easeInOutQuad' }} }});
       showNodeDetails(match.id);

@@ -49,7 +49,7 @@ TOP_MIN, TOP_MAX = 1, 50
 DEFAULT_TOP_N = 5
 
 # Between-track (and post-unlock) gap
-GAP_SECONDS = 10.0
+GAP_SECONDS = 5.0
 
 # Caches stored inside mp3 folder
 EMB_CACHE_VERSION = "v3"

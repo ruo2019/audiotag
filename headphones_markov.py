@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import curses
 import json
 import locale
@@ -8,10 +9,12 @@ import math
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -26,6 +29,11 @@ from pydub.exceptions import CouldntDecodeError
 from sentence_transformers import SentenceTransformer
 from tabulate import tabulate
 
+try:
+    from yt_dlp import YoutubeDL
+except Exception:
+    YoutubeDL = None  # type: ignore[assignment]
+
 HEADPHONES_LOST = threading.Event()
 
 # ============================== CONFIG ==============================
@@ -35,6 +43,7 @@ locale.setlocale(locale.LC_ALL, "")
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 DEFAULT_MP3_FOLDER = Path("static/mp3")
+DEFAULT_MID_MP3_FOLDER = Path("static/mid-mp3s")
 DEFAULT_TAGS_FILE = Path("tags.json")
 DEFAULT_SAMPLE_MP3 = "Deep Stone Crypt Theme.mp3"
 PLAYLISTS_FILE = "queue_playlists.json"
@@ -47,6 +56,7 @@ EXIT_AT_LOCAL_MINUTE = 30
 # Mood directive clamp
 TOP_MIN, TOP_MAX = 1, 50
 DEFAULT_TOP_N = 5
+DEFAULT_YOUTUBE_TOP_N = 10
 
 # Between-track (and post-unlock) gap
 GAP_SECONDS = 5.0
@@ -276,6 +286,329 @@ def save_listen_counts(counts: Dict[str, int], db_filename: str) -> None:
 
 def increment_listen(track_path: Path, counts: Dict[str, int]) -> None:
     counts[track_path.stem] = counts.get(track_path.stem, 0) + 1
+
+
+@dataclass
+class LibraryState:
+    label: str
+    mp3_folder: Path
+    tags_file: Path
+    listen_db_filename: str
+    listen_timestamps_filename: str
+    tags_data: Dict[str, List[str]]
+    counts: Dict[str, int]
+    listen_timestamps: List[dict]
+    history_duration_by_track_name: Dict[str, float]
+    markov_transitions: Dict[str, Dict[str, int]]
+    markov_global_counts: Dict[str, int]
+    loud_cache: Dict[str, dict]
+    playlists_filename: str
+    playlists_db: Dict[str, List[dict]]
+    tag_session: "TrackTagSession"
+    current_similar_entries: Optional[List[Tuple[str, float]]] = None
+    current_similar_mood: Optional[str] = None
+    audio_data: Dict[Path, Dict[str, float | None]] = field(default_factory=dict)
+    resolved_target_loudness: Optional[float] = None
+    duration_by_stem: Dict[str, float] = field(default_factory=dict)
+    active_playlist_name: Optional[str] = None
+
+
+@dataclass
+class YouTubeResult:
+    title: str
+    url: str
+    uploader: str
+    video_id: str = ""
+
+
+def library_defaults_for_folder(
+    mp3_folder: Path,
+    tags_file: Optional[Path] = None,
+    listen_db_filename: Optional[str] = None,
+) -> Tuple[str, Path, str]:
+    label = mp3_folder.name or "default"
+    if label == "mid-mp3s":
+        return (
+            label,
+            tags_file if tags_file is not None else Path("mid_tags.json"),
+            listen_db_filename or "mid_listen_counts.json",
+        )
+    return (
+        label,
+        tags_file if tags_file is not None else DEFAULT_TAGS_FILE,
+        listen_db_filename or LISTEN_DB_FILE,
+    )
+
+
+def load_library_state(
+    mp3_folder: Path,
+    tags_file: Path,
+    listen_db_filename: str,
+    logging: bool = False,
+) -> LibraryState:
+    label = mp3_folder.name or "default"
+    tags_data = load_tags(tags_file)
+    if logging:
+        print(f"Loaded {len(tags_data)} tag items from '{tags_file}' ({label}).")
+
+    counts = load_listen_counts(mp3_folder, listen_db_filename)
+    listen_timestamps_filename = listen_timestamps_filename_for_folder(mp3_folder)
+    listen_timestamps = load_listen_timestamps(mp3_folder, listen_timestamps_filename)
+    history_duration_by_track_name = build_duration_by_track_name(mp3_folder)
+    markov_transitions, markov_global_counts = build_markov_transition_counts(
+        mp3_folder,
+        listen_timestamps,
+        history_duration_by_track_name,
+    )
+    loud_cache = load_loudness_cache(mp3_folder)
+    playlists_filename = f"queue_playlists_{mp3_folder.name or 'default'}.json"
+    playlists_db = load_playlists(playlists_filename)
+
+    duration_by_stem: Dict[str, float] = {}
+    for key, entry in loud_cache.items():
+        if key == "_v" or not isinstance(entry, dict):
+            continue
+        stem = Path(key).stem
+        duration_by_stem[stem] = float(entry.get("duration") or 0.0)
+    for track_name, duration in history_duration_by_track_name.items():
+        duration_by_stem.setdefault(Path(track_name).stem, float(duration or 0.0))
+
+    return LibraryState(
+        label=label,
+        mp3_folder=mp3_folder,
+        tags_file=tags_file,
+        listen_db_filename=listen_db_filename,
+        listen_timestamps_filename=listen_timestamps_filename,
+        tags_data=tags_data,
+        counts=counts,
+        listen_timestamps=listen_timestamps,
+        history_duration_by_track_name=history_duration_by_track_name,
+        markov_transitions=markov_transitions,
+        markov_global_counts=markov_global_counts,
+        loud_cache=loud_cache,
+        playlists_filename=playlists_filename,
+        playlists_db=playlists_db,
+        tag_session=TrackTagSession(tags_file, tags_data),
+        duration_by_stem=duration_by_stem,
+    )
+
+
+def youtube_available() -> bool:
+    return YoutubeDL is not None
+
+
+@contextlib.contextmanager
+def suppress_terminal_output():
+    with open(os.devnull, "w", encoding="utf-8") as devnull:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            yield
+
+
+def search_youtube(query: str, limit: int) -> List[YouTubeResult]:
+    if YoutubeDL is None:
+        raise RuntimeError("yt-dlp Python package is not installed.")
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "skip_download": True,
+        "extract_flat": True,
+    }
+    with suppress_terminal_output():
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+
+    if not info:
+        return []
+    entries = info["entries"] if "entries" in info else [info]
+
+    results: List[YouTubeResult] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        video_id = str(entry.get("id") or "")
+        url = str(entry.get("webpage_url") or entry.get("url") or "")
+        if not url and video_id:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+        elif video_id and not url.startswith(("http://", "https://")):
+            url = f"https://www.youtube.com/watch?v={video_id}"
+        if "/watch?v=" not in url and not (
+            (entry.get("ie_key") == "Youtube" or entry.get("extractor_key") == "Youtube")
+            and video_id
+        ):
+            continue
+        uploader = (
+            entry.get("uploader")
+            or entry.get("channel")
+            or entry.get("uploader_id")
+            or entry.get("channel_id")
+            or "Unknown uploader"
+        )
+        results.append(
+            YouTubeResult(
+                title=str(entry.get("title") or video_id or url),
+                url=url,
+                uploader=str(uploader),
+                video_id=video_id,
+            )
+        )
+    return results
+
+
+def resolve_youtube_audio(
+    video_url: str,
+) -> Tuple[str, str, Dict[str, str], float]:
+    if YoutubeDL is None:
+        raise RuntimeError("yt-dlp Python package is not installed.")
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "skip_download": True,
+        "format": "bestaudio/best",
+    }
+    with suppress_terminal_output():
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+    if not isinstance(info, dict):
+        raise RuntimeError("Could not resolve YouTube audio.")
+    direct_url = str(info.get("url") or "")
+    if not direct_url:
+        raise RuntimeError("Could not resolve a direct audio stream URL.")
+    title = str(info.get("title") or video_url)
+    headers = {
+        str(k): str(v) for k, v in (info.get("http_headers") or {}).items()
+    }
+    try:
+        duration = float(info.get("duration") or 0.0)
+    except Exception:
+        duration = 0.0
+    return direct_url, title, headers, duration
+
+
+def headers_to_mpv_args(headers: Dict[str, str]) -> List[str]:
+    return [f"--http-header-fields={k}: {v}" for k, v in (headers or {}).items()]
+
+
+def mpv_audio_device_help(mpv_path: str) -> str:
+    proc = subprocess.run(
+        [mpv_path, "--audio-device=help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+def find_mpv_audio_device_token(mpv_path: str, wanted: str) -> str:
+    help_text = mpv_audio_device_help(mpv_path)
+    wanted_lc = wanted.lower()
+    candidates: List[str] = []
+    for line in help_text.splitlines():
+        if wanted_lc not in line.lower():
+            continue
+        token = None
+        match = re.search(r"^\s*['\"]([^'\"]+)['\"]", line)
+        if match:
+            token = match.group(1)
+        else:
+            match = re.search(r"^\s*(\S+)", line)
+            if match:
+                token = match.group(1)
+        if token:
+            candidates.append(token)
+    for token in candidates:
+        if token.lower().startswith("coreaudio/"):
+            return token
+    if candidates:
+        return candidates[0]
+    raise RuntimeError(f"Could not find an mpv audio device matching '{wanted}'.")
+
+
+def spawn_youtube_player(
+    direct_audio_url: str,
+    headers: Dict[str, str],
+    forced_audio_device: Optional[str],
+) -> subprocess.Popen:
+    mpv = shutil.which("mpv")
+    if not mpv:
+        raise RuntimeError("mpv is required for YouTube playback. Install with: brew install mpv")
+    cmd = [
+        mpv,
+        "--no-video",
+        "--quiet",
+        "--force-window=no",
+        "--no-input-terminal",
+        "--volume=75",
+    ]
+    if forced_audio_device:
+        cmd.append(f"--audio-device={forced_audio_device}")
+    cmd.extend(headers_to_mpv_args(headers))
+    cmd.append(direct_audio_url)
+    return subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def stop_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        for _ in range(15):
+            if proc.poll() is not None:
+                return
+            time.sleep(0.1)
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+
+
+def sanitize_download_title(title: str) -> str:
+    cleaned = re.sub(r"[/:\\]+", " - ", title.strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned or "download"
+
+
+def parse_youtube_download_name(raw: str) -> Tuple[str, str]:
+    text = raw.strip()
+    if not text.endswith("]") or " [" not in text:
+        raise ValueError("Use a name ending in [m] or [mm].")
+    title, marker = text.rsplit(" [", 1)
+    title = sanitize_download_title(title)
+    marker = marker[:-1].strip().lower()
+    if marker not in {"m", "mm"}:
+        raise ValueError("Folder marker must be [m] or [mm].")
+    return title, marker
+
+
+def run_youtube_download(url: str, output_path: Path) -> None:
+    yt_dlp = shutil.which("yt-dlp")
+    if not yt_dlp:
+        raise RuntimeError("yt-dlp command not found.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        yt_dlp,
+        "--quiet",
+        "--no-warnings",
+        "--no-progress",
+        "-x",
+        url,
+        "--audio-format",
+        "mp3",
+        "-o",
+        str(output_path),
+    ]
+    subprocess.run(
+        cmd,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def load_listen_timestamps(mp3_dir: Path, db_filename: str) -> List[dict]:
@@ -635,6 +968,13 @@ VOL_DIR_RE = re.compile(
     re.IGNORECASE,
 )
 
+STATS_ONLY_RE = re.compile(r"^\s*(?:stats?|totals?)\s*$", re.IGNORECASE)
+STATS_THRESHOLD_RE = re.compile(
+    r"^\s*(?:(?:stats?|totals?)\s+)?"
+    r"(listens?|counts?|plays?|hours?)\s*(>=|<=|>|<|=)\s*(\d+(?:\.\d+)?)\s*$",
+    re.IGNORECASE,
+)
+
 
 def clamp_int(n: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(n)))
@@ -968,6 +1308,8 @@ class CursesTUI:
         self.stop_requested = False
         self.queue_move = 0  # used for drag reorder
         self.queue_delete = False
+        self.queue_filter_mode = "tab"  # tab | all
+        self.queue_filter_toggle_request = False
         self.similar_add = False
         self.show_help = False
         self.playlist_activate = False
@@ -988,7 +1330,7 @@ class CursesTUI:
         self.playlist_item_drag_target: Optional[int] = None
         self.playlist_item_drag_commit_target: Optional[int] = None
         self.playlist_item_drag_commit_start: Optional[int] = None
-        self.input_mode = "mood"  # mood | save_playlist | tag_add | tag_edit
+        self.input_mode = "mood"  # mood | save_playlist | tag_add | tag_edit | youtube_search | youtube_download
         self.tag_panel_open = False
         self.tag_delete_request = False
         self.tag_edit_request = False
@@ -1025,6 +1367,8 @@ class CursesTUI:
         self.queue_name_col_end = 0
         self.queue_add_col_start = 0
         self.queue_add_col_end = 0
+        self.queue_filter_col_start = 0
+        self.queue_filter_col_end = 0
         self.similar_bounds = (0, 0, 0, 0)  # x, y, w, h
         self.similar_add_col_start = 0
         self.similar_add_col_end = 0
@@ -1052,6 +1396,10 @@ class CursesTUI:
         self.most_len = 0
         self.most_sort_col_start = 0
         self.most_sort_col_end = 0
+        self.stats_panel_open = False
+        self.stats_toggle_request = False
+        self.stats_toggle_col_start = 0
+        self.stats_toggle_col_end = 0
         self.playback_mode = "manual"
         self.playback_mode_toggle_request = False
         self.playback_mode_col_start = 0
@@ -1059,6 +1407,18 @@ class CursesTUI:
         self.current_play_once_toggle_request = False
         self.current_mode_col_start = 0
         self.current_mode_col_end = 0
+        self.library_switch_request: Optional[int] = None
+        self.library_tabs: List[str] = []
+        self.active_library_idx = 0
+        self.library_tab_bounds: List[Tuple[int, int, int]] = []
+        self.youtube_active = False
+        self.youtube_selected = 0
+        self.youtube_scroll = 0
+        self.youtube_len = 0
+        self.youtube_play_request = False
+        self.youtube_download_request = False
+        self.youtube_download_col_start = 0
+        self.youtube_download_col_end = 0
 
     def __enter__(self):
         if not self.enable:
@@ -1181,18 +1541,22 @@ class CursesTUI:
             "Shortcuts",
             "",
             "Enter: submit mood",
-            "TAB: focus (Queue/Similar/Playlists/Most)",
+            "TAB: focus visible panes (YouTube/Queue/Similar/Playlists/Most)",
             "↑/↓ PgUp/PgDn: move in focused panel",
             "→: skip track",
             "Ctrl+G: stop",
             "Enter: add selected (Similar)",
             "Drag in Queue: reorder",
             "Ctrl+X: delete (Queue)",
+            "Queue: click [this]/[all] to filter mixed-library queue",
             "Click current/queue loop/once to toggle",
+            "Click folder tabs to switch mp3 libraries",
             "Click [mode:manual/auto] to arm auto takeover",
             "Click [tags] to open current-track tags",
             "Tags: click row, [edit], [delete], [close]",
             "Most: click [by:count/time] or Ctrl+T",
+            "Stats: click [Most]/[Stats], or type stats/count>200/hours>10",
+            "YouTube: search at bottom; use top=10 for more results; [download] saves",
             "Playlists: click to edit, double-click to load; [add] adds tracks",
             "Playlist edit: click loop/once, drag reorder, double-click remove",
             "Ctrl+W: save queue (Playlists)",
@@ -1223,6 +1587,14 @@ class CursesTUI:
             help_win.noutrefresh()
         except Exception:
             pass
+
+    def _library_tab_at(self, mx: int, my: int) -> Optional[int]:
+        if my != 0:
+            return None
+        for idx, start, end in self.library_tab_bounds:
+            if start <= mx < end:
+                return idx
+        return None
 
     def _handle_playlist_row_click(self, row: int) -> None:
         idx = self.playlist_scroll + row
@@ -1328,6 +1700,34 @@ class CursesTUI:
             return True
         return True
 
+    def _handle_youtube_click(self, mx: int, my: int) -> bool:
+        x, y, w, h = self.most_bounds
+        if not self.youtube_active or not (x <= mx < x + w and y <= my < y + h):
+            return False
+        self.focus_panel = "youtube"
+        if my == y:
+            return True
+        row = my - (y + 1)
+        idx = self.youtube_scroll + row
+        if row < 0 or not (0 <= idx < self.youtube_len):
+            return True
+        was_selected = idx == self.youtube_selected
+        self.youtube_selected = idx
+        if was_selected and self.youtube_download_col_start <= mx < self.youtube_download_col_end:
+            self.youtube_download_request = True
+            return True
+        now = time.monotonic()
+        if (
+            self._last_click_panel == "youtube"
+            and self._last_click_row == idx
+            and (now - self._last_click_ts) <= self.DOUBLE_CLICK_SECONDS
+        ):
+            self.youtube_play_request = True
+        self._last_click_panel = "youtube"
+        self._last_click_row = idx
+        self._last_click_ts = now
+        return True
+
     def _handle_key(self) -> Optional[str]:
         if not self.enable or not self.stdscr:
             return None
@@ -1348,6 +1748,10 @@ class CursesTUI:
             try:
                 _, mx, my, _, bstate = curses.getmouse()
             except Exception:
+                return None
+            tab_idx = self._library_tab_at(mx, my)
+            if tab_idx is not None and tab_idx != self.active_library_idx:
+                self.library_switch_request = tab_idx
                 return None
             # Mouse wheel scrolling
             wheel_up = 0
@@ -1396,8 +1800,23 @@ class CursesTUI:
                             else:
                                 mx0, my0, mw, mh = self.most_bounds
                                 if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
-                                    self.focus_panel = "most"
-                                    if self.most_len:
+                                    if self.youtube_active:
+                                        self.focus_panel = "youtube"
+                                        if self.youtube_len:
+                                            self.youtube_selected = max(
+                                                0,
+                                                min(
+                                                    self.youtube_len - 1,
+                                                    self.youtube_selected + direction,
+                                                ),
+                                            )
+                                    else:
+                                        self.focus_panel = "stats" if self.stats_panel_open else "most"
+                                    if (
+                                        not self.youtube_active
+                                        and not self.stats_panel_open
+                                        and self.most_len
+                                    ):
                                         self.most_selected = max(0, min(self.most_len - 1, self.most_selected + direction))
                 return None
             # Live drag tracking (when terminal reports motion)
@@ -1425,10 +1844,14 @@ class CursesTUI:
                         self.playlist_item_drag_target = self.playlist_track_scroll + row
             if bstate & curses.BUTTON1_PRESSED:
                 x, y, w, h = self.queue_bounds
-                if x <= mx < x + w and y + 1 <= my < y + h:
+                if x <= mx < x + w and y <= my < y + h:
+                    self.focus_panel = "queue"
+                    if my == y:
+                        if self.queue_filter_col_start <= mx < self.queue_filter_col_end:
+                            self.queue_filter_toggle_request = True
+                        return None
                     row = my - (y + 1)
                     idx = self.queue_scroll + row
-                    self.focus_panel = "queue"
                     self.queue_drag_started_selected = idx == self.queue_selected
                     self.queue_selected = min(max(0, self.queue_len - 1), idx)
                     self.queue_drag_start = idx
@@ -1487,8 +1910,18 @@ class CursesTUI:
                             else:
                                 mx0, my0, mw, mh = self.most_bounds
                                 if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
-                                    self.focus_panel = "most"
+                                    if self._handle_youtube_click(mx, my):
+                                        return None
+                                    self.focus_panel = "stats" if self.stats_panel_open else "most"
                                     if my == my0:
+                                        if (
+                                            self.stats_toggle_col_start
+                                            <= mx
+                                            < self.stats_toggle_col_end
+                                        ):
+                                            self.stats_toggle_request = True
+                                        return None
+                                    if self.stats_panel_open:
                                         return None
                                     row = my - (my0 + 1)
                                     most_idx = self.most_scroll + row
@@ -1538,6 +1971,33 @@ class CursesTUI:
                             self.queue_drag_commit_target = None
                         else:
                             self.queue_drag_commit_target = drop_idx
+                    else:
+                        was_selected = drop_idx == self.queue_selected
+                        self.focus_panel = "queue"
+                        self.queue_selected = min(max(0, self.queue_len - 1), drop_idx)
+                        self.queue_click_row = drop_idx
+                        self.queue_click_x = mx
+                        if (
+                            was_selected
+                            and self.queue_add_col_start <= mx < self.queue_add_col_end
+                        ):
+                            self.playlist_add_queue_request = True
+                            self.queue_click_row = None
+                            self.queue_click_x = None
+                        else:
+                            now = time.monotonic()
+                            if (
+                                self._last_click_panel == "queue"
+                                and self._last_click_row == self.queue_click_row
+                                and (now - self._last_click_ts) <= self.DOUBLE_CLICK_SECONDS
+                            ):
+                                if self.queue_name_col_start <= mx < self.queue_name_col_end:
+                                    self.queue_delete = True
+                                else:
+                                    self.queue_delete = False
+                            self._last_click_panel = "queue"
+                            self._last_click_row = self.queue_click_row
+                            self._last_click_ts = now
                 self.queue_drag_start = None
                 self.queue_drag_started_selected = False
                 self._handle_playlist_release(mx, my)
@@ -1571,6 +2031,11 @@ class CursesTUI:
                     self.playlist_add_current_request = True
                     return None
                 x, y, w, h = self.queue_bounds
+                if x <= mx < x + w and my == y:
+                    self.focus_panel = "queue"
+                    if self.queue_filter_col_start <= mx < self.queue_filter_col_end:
+                        self.queue_filter_toggle_request = True
+                    return None
                 if x <= mx < x + w and y + 1 <= my < y + h:
                     row = my - (y + 1)
                     idx = self.queue_scroll + row
@@ -1664,9 +2129,20 @@ class CursesTUI:
                             else:
                                 mx0, my0, mw, mh = self.most_bounds
                                 if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
-                                    self.focus_panel = "most"
+                                    if self._handle_youtube_click(mx, my):
+                                        return None
+                                    self.focus_panel = "stats" if self.stats_panel_open else "most"
                                     if (
                                         my == my0
+                                        and self.stats_toggle_col_start <= mx < self.stats_toggle_col_end
+                                    ):
+                                        self.stats_toggle_request = True
+                                        return None
+                                    if self.stats_panel_open:
+                                        return None
+                                    if (
+                                        my == my0
+                                        and not self.stats_panel_open
                                         and self.most_sort_col_start <= mx < self.most_sort_col_end
                                     ):
                                         self.most_toggle_request = True
@@ -1715,6 +2191,8 @@ class CursesTUI:
                     self.playlist_selected = max(0, self.playlist_selected - 1)
             elif self.focus_panel == "tags":
                 self.tag_selected = max(0, self.tag_selected - 1)
+            elif self.focus_panel == "youtube":
+                self.youtube_selected = max(0, self.youtube_selected - 1)
             else:
                 self.most_selected = max(0, self.most_selected - 1)
                 if self.most_len:
@@ -1742,6 +2220,10 @@ class CursesTUI:
                 self.tag_selected = min(
                     max(0, self.tag_len - 1), self.tag_selected + 1
                 )
+            elif self.focus_panel == "youtube":
+                self.youtube_selected = min(
+                    max(0, self.youtube_len - 1), self.youtube_selected + 1
+                )
             else:
                 self.most_selected += 1
                 if self.most_len:
@@ -1759,6 +2241,8 @@ class CursesTUI:
                     self.playlist_selected = max(0, self.playlist_selected - page)
             elif self.focus_panel == "tags":
                 self.tag_selected = max(0, self.tag_selected - page)
+            elif self.focus_panel == "youtube":
+                self.youtube_selected = max(0, self.youtube_selected - page)
             else:
                 self.most_selected = max(0, self.most_selected - page)
                 if self.most_len:
@@ -1791,14 +2275,20 @@ class CursesTUI:
                     max(0, self.tag_len - 1),
                     self.tag_selected + page,
                 )
+            elif self.focus_panel == "youtube":
+                self.youtube_selected = min(
+                    max(0, self.youtube_len - 1),
+                    self.youtube_selected + page,
+                )
             else:
                 self.most_selected += page
                 if self.most_len:
                     self.most_selected = min(self.most_selected, self.most_len - 1)
         elif key in (self.KEY_TAB, KEY_BTAB):
-            order = ["queue", "similar"]
+            order = ["youtube", "queue"] if self.youtube_active else ["queue", "similar"]
             order.append("tags" if self.tag_panel_open else "playlists")
-            order.append("most")
+            if not self.youtube_active:
+                order.append("stats" if self.stats_panel_open else "most")
             try:
                 idx = order.index(self.focus_panel)
             except ValueError:
@@ -1834,6 +2324,9 @@ class CursesTUI:
                 return None
             if not self.input_buffer and self.focus_panel == "similar":
                 self.similar_add = True
+                return None
+            if not self.input_buffer and self.focus_panel == "youtube":
+                self.youtube_play_request = True
                 return None
             if not self.input_buffer and self.focus_panel == "tags":
                 self.tag_edit_request = True
@@ -1885,6 +2378,15 @@ class CursesTUI:
         pending_tags: Optional[List[str]] = None,
         active_playlist_name: Optional[str] = None,
         active_playlist_items: Optional[List[dict]] = None,
+        library_tabs: Optional[List[str]] = None,
+        active_library_idx: int = 0,
+        combined_total_listens: int = 0,
+        combined_total_listen_hours: float = 0.0,
+        stats_rows: Optional[List[str]] = None,
+        stats_query_result: Optional[str] = None,
+        youtube_active: bool = False,
+        youtube_results: Optional[List[YouTubeResult]] = None,
+        youtube_query: str = "",
     ) -> Optional[str]:
         if not self.enable or not self.stdscr:
             return None
@@ -1908,6 +2410,17 @@ class CursesTUI:
         h, w = self.stdscr.getmaxyx()
         self.last_h, self.last_w = h, w
         self.playback_mode = playback_mode
+        self.library_tabs = library_tabs or []
+        self.youtube_active = bool(youtube_active)
+        self.active_library_idx = max(
+            0, min(active_library_idx, max(0, len(self.library_tabs) - 1))
+        )
+        if self.youtube_active:
+            target_lufs = None
+            current_lufs = None
+            loudness_diff = None
+            volume_scale = None
+            current_play_once = None
         input_y = h - 2
         status_y = h - 4
         table_top = 8
@@ -1933,6 +2446,15 @@ class CursesTUI:
         self.playback_mode_col_start = chip_x
         self.playback_mode_col_end = chip_x + len(mode_chip)
         self._draw(0, 0, header)
+        self.library_tab_bounds = []
+        tab_x = 2
+        for idx, label in enumerate(self.library_tabs):
+            tab = f"[{label}]" if idx == self.active_library_idx else f" {label} "
+            if tab_x + len(tab) >= chip_x - 1:
+                break
+            self._draw(0, tab_x, tab)
+            self.library_tab_bounds.append((idx, tab_x, tab_x + len(tab)))
+            tab_x += len(tab) + 1
         self._draw(0, chip_x, mode_chip)
         current_chip = ""
         tag_chip = ""
@@ -1990,10 +2512,23 @@ class CursesTUI:
         volume_line = f"Adjusted Volume: {vs}"
         self._draw(5, 2, volume_line)
         listen_word = "listen" if total_listens == 1 else "listens"
-        stats_line = f"Total: {total_listens:n} {listen_word}, {total_listen_hours:.1f} hours"
+        all_listen_word = "listen" if combined_total_listens == 1 else "listens"
+        stats_line = (
+            f"Tab: {total_listens:n} {listen_word}, {total_listen_hours:.1f}h"
+            f" | All: {combined_total_listens:n} {all_listen_word}, "
+            f"{combined_total_listen_hours:.1f}h"
+        )
         stats_x = max(len(volume_line) + 6, w - len(stats_line) - 2)
         if stats_x + len(stats_line) < w:
             self._draw(5, stats_x, stats_line)
+        else:
+            compact_stats = (
+                f"All: {combined_total_listens:n}, "
+                f"{combined_total_listen_hours:.1f}h"
+            )
+            compact_x = max(len(volume_line) + 6, w - len(compact_stats) - 2)
+            if compact_x + len(compact_stats) < w:
+                self._draw(5, compact_x, compact_stats)
 
         bar_y = 6
         bar_w = max(10, w - 20)
@@ -2140,9 +2675,11 @@ class CursesTUI:
                         max(0, left_w - len(playlist_add_chip) - 1)
                     ) + row_add_chip
                 m_rows.append(row)
-            m_focus = "[Most]" if self.focus_panel == "most" else " Most "
             m_sort_chip = f"[by:{self.most_sort_mode}]"
-            m_title = f"{m_focus} {m_sort_chip}"
+            view_chip = "[Stats]" if self.stats_panel_open else "[Most]"
+            m_title = f"{view_chip} {m_sort_chip}"
+            self.stats_toggle_col_start = left_x
+            self.stats_toggle_col_end = left_x + len(view_chip)
             chip_idx = m_title.find(m_sort_chip)
             if chip_idx >= 0:
                 self.most_sort_col_start = left_x + chip_idx
@@ -2150,8 +2687,76 @@ class CursesTUI:
             else:
                 self.most_sort_col_start = 0
                 self.most_sort_col_end = 0
+            if self.stats_panel_open:
+                stats_rows_data = stats_rows or []
+                m_title = view_chip
+                self.most_sort_col_start = 0
+                self.most_sort_col_end = 0
+                self.most_add_col_start = 0
+                self.most_add_col_end = 0
+                m_rows = []
+                if stats_query_result:
+                    m_rows.append(str(stats_query_result)[:left_w])
+                    m_rows.append("")
+                m_rows.extend(str(row)[:left_w] for row in stats_rows_data)
+                if not m_rows:
+                    m_rows = ["Type stats, count>200, listens>=50, or hours>10"]
             render_pane(m_title.ljust(left_w), m_rows, left_x, table_top, left_w, table_height)
             self.most_bounds = (left_x, table_top, left_w, table_height)
+
+            if self.youtube_active:
+                yt_results = youtube_results or []
+                self.youtube_len = len(yt_results)
+                y_content_h = max(0, table_height - 1)
+                y_max_scroll = max(0, self.youtube_len - y_content_h)
+                self.youtube_selected = max(
+                    0, min(self.youtube_selected, max(0, self.youtube_len - 1))
+                )
+                if self.youtube_selected < self.youtube_scroll:
+                    self.youtube_scroll = self.youtube_selected
+                if self.youtube_selected >= self.youtube_scroll + y_content_h:
+                    self.youtube_scroll = self.youtube_selected - y_content_h + 1
+                self.youtube_scroll = min(max(0, self.youtube_scroll), y_max_scroll)
+                self.most_add_col_start = 0
+                self.most_add_col_end = 0
+                self.most_sort_col_start = 0
+                self.most_sort_col_end = 0
+                self.stats_toggle_col_start = 0
+                self.stats_toggle_col_end = 0
+                dl_chip = "[download]"
+                self.youtube_download_col_start = left_x + left_w - len(dl_chip) - 1
+                self.youtube_download_col_end = (
+                    self.youtube_download_col_start + len(dl_chip)
+                )
+                y_rows: List[str] = []
+                title_w = max(1, left_w - (2 + 3 + 3 + 12 + len(dl_chip) + 2))
+                uploader_w = min(10, max(4, left_w // 5))
+                title_w = max(1, left_w - (2 + 3 + 3 + uploader_w + 4 + len(dl_chip) + 2))
+                for i in range(
+                    self.youtube_scroll,
+                    min(self.youtube_len, self.youtube_scroll + y_content_h),
+                ):
+                    result = yt_results[i]
+                    sel = ">" if i == self.youtube_selected and self.focus_panel == "youtube" else " "
+                    title = result.title[:title_w].ljust(title_w)
+                    uploader = result.uploader[:uploader_w].ljust(uploader_w)
+                    row = f"{sel} {i+1:>3} | {title}| {uploader}"
+                    if i == self.youtube_selected:
+                        row = row[: max(0, left_w - len(dl_chip) - 1)].ljust(
+                            max(0, left_w - len(dl_chip) - 1)
+                        ) + dl_chip
+                    y_rows.append(row)
+                if not yt_results:
+                    if youtube_query:
+                        y_rows.append("  (no YouTube results)")
+                    elif youtube_available():
+                        y_rows.append("  Search YouTube from the bottom bar.")
+                    else:
+                        y_rows.append("  yt-dlp Python package is not installed.")
+                title = "[YouTube]"
+                if youtube_query:
+                    title = f"{title} {youtube_query}"[:left_w]
+                render_pane(title.ljust(left_w), y_rows, left_x, table_top, left_w, table_height)
 
             # Similar (right top)
             entries = similar_entries or []
@@ -2228,7 +2833,24 @@ class CursesTUI:
             for i in range(self.queue_scroll, min(self.queue_len, self.queue_scroll + q_content_h)):
                 item = queue_items[order[i]]
                 path = item.get("path")
-                name = path.name if isinstance(path, Path) else "(unknown)"
+                yt = item.get("youtube_result")
+                if isinstance(path, Path):
+                    name = path.name
+                elif isinstance(yt, YouTubeResult):
+                    name = f"yt: {yt.title}"
+                else:
+                    name = "(unknown)"
+                item_lib_idx = item.get("library_idx")
+                if isinstance(item_lib_idx, int) and 0 <= item_lib_idx < len(self.library_tabs):
+                    lib_label = self.library_tabs[item_lib_idx]
+                    if lib_label == "mp3":
+                        marker = "m"
+                    elif lib_label == "mid-mp3s":
+                        marker = "mm"
+                    else:
+                        marker = lib_label[:4] or str(item_lib_idx)
+                    if self.queue_filter_mode == "all" or item_lib_idx != self.active_library_idx:
+                        name = f"[{marker}] {name}"
                 mode = "once" if display_play_once(item) else "loop"
                 if self.queue_drag_start is not None and order[i] == self.queue_drag_start:
                     sel = "D"
@@ -2242,6 +2864,11 @@ class CursesTUI:
                 row = f"{sel} {i+1:>3} | {name}| {mode:>4}  "
                 q_rows.append(row)
             q_title = "[Queue]" if self.focus_panel == "queue" else " Queue "
+            filter_chip = "[all]" if self.queue_filter_mode == "all" else "[this]"
+            q_title = f"{q_title} {filter_chip}"
+            filter_idx = q_title.find(filter_chip)
+            self.queue_filter_col_start = right_x + filter_idx if filter_idx >= 0 else 0
+            self.queue_filter_col_end = self.queue_filter_col_start + len(filter_chip)
             render_pane(q_title.ljust(right_w), q_rows, right_x, mid_y, right_w, mid_h)
             self.queue_bounds = (right_x, mid_y, right_w, mid_h)
 
@@ -2403,6 +3030,76 @@ class CursesTUI:
             if right_w > 0 and sep_h and mid_h > 0 and bot_h > 0:
                 self._draw(sep2_y, right_x, "─" * right_w)
 
+            if self.youtube_active:
+                full_w = max(1, w)
+                yt_results = youtube_results or []
+                self.youtube_len = len(yt_results)
+                y_content_h = max(0, table_height - 1)
+                y_max_scroll = max(0, self.youtube_len - y_content_h)
+                self.youtube_selected = max(
+                    0, min(self.youtube_selected, max(0, self.youtube_len - 1))
+                )
+                if self.youtube_selected < self.youtube_scroll:
+                    self.youtube_scroll = self.youtube_selected
+                if self.youtube_selected >= self.youtube_scroll + y_content_h:
+                    self.youtube_scroll = self.youtube_selected - y_content_h + 1
+                self.youtube_scroll = min(max(0, self.youtube_scroll), y_max_scroll)
+
+                self.most_bounds = (0, table_top, full_w, table_height)
+                self.queue_bounds = (0, 0, 0, 0)
+                self.similar_bounds = (0, 0, 0, 0)
+                self.playlist_bounds = (0, 0, 0, 0)
+                self.tag_bounds = (0, 0, 0, 0)
+                self.most_add_col_start = 0
+                self.most_add_col_end = 0
+                self.most_sort_col_start = 0
+                self.most_sort_col_end = 0
+                self.stats_toggle_col_start = 0
+                self.stats_toggle_col_end = 0
+
+                dl_chip = "[download]"
+                self.youtube_download_col_start = full_w - len(dl_chip) - 1
+                self.youtube_download_col_end = (
+                    self.youtube_download_col_start + len(dl_chip)
+                )
+                uploader_w = min(18, max(8, full_w // 5))
+                title_w = max(
+                    1,
+                    full_w
+                    - (2 + 3 + 3 + uploader_w + 4 + len(dl_chip) + 2),
+                )
+                y_rows: List[str] = []
+                for i in range(
+                    self.youtube_scroll,
+                    min(self.youtube_len, self.youtube_scroll + y_content_h),
+                ):
+                    result = yt_results[i]
+                    sel = (
+                        ">"
+                        if i == self.youtube_selected
+                        and self.focus_panel == "youtube"
+                        else " "
+                    )
+                    title_text = result.title[:title_w].ljust(title_w)
+                    uploader = result.uploader[:uploader_w].ljust(uploader_w)
+                    row = f"{sel} {i+1:>3} | {title_text}| {uploader}"
+                    if i == self.youtube_selected:
+                        row = row[: max(0, full_w - len(dl_chip) - 1)].ljust(
+                            max(0, full_w - len(dl_chip) - 1)
+                        ) + dl_chip
+                    y_rows.append(row)
+                if not yt_results:
+                    if youtube_query:
+                        y_rows.append("  (no YouTube results)")
+                    elif youtube_available():
+                        y_rows.append("  Search YouTube from the bottom bar.")
+                    else:
+                        y_rows.append("  yt-dlp Python package is not installed.")
+                title = "[YouTube]"
+                if youtube_query:
+                    title = f"{title} {youtube_query}"[:full_w]
+                render_pane(title.ljust(full_w), y_rows, 0, table_top, full_w, table_height)
+
         # Input bar + footer
         self._set_draw_target(self._input_win, input_y - 1)
         if self.input_mode == "save_playlist":
@@ -2411,13 +3108,28 @@ class CursesTUI:
         elif self.input_mode in ("tag_add", "tag_edit"):
             self._hline(input_y - 1, "-")
             prompt = ""
+        elif self.input_mode == "youtube_download":
+            self._hline(input_y - 1, "-")
+            prompt = "name [m|mm]: "
+        elif self.input_mode == "youtube_search" or self.youtube_active:
+            self._hline(input_y - 1, "-")
+            prompt = "youtube: "
         else:
             self._hline(input_y - 1, "-")
             prompt = "mood: "
-        if not self.input_buffer and not now_playing and self.input_mode == "mood":
+        if (
+            not self.input_buffer
+            and not now_playing
+            and self.input_mode == "mood"
+            and not self.youtube_active
+        ):
             self._draw(
                 input_y, 2, prompt + "(type a mood + Enter; optional: (top N) / top=N)"
             )
+        elif not self.input_buffer and self.input_mode == "youtube_search":
+            self._draw(input_y, 2, prompt + "(search YouTube; optional top=10)")
+        elif not self.input_buffer and self.input_mode == "youtube_download":
+            self._draw(input_y, 2, prompt + "(track name ending with [m] or [mm])")
         elif self.input_mode in ("tag_add", "tag_edit"):
             self._draw(input_y, 2, "Tags panel: type in panel, click edit/delete/close")
         else:
@@ -2426,7 +3138,7 @@ class CursesTUI:
         self._draw(
             h - 1,
             2,
-            "Click playlist to edit • Double-click playlist to load • [add] adds to playlist • Ctrl+G stop • --help",
+            "Tabs switch libraries/YouTube • [download] saves selected YouTube result • [add] adds to playlist • Ctrl+G stop • --help",
         )
 
         try:
@@ -2709,18 +3421,59 @@ def main(
     enable_tui: bool,
     listen_db_filename: str,
     playback_mode: str,
+    library_configs: Optional[List[Tuple[str, Path, Path, str]]] = None,
 ) -> None:
-    tags_data = load_tags(tags_file)
-    if logging:
-        print(f"Loaded {len(tags_data)} tag items from '{tags_file}'.")
+    if library_configs is None:
+        label, resolved_tags_file, resolved_listen_db = library_defaults_for_folder(
+            mp3_folder,
+            tags_file,
+            listen_db_filename,
+        )
+        library_configs = [(label, mp3_folder, resolved_tags_file, resolved_listen_db)]
+
+    library_states = [
+        load_library_state(folder, tags_path, listen_db, logging=logging)
+        for _, folder, tags_path, listen_db in library_configs
+    ]
+    if not library_states:
+        raise RuntimeError("No MP3 libraries configured.")
+    library_tabs = [label for label, _, _, _ in library_configs]
+    youtube_tab_idx = len(library_tabs)
+    display_tabs = library_tabs + ["youtube"]
+    for idx, state in enumerate(library_states):
+        state.label = library_tabs[idx]
 
     if logging:
         print(f"Loading model '{MODEL_NAME}' on '{DEVICE}'...")
     model = SentenceTransformer(MODEL_NAME, device=DEVICE)
 
+    active_library_idx = 0
+    active_tab_idx = 0
+    active_state = library_states[active_library_idx]
+    mp3_folder = active_state.mp3_folder
+    tags_file = active_state.tags_file
+    listen_db_filename = active_state.listen_db_filename
+    tags_data = active_state.tags_data
+    counts = active_state.counts
+    listen_timestamps = active_state.listen_timestamps
+    listen_timestamps_filename = active_state.listen_timestamps_filename
+    markov_transitions = active_state.markov_transitions
+    markov_global_counts = active_state.markov_global_counts
+    loud_cache = active_state.loud_cache
+    playlists_filename = active_state.playlists_filename
+    playlists_db = active_state.playlists_db
+    tag_session = active_state.tag_session
+    current_similar_entries = active_state.current_similar_entries
+    current_similar_mood = active_state.current_similar_mood
+    audio_data = active_state.audio_data
+    resolved_target_loudness = active_state.resolved_target_loudness
+    duration_by_stem = active_state.duration_by_stem
+    active_playlist_name = active_state.active_playlist_name
+
     EMB_CACHE.ensure(model, tags_data, mp3_folder, logging=logging)
 
     FORCE_DEVICE: Optional[str] = None
+    youtube_mpv_audio_device: Optional[str] = None
     if sys.platform == "darwin":
         # Pin THIS program's audio to a specific output device (headphones),
         # without changing the macOS system output device.
@@ -2741,6 +3494,16 @@ def main(
         print("Initializing pygame mixer...")
     init_pygame(device_name=FORCE_DEVICE)
     start_device_presence_watchdog(device_name=FORCE_DEVICE)
+    if sys.platform == "darwin" and FORCE_DEVICE:
+        mpv_path = shutil.which("mpv")
+        if mpv_path:
+            try:
+                youtube_mpv_audio_device = find_mpv_audio_device_token(
+                    mpv_path, FORCE_DEVICE
+                )
+            except Exception as e:
+                if logging:
+                    print(f"[youtube] mpv device lookup failed: {e}")
 
 
     next_exit_dt = next_local_time(EXIT_AT_LOCAL_HOUR, EXIT_AT_LOCAL_MINUTE)
@@ -2750,29 +3513,20 @@ def main(
             f"Exit policy: lock>{LOCK_EXIT_MINUTES}m or at {next_exit_dt:%Y-%m-%d %H:%M} local."
         )
 
-    counts = load_listen_counts(mp3_folder, listen_db_filename)
-    listen_timestamps_filename = listen_timestamps_filename_for_folder(mp3_folder)
-    listen_timestamps = load_listen_timestamps(
-        mp3_folder, listen_timestamps_filename
-    )
-    history_duration_by_track_name = build_duration_by_track_name(mp3_folder)
-    markov_transitions, markov_global_counts = build_markov_transition_counts(
-        mp3_folder,
-        listen_timestamps,
-        history_duration_by_track_name,
-    )
-    loud_cache = load_loudness_cache(mp3_folder)
-    playlists_filename = f"queue_playlists_{mp3_folder.name or 'default'}.json"
-    playlists_db = load_playlists(playlists_filename)
-    tag_session = TrackTagSession(tags_file, tags_data)
-
-    current_similar_entries: Optional[List[Tuple[str, float]]] = None
-    current_similar_mood: Optional[str] = None
     queue: List[Dict[str, object]] = []
     current_playing_item: Optional[Dict[str, object]] = None
-    active_playlist_name: Optional[str] = None
+    current_playing_tag_session: Optional[TrackTagSession] = None
     skip_requeue_item: Optional[Dict[str, object]] = None
     last_completed_track_name: Optional[str] = None
+    stats_query_result: Optional[str] = None
+    youtube_results: List[YouTubeResult] = []
+    youtube_query = ""
+    youtube_side_player: Optional[subprocess.Popen] = None
+    youtube_side_title: Optional[str] = None
+    youtube_side_started_at: Optional[float] = None
+    youtube_side_duration = 0.0
+    youtube_side_generation = 0
+    youtube_side_lock = threading.Lock()
     playback_mode = str(playback_mode)
 
     def item_effective_play_once(item: Dict[str, object]) -> bool:
@@ -2788,19 +3542,294 @@ def main(
         item["play_once"] = bool(play_once)
         item["play_once_overridden"] = True
 
-    audio_data: Dict[Path, Dict[str, float | None]] = {}
-    resolved_target_loudness: Optional[float] = None
-    duration_by_stem: Dict[str, float] = {}
-    for key, entry in loud_cache.items():
-        if key == "_v" or not isinstance(entry, dict):
-            continue
-        stem = Path(key).stem
-        duration_by_stem[stem] = float(entry.get("duration") or 0.0)
-    for track_name, duration in history_duration_by_track_name.items():
-        duration_by_stem.setdefault(Path(track_name).stem, float(duration or 0.0))
+    def queue_item_library_idx(item: Dict[str, object]) -> Optional[int]:
+        idx = item.get("library_idx")
+        if isinstance(idx, int) and 0 <= idx < len(library_states):
+            return idx
+        return None
+
+    def make_queue_item(
+        path: Optional[Path],
+        play_once: bool,
+        play_once_overridden: bool,
+        mood: Optional[str],
+        source: str,
+        library_idx: int,
+    ) -> Dict[str, object]:
+        item: Dict[str, object] = {
+            "play_once": bool(play_once),
+            "play_once_overridden": bool(play_once_overridden),
+            "mood": mood,
+            "source": source,
+            "library_idx": library_idx,
+        }
+        if path is not None:
+            item["path"] = path
+        return item
+
+    def enqueue_item(
+        item: Dict[str, object],
+        library_idx: int,
+        *,
+        play_next: bool = False,
+        switch_context: bool = False,
+        tui: Optional[CursesTUI] = None,
+    ) -> None:
+        nonlocal skip_requeue_item
+
+        if play_next:
+            queue.insert(0, item)
+        else:
+            queue.append(item)
+        if switch_context and current_playing_item is not None:
+            skip_requeue_item = current_playing_item
+
+    def youtube_side_now_playing() -> str:
+        with youtube_side_lock:
+            title = youtube_side_title
+            proc = youtube_side_player
+        if title and (proc is None or proc.poll() is None):
+            return f"yt: {title}"
+        return ""
+
+    def display_now_playing(local_name: str = "") -> str:
+        yt_name = youtube_side_now_playing()
+        if active_tab_idx == youtube_tab_idx:
+            return yt_name
+        return local_name
+
+    def display_progress(local_elapsed: float, local_total: float) -> Tuple[float, float]:
+        if active_tab_idx != youtube_tab_idx:
+            return local_elapsed, local_total
+        with youtube_side_lock:
+            started_at = youtube_side_started_at
+            duration = youtube_side_duration
+            title = youtube_side_title
+            proc = youtube_side_player
+        if not title or (proc is not None and proc.poll() is not None):
+            return 0.0, 0.0
+        if started_at is None:
+            return 0.0, float(duration or 0.0)
+        elapsed = max(0.0, time.monotonic() - started_at)
+        total = float(duration or 0.0)
+        if total > 0:
+            elapsed = min(elapsed, total)
+        return elapsed, total
+
+    def stop_youtube_side_players() -> None:
+        nonlocal youtube_side_player, youtube_side_title, youtube_side_started_at
+        nonlocal youtube_side_duration, youtube_side_generation
+        with youtube_side_lock:
+            youtube_side_generation += 1
+            proc = youtube_side_player
+            youtube_side_player = None
+            youtube_side_title = None
+            youtube_side_started_at = None
+            youtube_side_duration = 0.0
+        if proc is not None:
+            stop_process(proc)
+
+    def start_youtube_side_playback(
+        result: YouTubeResult,
+        tui: Optional[CursesTUI],
+    ) -> None:
+        nonlocal youtube_side_generation, youtube_side_player, youtube_side_title
+        nonlocal youtube_side_started_at, youtube_side_duration
+        stop_youtube_side_players()
+        with youtube_side_lock:
+            youtube_side_generation += 1
+            generation = youtube_side_generation
+            youtube_side_title = f"resolving {result.title}"
+            youtube_side_started_at = None
+            youtube_side_duration = 0.0
+
+        def _run() -> None:
+            nonlocal youtube_side_player, youtube_side_title, youtube_side_started_at
+            nonlocal youtube_side_duration
+            if tui and tui.enable:
+                tui.status_msg = f"Resolving YouTube: {result.title}"
+            try:
+                direct_url, title, headers, duration = resolve_youtube_audio(result.url)
+                with youtube_side_lock:
+                    if generation != youtube_side_generation:
+                        return
+                proc = spawn_youtube_player(
+                    direct_url,
+                    headers,
+                    youtube_mpv_audio_device,
+                )
+            except Exception as e:
+                if tui and tui.enable:
+                    tui.status_msg = f"YouTube playback failed: {e}"
+                with youtube_side_lock:
+                    if generation == youtube_side_generation:
+                        youtube_side_title = None
+                return
+            with youtube_side_lock:
+                if generation != youtube_side_generation:
+                    should_stop = True
+                else:
+                    should_stop = False
+                    youtube_side_player = proc
+                    youtube_side_title = title
+                    youtube_side_started_at = time.monotonic()
+                    youtube_side_duration = float(duration or 0.0)
+            if should_stop:
+                stop_process(proc)
+                return
+            if tui and tui.enable:
+                tui.status_msg = f"Playing YouTube alongside queue: {title}"
+            try:
+                proc.wait()
+            finally:
+                with youtube_side_lock:
+                    if generation == youtube_side_generation and youtube_side_player is proc:
+                        youtube_side_player = None
+                        youtube_side_title = None
+                        youtube_side_started_at = None
+                        youtube_side_duration = 0.0
+
+        threading.Thread(target=_run, daemon=True).start()
 
     current_top_n = clamp_int(top_n, TOP_MIN, TOP_MAX)
     runtime_target_lufs: Optional[float] = target_lufs
+
+    def store_active_library_state() -> None:
+        state = library_states[active_library_idx]
+        state.current_similar_entries = current_similar_entries
+        state.current_similar_mood = current_similar_mood
+        state.audio_data = audio_data
+        state.resolved_target_loudness = resolved_target_loudness
+        state.duration_by_stem = duration_by_stem
+        state.active_playlist_name = active_playlist_name
+
+    def activate_library(idx: int, tui: Optional[CursesTUI] = None) -> None:
+        nonlocal active_library_idx, active_tab_idx, active_state, mp3_folder, tags_file
+        nonlocal listen_db_filename, tags_data, counts, listen_timestamps
+        nonlocal listen_timestamps_filename, markov_transitions, markov_global_counts
+        nonlocal loud_cache, playlists_filename, playlists_db, tag_session
+        nonlocal current_similar_entries, current_similar_mood, audio_data
+        nonlocal resolved_target_loudness, duration_by_stem, active_playlist_name
+
+        if not 0 <= idx < len(library_states):
+            return
+        if idx == active_library_idx and active_tab_idx == idx:
+            return
+        store_active_library_state()
+        active_library_idx = idx
+        active_tab_idx = idx
+        active_state = library_states[active_library_idx]
+        mp3_folder = active_state.mp3_folder
+        tags_file = active_state.tags_file
+        listen_db_filename = active_state.listen_db_filename
+        tags_data = active_state.tags_data
+        counts = active_state.counts
+        listen_timestamps = active_state.listen_timestamps
+        listen_timestamps_filename = active_state.listen_timestamps_filename
+        markov_transitions = active_state.markov_transitions
+        markov_global_counts = active_state.markov_global_counts
+        loud_cache = active_state.loud_cache
+        playlists_filename = active_state.playlists_filename
+        playlists_db = active_state.playlists_db
+        tag_session = active_state.tag_session
+        current_similar_entries = active_state.current_similar_entries
+        current_similar_mood = active_state.current_similar_mood
+        audio_data = active_state.audio_data
+        resolved_target_loudness = active_state.resolved_target_loudness
+        duration_by_stem = active_state.duration_by_stem
+        active_playlist_name = active_state.active_playlist_name
+        EMB_CACHE.ensure(model, tags_data, mp3_folder, logging=logging)
+        if tui and tui.enable:
+            tui.playlist_editor_open = bool(active_playlist_name)
+            tui.queue_selected = 0
+            tui.queue_scroll = 0
+            tui.playlist_selected = 0
+            tui.playlist_scroll = 0
+            tui.playlist_track_selected = 0
+            tui.playlist_track_scroll = 0
+            tui.similar_selected = 0
+            tui.similar_scroll = 0
+            tui.most_selected = 0
+            tui.most_scroll = 0
+            tui.tag_panel_open = False
+            tui.input_mode = "mood"
+            tui.input_buffer = ""
+            tui.youtube_active = False
+            tui.status_msg = f"Switched to {active_state.label}"
+
+    def activate_youtube_tab(tui: Optional[CursesTUI] = None) -> None:
+        nonlocal active_tab_idx
+        if active_tab_idx == youtube_tab_idx:
+            return
+        store_active_library_state()
+        active_tab_idx = youtube_tab_idx
+        if tui and tui.enable:
+            tui.focus_panel = "youtube"
+            tui.input_mode = "youtube_search"
+            tui.input_buffer = ""
+            tui.tag_panel_open = False
+            tui.youtube_active = True
+            tui.status_msg = "YouTube search ready."
+
+    def library_state_for_item(item: Dict[str, object]) -> LibraryState:
+        idx = item.get("library_idx")
+        if isinstance(idx, int) and 0 <= idx < len(library_states):
+            return library_states[idx]
+        return library_states[active_library_idx]
+
+    def library_index_for_marker(marker: str) -> int:
+        wanted = "mid-mp3s" if marker == "mm" else "mp3"
+        for idx, state in enumerate(library_states):
+            if state.mp3_folder.name == wanted:
+                return idx
+        raise ValueError(f"No configured library matches [{marker}].")
+
+    def default_download_marker() -> str:
+        return "mm" if active_state.mp3_folder.name == "mid-mp3s" else "m"
+
+    def refresh_library_after_download(state_idx: int, track_path: Path) -> None:
+        state = library_states[state_idx]
+        state.counts.setdefault(track_path.stem, 0)
+        save_listen_counts(state.counts, state.listen_db_filename)
+        duration = get_audio_duration_seconds(track_path)
+        state.history_duration_by_track_name[track_path.name] = duration
+        state.duration_by_stem[track_path.stem] = duration
+        try:
+            effective_target = (
+                runtime_target_lufs
+                if runtime_target_lufs is not None
+                else state.resolved_target_loudness
+            )
+            resolved, data = build_audio_data_for_playlist(
+                playlist=[track_path],
+                target_lufs=effective_target,
+                mp3_folder=state.mp3_folder,
+                sample_filename=sample_filename,
+                cache=state.loud_cache,
+                logging=logging,
+            )
+            state.audio_data.update(data)
+            if state.resolved_target_loudness is None:
+                state.resolved_target_loudness = resolved
+            save_loudness_cache(state.loud_cache, state.mp3_folder)
+        except Exception:
+            state.audio_data.setdefault(
+                track_path,
+                {
+                    "loudness_lufs": None,
+                    "true_peak_dbtp": None,
+                    "scale": BASE_VOLUME_SCALE,
+                    "duration": duration,
+                },
+            )
+        if state is library_states[active_library_idx]:
+            counts.setdefault(track_path.stem, 0)
+            duration_by_stem[track_path.stem] = duration
+            audio_data.update(state.audio_data)
+        try:
+            EMB_CACHE.ensure(model, state.tags_data, state.mp3_folder, logging=logging)
+        except Exception:
+            pass
 
     def get_playlists_list() -> List[Tuple[str, int]]:
         return sorted(
@@ -2860,7 +3889,11 @@ def main(
         items: List[dict] = []
         if current_playing_item:
             path = current_playing_item.get("path")
-            if isinstance(path, Path):
+            if (
+                isinstance(path, Path)
+                and library_state_for_item(current_playing_item)
+                is library_states[active_library_idx]
+            ):
                 items.append(
                     {
                         "base": path.stem,
@@ -2869,7 +3902,10 @@ def main(
                 )
         for item in queue:
             path = item.get("path")
-            if isinstance(path, Path):
+            if (
+                isinstance(path, Path)
+                and library_state_for_item(item) is library_states[active_library_idx]
+            ):
                 items.append(
                     {
                         "base": path.stem,
@@ -2902,14 +3938,17 @@ def main(
                 continue
             p = mp3_folder / f"{base}.mp3"
             if p.exists():
-                queue.append(
-                    {
-                        "path": p,
-                        "play_once": bool(it.get("play_once", False)),
-                        "play_once_overridden": True,
-                        "mood": f"playlist:{name}",
-                        "source": "manual",
-                    }
+                enqueue_item(
+                    make_queue_item(
+                        p,
+                        bool(it.get("play_once", False)),
+                        True,
+                        f"playlist:{name}",
+                        "manual",
+                        active_library_idx,
+                    ),
+                    active_library_idx,
+                    switch_context=replace_queue,
                 )
                 paths.append(p)
         if paths:
@@ -2957,14 +3996,16 @@ def main(
 
     def enqueue_tracks(tracks: List[Path], mood_text: Optional[str]) -> None:
         for p in tracks:
-            queue.append(
-                {
-                    "path": p,
-                    "play_once": False,
-                    "play_once_overridden": False,
-                    "mood": mood_text,
-                    "source": "manual",
-                }
+            enqueue_item(
+                make_queue_item(
+                    p,
+                    False,
+                    False,
+                    mood_text,
+                    "manual",
+                    active_library_idx,
+                ),
+                active_library_idx,
             )
 
     def ensure_audio_data_for_tracks(paths: List[Path]) -> None:
@@ -2985,6 +4026,9 @@ def main(
             duration_by_stem[p.stem] = float(d.get("duration") or 0.0)
         if resolved_target_loudness is None:
             resolved_target_loudness = resolved
+        active_state.resolved_target_loudness = resolved_target_loudness
+        active_state.audio_data = audio_data
+        active_state.duration_by_stem = duration_by_stem
 
     def enqueue_auto_track(tui: Optional[CursesTUI]) -> bool:
         track_name = choose_auto_track_name(
@@ -3002,14 +4046,17 @@ def main(
                 tui.status_msg = f"Auto track missing on disk: {track_name}"
             return False
         ensure_audio_data_for_tracks([track_path])
-        queue.append(
-            {
-                "path": track_path,
-                "play_once": True,
-                "play_once_overridden": False,
-                "mood": "auto",
-                "source": "auto",
-            }
+        enqueue_item(
+            make_queue_item(
+                track_path,
+                True,
+                False,
+                "auto",
+                "auto",
+                active_library_idx,
+            ),
+            active_library_idx,
+            switch_context=True,
         )
         if tui and tui.enable:
             tui.status_msg = f"Auto-picked: {track_path.stem}"
@@ -3033,6 +4080,17 @@ def main(
                 duration_by_stem[stem] = dur
         return (max(0, int(listens)) * dur) / 3600.0
 
+    def listen_hours_for_state(
+        state: LibraryState, stem: str, listens: int
+    ) -> float:
+        dur = float(state.duration_by_stem.get(stem, 0.0))
+        if dur <= 0.0:
+            track_path = state.mp3_folder / f"{stem}.mp3"
+            if track_path.exists():
+                dur = get_audio_duration_seconds(track_path)
+                state.duration_by_stem[stem] = dur
+        return (max(0, int(listens)) * dur) / 3600.0
+
     def total_listen_stats() -> Tuple[int, float]:
         total_listens = 0
         total_hours = 0.0
@@ -3045,37 +4103,151 @@ def main(
             total_hours += listen_hours_for_stem(stem, listen_count)
         return total_listens, total_hours
 
+    def listen_stats_for_state(state: LibraryState) -> Tuple[int, float, int]:
+        total_listens = 0
+        total_hours = 0.0
+        track_count = 0
+        for stem, listens in state.counts.items():
+            try:
+                listen_count = max(0, int(listens))
+            except Exception:
+                listen_count = 0
+            track_count += 1
+            total_listens += listen_count
+            total_hours += listen_hours_for_state(state, stem, listen_count)
+        return total_listens, total_hours, track_count
+
+    def combined_listen_stats() -> Tuple[int, float, int]:
+        total_listens = 0
+        total_hours = 0.0
+        track_count = 0
+        for state in library_states:
+            state_listens, state_hours, state_tracks = listen_stats_for_state(state)
+            total_listens += state_listens
+            total_hours += state_hours
+            track_count += state_tracks
+        return total_listens, total_hours, track_count
+
+    def build_stats_rows() -> List[str]:
+        all_listens, all_hours, all_tracks = combined_listen_stats()
+        rows = [
+            "Library       Tracks      Listens      Hours",
+            "-" * 44,
+        ]
+        for idx, state in enumerate(library_states):
+            state_listens, state_hours, state_tracks = listen_stats_for_state(state)
+            marker = "*" if idx == active_library_idx else " "
+            rows.append(
+                f"{marker} {state.label[:10]:<10} "
+                f"{state_tracks:>7n} {state_listens:>12n} {state_hours:>9.1f}"
+            )
+        rows.extend(
+            [
+                "-" * 44,
+                f"  {'All':<10} {all_tracks:>7n} {all_listens:>12n} {all_hours:>9.1f}",
+                "",
+                "Queries: count>200, listens>=50, hours>10",
+            ]
+        )
+        return rows
+
+    def matches_comparison(value: float, op: str, threshold: float) -> bool:
+        if op == ">":
+            return value > threshold
+        if op == ">=":
+            return value >= threshold
+        if op == "<":
+            return value < threshold
+        if op == "<=":
+            return value <= threshold
+        return value == threshold
+
+    def combined_threshold_count(metric: str, op: str, threshold: float) -> int:
+        metric = metric.lower()
+        use_hours = metric.startswith("hour")
+        matches = 0
+        for state in library_states:
+            for stem, listens in state.counts.items():
+                try:
+                    listen_count = max(0, int(listens))
+                except Exception:
+                    listen_count = 0
+                value = (
+                    listen_hours_for_state(state, stem, listen_count)
+                    if use_hours
+                    else float(listen_count)
+                )
+                if matches_comparison(value, op, threshold):
+                    matches += 1
+        return matches
+
+    def handle_stats_query(text: str, tui: Optional[CursesTUI]) -> bool:
+        nonlocal stats_query_result
+        raw = text.strip()
+        threshold_match = STATS_THRESHOLD_RE.match(raw)
+        if not threshold_match and not STATS_ONLY_RE.match(raw):
+            return False
+
+        all_listens, all_hours, all_tracks = combined_listen_stats()
+        msg = f"All: {all_tracks:n} tracks, {all_listens:n} listens, {all_hours:.1f}h"
+        if threshold_match:
+            metric, op, value_text = threshold_match.groups()
+            threshold = float(value_text)
+            matches = combined_threshold_count(metric, op, threshold)
+            metric_label = "hours" if metric.lower().startswith("hour") else "listens"
+            threshold_label = (
+                str(int(threshold)) if threshold.is_integer() else f"{threshold:g}"
+            )
+            msg = f"{matches:n} tracks with {metric_label} {op} {threshold_label}"
+        stats_query_result = msg
+        if tui and tui.enable:
+            tui.stats_panel_open = True
+            tui.focus_panel = "stats"
+            tui.status_msg = "Stats updated."
+        else:
+            print(msg)
+        return True
+
     def apply_new_target_loudness(
         new_target: Optional[float],
         tui: Optional[CursesTUI],
         current_track: Optional[Path] = None,
         current_channel: Optional["pygame.mixer.Channel"] = None,
+        library_state: Optional[LibraryState] = None,
     ) -> None:
         nonlocal runtime_target_lufs, resolved_target_loudness, audio_data
 
         runtime_target_lufs = new_target
+        state = library_state or library_states[active_library_idx]
+        state_audio_data = state.audio_data
+        state_loud_cache = state.loud_cache
+        state_resolved_target = state.resolved_target_loudness
 
         # Resolve the "actual" target loudness:
         # - if user specified a number: use it
         # - if None: fall back to sample-based target (same logic as build_audio_data_for_playlist)
         if runtime_target_lufs is None:
-            sample_path = mp3_folder / sample_filename
+            sample_path = state.mp3_folder / sample_filename
             key = str(sample_path)
             sample_mtime = sample_path.stat().st_mtime if sample_path.exists() else 0.0
-            entry = loud_cache.get(key)
+            entry = state_loud_cache.get(key)
             if not entry or abs(float(entry.get("mtime", 0.0)) - sample_mtime) > 0.5:
                 entry = get_audio_stats(sample_path)
-                loud_cache[key] = entry
+                state_loud_cache[key] = entry
             loud = entry.get("loudness_lufs")
             if isinstance(loud, (int, float)):
-                resolved_target_loudness = float(loud)
+                state_resolved_target = float(loud)
         else:
-            resolved_target_loudness = float(runtime_target_lufs)
+            state_resolved_target = float(runtime_target_lufs)
+        state.resolved_target_loudness = state_resolved_target
+        if state is library_states[active_library_idx]:
+            resolved_target_loudness = state_resolved_target
+            audio_data = state_audio_data
 
         # Update cached per-track scales (fast: no re-decode)
-        if isinstance(resolved_target_loudness, (int, float)):
-            tgt = float(resolved_target_loudness)
-            for p, d in audio_data.items():
+        if isinstance(state_resolved_target, (int, float)):
+            tgt = float(state_resolved_target)
+            for p, d in state_audio_data.items():
                 loud = d.get("loudness_lufs")
                 true_peak = d.get("true_peak_dbtp")
                 if isinstance(loud, (int, float)):
@@ -3092,18 +4264,18 @@ def main(
                     d["scale"] = 0.5
 
         # Apply immediately to currently playing track (no restart)
-        if current_track and current_channel and current_track in audio_data:
-            new_scale = float(audio_data[current_track].get("scale") or 0.5)
+        if current_track and current_channel and current_track in state_audio_data:
+            new_scale = float(state_audio_data[current_track].get("scale") or 0.5)
             try:
                 current_channel.set_volume(new_scale)
             except Exception:
                 pass
 
         if tui and tui.enable:
-            if isinstance(resolved_target_loudness, (int, float)):
+            if isinstance(state_resolved_target, (int, float)):
                 src = "sample" if runtime_target_lufs is None else "manual"
                 tui.status_msg = (
-                    f"Target loudness set to {resolved_target_loudness:.2f} LUFS ({src})"
+                    f"Target loudness set to {state_resolved_target:.2f} LUFS ({src})"
                 )
             else:
                 tui.status_msg = "Target loudness updated"
@@ -3113,16 +4285,21 @@ def main(
         tui: Optional[CursesTUI],
         current_track: Optional[Path] = None,
         current_channel: Optional["pygame.mixer.Channel"] = None,
+        library_state: Optional[LibraryState] = None,
     ) -> None:
         nonlocal current_top_n
         if text.strip() == "--help":
             if tui and tui.enable:
                 tui.show_help = True
             return
+        if handle_stats_query(text, tui):
+            return
         mood_text, new_top, new_vol = parse_mood_and_directives(text)
 
         if new_vol is not None:
-            apply_new_target_loudness(new_vol, tui, current_track, current_channel)
+            apply_new_target_loudness(
+                new_vol, tui, current_track, current_channel, library_state
+            )
 
         if new_top is not None:
             current_top_n = clamp_int(new_top, TOP_MIN, TOP_MAX)
@@ -3143,9 +4320,11 @@ def main(
                     tui.status_msg = f"No matches for mood: “{mood_text}”"
 
     def reset_to_idle(tui: Optional[CursesTUI]) -> None:
-        nonlocal current_similar_entries, current_similar_mood, queue
-        queue = []
-        tag_session.abandon()
+        nonlocal current_similar_entries, current_similar_mood
+        queue.clear()
+        for state in library_states:
+            state.tag_session.abandon()
+        stop_youtube_side_players()
         if tui and tui.enable:
             tui.focus_panel = "queue"
             tui.input_mode = "mood"
@@ -3154,25 +4333,27 @@ def main(
     def handle_tag_submission(submitted: str, tui: CursesTUI) -> bool:
         if tui.input_mode not in ("tag_add", "tag_edit"):
             return False
+        session = current_playing_tag_session or tag_session
         if tui.input_mode == "tag_add":
-            tag_session.editing_ref = None
-        msg = tag_session.submit(submitted)
+            session.editing_ref = None
+        msg = session.submit(submitted)
         if msg:
             tui.status_msg = msg
         tui.input_mode = "tag_add"
         return True
 
     def apply_tag_actions() -> None:
+        session = current_playing_tag_session or tag_session
         if tui.tag_delete_request:
             tui.tag_delete_request = False
-            tui.status_msg = tag_session.delete(tui.tag_selected)
+            tui.status_msg = session.delete(tui.tag_selected)
             tui.input_mode = "tag_add"
             tui.input_buffer = ""
             if tui.tag_selected >= tui.tag_len - 1:
                 tui.tag_selected = max(0, tui.tag_len - 2)
         if tui.tag_edit_request:
             tui.tag_edit_request = False
-            text, msg = tag_session.begin_edit(tui.tag_selected)
+            text, msg = session.begin_edit(tui.tag_selected)
             tui.status_msg = msg
             if text:
                 tui.tag_panel_open = True
@@ -3213,8 +4394,28 @@ def main(
                 )
             return sorted_counts(counts)
 
+        def visible_queue_indices() -> List[int]:
+            if tui.queue_filter_mode == "all":
+                return list(range(len(queue)))
+            return [
+                idx
+                for idx, item in enumerate(queue)
+                if queue_item_library_idx(item) == active_library_idx
+            ]
+
+        def visible_queue_items() -> List[Dict[str, object]]:
+            return [queue[idx] for idx in visible_queue_indices()]
+
+        def selected_queue_actual_index() -> Optional[int]:
+            visible = visible_queue_indices()
+            if not visible:
+                return None
+            selected = min(max(0, tui.queue_selected), len(visible) - 1)
+            return visible[selected]
+
         def apply_queue_actions() -> None:
-            if not queue:
+            visible = visible_queue_indices()
+            if not visible:
                 tui.queue_selected = 0
                 tui.queue_move = 0
                 tui.queue_delete = False
@@ -3229,10 +4430,11 @@ def main(
             if tui.queue_click_row is not None:
                 idx = tui.queue_click_row
                 click_x = tui.queue_click_x or 0
-                if 0 <= idx < len(queue):
+                if 0 <= idx < len(visible):
+                    actual_idx = visible[idx]
                     if tui.queue_mode_col_start <= click_x < tui.queue_mode_col_end:
-                        cur = item_effective_play_once(queue[idx])
-                        set_item_effective_play_once(queue[idx], not cur)
+                        cur = item_effective_play_once(queue[actual_idx])
+                        set_item_effective_play_once(queue[actual_idx], not cur)
                         tui.status_msg = (
                             "Toggled play-once." if not cur else "Set to loop."
                         )
@@ -3246,11 +4448,14 @@ def main(
                     else tui.queue_selected
                 )
                 target_idx = tui.queue_drag_commit_target
-                if 0 <= start_idx < len(queue):
-                    target_idx = max(0, min(len(queue) - 1, target_idx))
+                visible = visible_queue_indices()
+                if 0 <= start_idx < len(visible):
+                    target_idx = max(0, min(len(visible) - 1, target_idx))
                     if target_idx != start_idx:
-                        item = queue.pop(start_idx)
-                        queue.insert(target_idx, item)
+                        actual_start = visible[start_idx]
+                        actual_target = visible[target_idx]
+                        item = queue.pop(actual_start)
+                        queue.insert(actual_target, item)
                         tui.queue_selected = target_idx
                         tui.status_msg = "Queue reordered."
                 tui.queue_drag_commit_target = None
@@ -3259,21 +4464,26 @@ def main(
             if tui.queue_move:
                 idx = tui.queue_selected
                 new_idx = idx + tui.queue_move
-                if 0 <= idx < len(queue):
-                    new_idx = max(0, min(len(queue) - 1, new_idx))
+                visible = visible_queue_indices()
+                if 0 <= idx < len(visible):
+                    new_idx = max(0, min(len(visible) - 1, new_idx))
                     if new_idx != idx:
-                        item = queue.pop(idx)
-                        queue.insert(new_idx, item)
+                        actual_start = visible[idx]
+                        actual_target = visible[new_idx]
+                        item = queue.pop(actual_start)
+                        queue.insert(actual_target, item)
                         tui.queue_selected = new_idx
                         tui.status_msg = "Queue reordered."
                 tui.queue_move = 0
 
             if tui.queue_delete:
                 idx = tui.queue_selected
-                if 0 <= idx < len(queue):
-                    del queue[idx]
-                    if idx >= len(queue):
-                        tui.queue_selected = max(0, len(queue) - 1)
+                visible = visible_queue_indices()
+                if 0 <= idx < len(visible):
+                    del queue[visible[idx]]
+                    visible_after = visible_queue_indices()
+                    if idx >= len(visible_after):
+                        tui.queue_selected = max(0, len(visible_after) - 1)
                     tui.status_msg = "Removed from queue."
                 tui.queue_delete = False
 
@@ -3293,16 +4503,20 @@ def main(
                 tui.status_msg = "Track not found on disk."
                 return
             ensure_audio_data_for_tracks([path])
-            queue.append(
-                {
-                    "path": path,
-                    "play_once": False,
-                    "play_once_overridden": False,
-                    "mood": current_similar_mood,
-                }
+            enqueue_item(
+                make_queue_item(
+                    path,
+                    False,
+                    False,
+                    current_similar_mood,
+                    "manual",
+                    active_library_idx,
+                ),
+                active_library_idx,
+                switch_context=True,
+                tui=tui,
             )
-            queue[-1]["source"] = "manual"
-            tui.status_msg = f"Added to queue: {base}"
+            tui.status_msg = f"Queued: {base}"
 
         def apply_most_actions() -> None:
             if not tui.most_add:
@@ -3319,16 +4533,99 @@ def main(
                 tui.status_msg = "Track not found on disk."
                 return
             ensure_audio_data_for_tracks([path])
-            queue.append(
-                {
-                    "path": path,
-                    "play_once": False,
-                    "play_once_overridden": False,
-                    "mood": "most",
-                    "source": "manual",
-                }
+            enqueue_item(
+                make_queue_item(
+                    path,
+                    False,
+                    False,
+                    "most",
+                    "manual",
+                    active_library_idx,
+                ),
+                active_library_idx,
+                switch_context=True,
+                tui=tui,
             )
-            tui.status_msg = f"Added to queue: {name}"
+            tui.status_msg = f"Queued: {name}"
+
+        def selected_youtube_result() -> Optional[YouTubeResult]:
+            if not youtube_results:
+                return None
+            idx = min(max(0, tui.youtube_selected), len(youtube_results) - 1)
+            return youtube_results[idx]
+
+        def apply_youtube_actions() -> None:
+            if tui.youtube_play_request:
+                tui.youtube_play_request = False
+                result = selected_youtube_result()
+                if result is None:
+                    tui.status_msg = "No YouTube result selected."
+                else:
+                    start_youtube_side_playback(result, tui)
+                    tui.status_msg = f"Starting YouTube: {result.title}"
+            if tui.youtube_download_request:
+                tui.youtube_download_request = False
+                result = selected_youtube_result()
+                if result is None:
+                    tui.status_msg = "No YouTube result selected."
+                    return
+                tui.input_mode = "youtube_download"
+                tui.input_buffer = ""
+                tui.focus_panel = "youtube"
+                tui.status_msg = (
+                    f"Enter download name ending in [m] or [mm]. "
+                    f"Default tab marker: [{default_download_marker()}]"
+                )
+
+        def handle_youtube_search_input(submitted: str) -> bool:
+            nonlocal youtube_results, youtube_query
+            if tui.input_mode != "youtube_search":
+                return False
+            query, requested_top, _ = parse_mood_and_directives(submitted)
+            if not query:
+                return True
+            result_limit = clamp_int(
+                requested_top if requested_top is not None else DEFAULT_YOUTUBE_TOP_N,
+                TOP_MIN,
+                TOP_MAX,
+            )
+            youtube_query = query
+            tui.status_msg = f"Searching YouTube: {query} (top {result_limit})"
+            try:
+                youtube_results = search_youtube(query, result_limit)
+                tui.youtube_selected = 0
+                tui.youtube_scroll = 0
+                tui.focus_panel = "youtube"
+                tui.status_msg = f"YouTube results: {len(youtube_results)} (top {result_limit})"
+            except Exception as e:
+                youtube_results = []
+                tui.status_msg = f"YouTube search failed: {e}"
+            return True
+
+        def handle_youtube_download_input(submitted: str) -> bool:
+            if tui.input_mode != "youtube_download":
+                return False
+            result = selected_youtube_result()
+            if result is None:
+                tui.input_mode = "youtube_search"
+                tui.status_msg = "No YouTube result selected."
+                return True
+            try:
+                title, marker = parse_youtube_download_name(submitted)
+                target_idx = library_index_for_marker(marker)
+                target_state = library_states[target_idx]
+                output_path = target_state.mp3_folder / f"{title}.mp3"
+                tui.status_msg = f"Downloading to {target_state.label}: {title}"
+                run_youtube_download(result.url, output_path)
+                refresh_library_after_download(target_idx, output_path)
+                tui.input_mode = "youtube_search"
+                tui.input_buffer = ""
+                tui.status_msg = f"Downloaded: {output_path.name} -> {target_state.label}"
+            except subprocess.CalledProcessError as e:
+                tui.status_msg = f"Download failed: yt-dlp exited {e.returncode}"
+            except Exception as e:
+                tui.status_msg = f"Download failed: {e}"
+            return True
 
         def apply_playlist_editor_actions() -> None:
             nonlocal active_playlist_name
@@ -3378,9 +4675,9 @@ def main(
 
             if tui.playlist_add_queue_request:
                 tui.playlist_add_queue_request = False
-                if queue:
-                    idx = min(max(0, tui.queue_selected), len(queue) - 1)
-                    item = queue[idx]
+                actual_idx = selected_queue_actual_index()
+                if actual_idx is not None:
+                    item = queue[actual_idx]
                     path = item.get("path")
                     if isinstance(path, Path):
                         add_path_to_active_playlist(
@@ -3524,6 +4821,26 @@ def main(
                         tui.status_msg = "No playlists to delete."
 
         def handle_common_actions() -> None:
+            if tui.library_switch_request is not None:
+                idx = tui.library_switch_request
+                tui.library_switch_request = None
+                if idx == youtube_tab_idx:
+                    activate_youtube_tab(tui)
+                else:
+                    activate_library(idx, tui)
+            if tui.stats_toggle_request:
+                tui.stats_toggle_request = False
+                tui.stats_panel_open = not tui.stats_panel_open
+                tui.focus_panel = "stats" if tui.stats_panel_open else "most"
+            if tui.queue_filter_toggle_request:
+                tui.queue_filter_toggle_request = False
+                tui.queue_filter_mode = (
+                    "all" if tui.queue_filter_mode == "tab" else "tab"
+                )
+                tui.queue_selected = 0
+                tui.queue_scroll = 0
+                label = "all tracks" if tui.queue_filter_mode == "all" else "this tab"
+                tui.status_msg = f"Queue view: {label}"
             if tui.playback_mode_toggle_request:
                 tui.playback_mode_toggle_request = False
                 toggle_playback_mode(tui)
@@ -3532,6 +4849,7 @@ def main(
             apply_queue_actions()
             apply_similar_actions()
             apply_most_actions()
+            apply_youtube_actions()
             apply_playlist_editor_actions()
             apply_tag_actions()
             handle_playlist_requests()
@@ -3562,14 +4880,19 @@ def main(
                 )
 
                 total_listens, total_hours = total_listen_stats()
+                all_listens, all_hours, _ = combined_listen_stats()
+                header_elapsed, header_total = display_progress(
+                    max(0.0, seconds - max(0.0, end - time.monotonic())),
+                    seconds,
+                )
                 submitted = tui.render(
-                    now_playing="",
+                    now_playing=display_now_playing(),
                     target_lufs=None,
                     current_lufs=None,
                     loudness_diff=None,
                     volume_scale=None,
-                    elapsed_sec=max(0.0, seconds - max(0.0, end - time.monotonic())),
-                    total_sec=seconds,
+                    elapsed_sec=header_elapsed,
+                    total_sec=header_total,
                     playback_mode=playback_mode,
                     current_play_once=None,
                     counts=counts,
@@ -3578,15 +4901,28 @@ def main(
                     total_listen_hours=total_hours,
                     similar_entries=current_similar_entries,
                     similar_mood=current_similar_mood,
-                    queue_items=queue,
+                    queue_items=visible_queue_items(),
                     playlists=get_playlists_list(),
                     active_playlist_name=active_playlist_name
                     if tui.playlist_editor_open
                     else None,
                     active_playlist_items=get_active_playlist_items(tui),
+                    library_tabs=display_tabs,
+                    active_library_idx=active_tab_idx,
+                    combined_total_listens=all_listens,
+                    combined_total_listen_hours=all_hours,
+                    stats_rows=build_stats_rows(),
+                    stats_query_result=stats_query_result,
+                    youtube_active=(active_tab_idx == youtube_tab_idx),
+                    youtube_results=youtube_results,
+                    youtube_query=youtube_query,
                 )
                 if submitted:
                     if handle_save_playlist_input(submitted):
+                        continue
+                    if handle_youtube_download_input(submitted):
+                        continue
+                    if handle_youtube_search_input(submitted):
                         continue
                     if handle_tag_submission(submitted, tui):
                         continue
@@ -3626,14 +4962,16 @@ def main(
                         time.sleep(0.2)
                         continue
                     total_listens, total_hours = total_listen_stats()
+                    all_listens, all_hours, _ = combined_listen_stats()
+                    header_elapsed, header_total = display_progress(0.0, 0.0)
                     submitted = tui.render(
-                        now_playing="",
+                        now_playing=display_now_playing(),
                         target_lufs=None,
                         current_lufs=None,
                         loudness_diff=None,
                         volume_scale=None,
-                        elapsed_sec=0.0,
-                        total_sec=0.0,
+                        elapsed_sec=header_elapsed,
+                        total_sec=header_total,
                         playback_mode=playback_mode,
                         current_play_once=None,
                         counts=counts,
@@ -3642,12 +4980,21 @@ def main(
                         total_listen_hours=total_hours,
                         similar_entries=current_similar_entries,
                         similar_mood=current_similar_mood,
-                        queue_items=queue,
+                        queue_items=visible_queue_items(),
                         playlists=get_playlists_list(),
                         active_playlist_name=active_playlist_name
                         if tui.playlist_editor_open
                         else None,
                         active_playlist_items=get_active_playlist_items(tui),
+                        library_tabs=display_tabs,
+                        active_library_idx=active_tab_idx,
+                        combined_total_listens=all_listens,
+                        combined_total_listen_hours=all_hours,
+                        stats_rows=build_stats_rows(),
+                        stats_query_result=stats_query_result,
+                        youtube_active=(active_tab_idx == youtube_tab_idx),
+                        youtube_results=youtube_results,
+                        youtube_query=youtube_query,
                     )
                     if submitted:
                         if submitted.strip() == "--help":
@@ -3657,7 +5004,16 @@ def main(
                         if handle_save_playlist_input(submitted):
                             time.sleep(0.01)
                             continue
+                        if handle_youtube_download_input(submitted):
+                            time.sleep(0.01)
+                            continue
+                        if handle_youtube_search_input(submitted):
+                            time.sleep(0.01)
+                            continue
                         if handle_tag_submission(submitted, tui):
+                            time.sleep(0.01)
+                            continue
+                        if handle_stats_query(submitted, tui):
                             time.sleep(0.01)
                             continue
                         mood_text, new_top, new_vol = parse_mood_and_directives(
@@ -3697,30 +5053,35 @@ def main(
                 if not isinstance(track_path, Path):
                     current_playing_item = None
                     continue
-                tag_session.start(track_path)
+                track_state = library_state_for_item(current_item)
+                track_tag_session = track_state.tag_session
+                current_playing_tag_session = track_tag_session
+                track_tag_session.start(track_path)
                 if enable_tui and tui.input_mode in ("tag_add", "tag_edit"):
                     tui.input_buffer = ""
 
                 # refresh queue selection bounds
-                if tui.queue_selected >= len(queue):
-                    tui.queue_selected = max(0, len(queue) - 1)
+                visible_items = visible_queue_items()
+                if tui.queue_selected >= len(visible_items):
+                    tui.queue_selected = max(0, len(visible_items) - 1)
 
                 # Play single item
                 while True:
                     maybe_exit(next_exit_dt)
 
-                    if track_path not in audio_data:
-                        tag_session.abandon()
+                    if track_path not in track_state.audio_data:
+                        track_tag_session.abandon()
                         current_playing_item = None
+                        current_playing_tag_session = None
                         break
 
                     filename_ext = track_path.name
-                    vol_scale = float(audio_data[track_path].get("scale") or 0.5)
-                    current_loudness = audio_data[track_path].get("loudness_lufs")
+                    vol_scale = float(track_state.audio_data[track_path].get("scale") or 0.5)
+                    current_loudness = track_state.audio_data[track_path].get("loudness_lufs")
                     loudness_diff = (
-                        float(current_loudness) - float(resolved_target_loudness)
+                        float(current_loudness) - float(track_state.resolved_target_loudness)
                         if isinstance(current_loudness, (int, float))
-                        and isinstance(resolved_target_loudness, (int, float))
+                        and isinstance(track_state.resolved_target_loudness, (int, float))
                         else None
                     )
 
@@ -3747,7 +5108,7 @@ def main(
                         except Exception:
                             total_dur = 0.0
                         if total_dur <= 0.0:
-                            total_dur = float(audio_data[track_path].get("duration") or 0.0)
+                            total_dur = float(track_state.audio_data[track_path].get("duration") or 0.0)
 
                         reached_end = False
                         interrupted_by_lock = False
@@ -3764,9 +5125,14 @@ def main(
                                     total_dur if total_dur > 0 else 0.0,
                                 )
                                 total_listens, total_hours = total_listen_stats()
+                                all_listens, all_hours, _ = combined_listen_stats()
+                                header_elapsed, header_total = display_progress(
+                                    elapsed,
+                                    total_dur,
+                                )
                                 submitted = tui.render(
-                                    now_playing=filename_ext,
-                                    target_lufs=resolved_target_loudness,
+                                    now_playing=display_now_playing(filename_ext),
+                                    target_lufs=track_state.resolved_target_loudness,
                                     current_lufs=float(current_loudness)
                                     if isinstance(current_loudness, (int, float))
                                     else None,
@@ -3774,8 +5140,8 @@ def main(
                                     if isinstance(loudness_diff, (int, float))
                                     else None,
                                     volume_scale=vol_scale,
-                                    elapsed_sec=elapsed,
-                                    total_sec=total_dur,
+                                    elapsed_sec=header_elapsed,
+                                    total_sec=header_total,
                                     playback_mode=playback_mode,
                                     current_play_once=item_effective_play_once(current_item),
                                     counts=counts,
@@ -3784,35 +5150,48 @@ def main(
                                     total_listen_hours=total_hours,
                                     similar_entries=current_similar_entries,
                                     similar_mood=current_similar_mood,
-                                    queue_items=queue,
+                                    queue_items=visible_queue_items(),
                                     playlists=get_playlists_list(),
-                                    current_tags=tag_session.existing_tags(),
-                                    pending_tags=tag_session.pending_tags(),
+                                    current_tags=track_tag_session.existing_tags(),
+                                    pending_tags=track_tag_session.pending_tags(),
                                     active_playlist_name=active_playlist_name
                                     if tui.playlist_editor_open
                                     else None,
                                     active_playlist_items=get_active_playlist_items(tui),
+                                    library_tabs=display_tabs,
+                                    active_library_idx=active_tab_idx,
+                                    combined_total_listens=all_listens,
+                                    combined_total_listen_hours=all_hours,
+                                    stats_rows=build_stats_rows(),
+                                    stats_query_result=stats_query_result,
+                                    youtube_active=(active_tab_idx == youtube_tab_idx),
+                                    youtube_results=youtube_results,
+                                    youtube_query=youtube_query,
                                 )
                                 if submitted:
                                     if handle_save_playlist_input(submitted):
+                                        pass
+                                    elif handle_youtube_download_input(submitted):
+                                        pass
+                                    elif handle_youtube_search_input(submitted):
                                         pass
                                     elif handle_tag_submission(submitted, tui):
                                         pass
                                     else:
                                         apply_submission(
-                                            submitted, tui, track_path, channel
+                                            submitted, tui, track_path, channel, track_state
                                         )
                                     # refresh values for UI immediately after a vol change
                                     vol_scale = float(
-                                        audio_data[track_path].get("scale") or vol_scale
+                                        track_state.audio_data[track_path].get("scale") or vol_scale
                                     )
                                     if isinstance(
                                         current_loudness, (int, float)
                                     ) and isinstance(
-                                        resolved_target_loudness, (int, float)
+                                        track_state.resolved_target_loudness, (int, float)
                                     ):
                                         loudness_diff = float(current_loudness) - float(
-                                            resolved_target_loudness
+                                            track_state.resolved_target_loudness
                                         )
                                     else:
                                         loudness_diff = None
@@ -3868,26 +5247,31 @@ def main(
                                 if enable_tui and tui.input_mode in ("tag_add", "tag_edit")
                                 else ""
                             )
-                            saved_tags = tag_session.finish(trailing_tag)
+                            saved_tags = track_tag_session.finish(trailing_tag)
                             if trailing_tag and enable_tui and tui.input_mode in ("tag_add", "tag_edit"):
                                 tui.input_buffer = ""
                             if track_source == "manual":
-                                increment_listen(track_path, counts)
-                                save_listen_counts(counts, listen_db_filename)
-                                record_listen_timestamp(track_path, listen_timestamps)
+                                increment_listen(track_path, track_state.counts)
+                                save_listen_counts(
+                                    track_state.counts, track_state.listen_db_filename
+                                )
+                                record_listen_timestamp(
+                                    track_path, track_state.listen_timestamps
+                                )
                                 save_listen_timestamps(
-                                    listen_timestamps, listen_timestamps_filename
+                                    track_state.listen_timestamps,
+                                    track_state.listen_timestamps_filename,
                                 )
                                 if tui and tui.enable:
                                     listen_msg = (
                                         f"Recorded listen: {track_path.stem} "
-                                        f"({counts.get(track_path.stem, 0)})"
+                                        f"({track_state.counts.get(track_path.stem, 0)})"
                                     )
                                     if saved_tags:
                                         listen_msg += f"; saved {saved_tags} tag(s)"
                                     tui.status_msg = listen_msg
                         else:
-                            tag_session.abandon()
+                            track_tag_session.abandon()
 
                         if user_stop:
                             reset_to_idle(tui)
@@ -3895,6 +5279,7 @@ def main(
                                 0.2, lock_since_wall, next_exit_dt
                             )
                             current_playing_item = None
+                            current_playing_tag_session = None
                             break
 
                         # Between tracks
@@ -3912,10 +5297,11 @@ def main(
                         if current_item is skip_requeue_item:
                             skip_requeue_item = None
                         current_playing_item = None
+                        current_playing_tag_session = None
                         break
 
                     except pygame.error as e:
-                        tag_session.abandon()
+                        track_tag_session.abandon()
                         if enable_tui:
                             tui.status_msg = f"Error playing {filename_ext}: {e}"
                         else:
@@ -3929,9 +5315,10 @@ def main(
                         if current_item is skip_requeue_item:
                             skip_requeue_item = None
                         current_playing_item = None
+                        current_playing_tag_session = None
                         break
                     except Exception as e:
-                        tag_session.abandon()
+                        track_tag_session.abandon()
                         if enable_tui:
                             tui.status_msg = f"Unexpected error: {e}"
                         else:
@@ -3945,13 +5332,17 @@ def main(
                         if current_item is skip_requeue_item:
                             skip_requeue_item = None
                         current_playing_item = None
+                        current_playing_tag_session = None
                         break
 
         except (SystemExit, KeyboardInterrupt):
             pass
         finally:
+            stop_youtube_side_players()
+            store_active_library_state()
             try:
-                save_loudness_cache(loud_cache, mp3_folder)
+                for state in library_states:
+                    save_loudness_cache(state.loud_cache, state.mp3_folder)
             except Exception:
                 pass
 
@@ -3983,7 +5374,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--log", action="store_true", help="Enable detailed logging.")
     p.add_argument(
-        "--folder", type=str, default=str(DEFAULT_MP3_FOLDER), help="MP3 folder path."
+        "--folder",
+        type=str,
+        default=None,
+        help="Single MP3 folder path. Overrides the default tabbed libraries.",
+    )
+    p.add_argument(
+        "--folders",
+        nargs="+",
+        default=None,
+        help="MP3 folders to open as TUI tabs.",
     )
     p.add_argument(
         "--tags", type=str, default=str(DEFAULT_TAGS_FILE), help="Tags JSON path."
@@ -4007,13 +5407,28 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
 
-    mp3_folder = Path(args.folder)
-    tags_file = Path(args.tags)
-    listen_db = LISTEN_DB_FILE
+    if args.folders:
+        folder_paths = [Path(folder) for folder in args.folders]
+    elif args.folder:
+        folder_paths = [Path(args.folder)]
+    elif args.no_tui:
+        folder_paths = [DEFAULT_MP3_FOLDER]
+    else:
+        folder_paths = [DEFAULT_MP3_FOLDER, DEFAULT_MID_MP3_FOLDER]
 
-    if mp3_folder.name == "mid-mp3s":
-        listen_db = "mid_listen_counts.json"
-        tags_file = Path("mid_tags.json")
+    library_configs: List[Tuple[str, Path, Path, str]] = []
+    for idx, folder_path in enumerate(folder_paths):
+        explicit_tags = Path(args.tags) if args.folder and len(folder_paths) == 1 else None
+        label, tags_path, listen_db = library_defaults_for_folder(
+            folder_path,
+            explicit_tags if idx == 0 else None,
+            None,
+        )
+        library_configs.append((label, folder_path, tags_path, listen_db))
+
+    mp3_folder = library_configs[0][1]
+    tags_file = library_configs[0][2]
+    listen_db = library_configs[0][3]
 
     try:
         main(
@@ -4027,6 +5442,7 @@ if __name__ == "__main__":
             enable_tui=(not args.no_tui),
             listen_db_filename=listen_db,
             playback_mode=str(args.mode),
+            library_configs=library_configs,
         )
     except SystemExit:
         print("\nPlayback stopped.")

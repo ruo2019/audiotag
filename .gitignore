@@ -38,9 +38,6 @@ artists_reviewed.json
 mid_artists_reviewed.json
 artists_reviewed.json.bak
 mid_artists_reviewed.json.bak
-listen_counts.json
-listen_timestamps*.json
-mid_listen_counts.json
 queue_playlists*.json
 out.json
 download_list.txt

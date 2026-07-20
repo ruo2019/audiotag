@@ -1,0 +1,134 @@
+{
+  "21P": [
+    {
+      "base": "Doubt",
+      "play_once": false
+    },
+    {
+      "base": "Redecorate",
+      "play_once": false
+    },
+    {
+      "base": "Drop",
+      "play_once": false
+    },
+    {
+      "base": "[21P] Heathens",
+      "play_once": false
+    },
+    {
+      "base": "[21P] Ride",
+      "play_once": false
+    },
+    {
+      "base": "[21P] Stressed Out",
+      "play_once": false
+    }
+  ],
+  "letting go": [
+    {
+      "base": "Rain",
+      "play_once": false
+    },
+    {
+      "base": "Undertow",
+      "play_once": false
+    },
+    {
+      "base": "Leave",
+      "play_once": false
+    }
+  ],
+  "calming": [
+    {
+      "base": "Darkside",
+      "play_once": false
+    },
+    {
+      "base": "Stressed Out (Instrumental)",
+      "play_once": false
+    },
+    {
+      "base": "6 Pills (Instrumental)",
+      "play_once": false
+    }
+  ],
+  "old": [
+    {
+      "base": "Nuvole Bianche",
+      "play_once": false
+    },
+    {
+      "base": "Little Sea",
+      "play_once": false
+    },
+    {
+      "base": "[JP] Experience",
+      "play_once": false
+    },
+    {
+      "base": "Primavera",
+      "play_once": false
+    },
+    {
+      "base": "Chaconne",
+      "play_once": false
+    },
+    {
+      "base": "OT",
+      "play_once": false
+    },
+    {
+      "base": "Handel",
+      "play_once": false
+    },
+    {
+      "base": "Schindler's List",
+      "play_once": false
+    },
+    {
+      "base": "Fur Elise",
+      "play_once": false
+    },
+    {
+      "base": "End",
+      "play_once": false
+    },
+    {
+      "base": "Waltz No. 2",
+      "play_once": false
+    }
+  ],
+  "ld": [
+    {
+      "base": "Malinconica",
+      "play_once": false
+    },
+    {
+      "base": "Tomorrow",
+      "play_once": false
+    },
+    {
+      "base": "Disappearing",
+      "play_once": false
+    },
+    {
+      "base": "Ready",
+      "play_once": false
+    },
+    {
+      "base": "Lose",
+      "play_once": false
+    }
+  ],
+  "soft wishful": [
+    {
+      "base": "Across the Stars",
+      "play_once": false
+    },
+    {
+      "base": "7 Years",
+      "play_once": false
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+{
+  "lost": [
+    {
+      "base": "Ce Monde",
+      "play_once": false
+    },
+    {
+      "base": "Maison",
+      "play_once": false
+    },
+    {
+      "base": "[L] Voila",
+      "play_once": false
+    }
+  ],
+  "dark low": [
+    {
+      "base": "Starboy",
+      "play_once": false
+    },
+    {
+      "base": "Circles",
+      "play_once": false
+    }
+  ],
+  "soft doubt": [
+    {
+      "base": "To Build a Home",
+      "play_once": false
+    },
+    {
+      "base": "Apologize",
+      "play_once": false
+    },
+    {
+      "base": "Scared to be Lonely",
+      "play_once": false
+    }
+  ],
+  "alan walker": [
+    {
+      "base": "Dt",
+      "play_once": false
+    },
+    {
+      "base": "HM",
+      "play_once": false
+    },
+    {
+      "base": "OMW",
+      "play_once": false
+    },
+    {
+      "base": "Not Home",
+      "play_once": false
+    },
+    {
+      "base": "A2",
+      "play_once": false
+    },
+    {
+      "base": "A",
+      "play_once": false
+    },
+    {
+      "base": "Hero",
+      "play_once": false
+    },
+    {
+      "base": "Lifeline",
+      "play_once": false
+    },
+    {
+      "base": "Broken Strings",
+      "play_once": false
+    },
+    {
+      "base": "Unsure",
+      "play_once": false
+    },
+    {
+      "base": "Barcelona",
+      "play_once": false
+    }
+  ],
+  "blue": [
+    {
+      "base": "BITTERSUITE",
+      "play_once": false
+    },
+    {
+      "base": "CHIHIRO",
+      "play_once": false
+    },
+    {
+      "base": "BLUE",
+      "play_once": false
+    }
+  ]
+}

@@ -57,6 +57,7 @@ TRENDING_BASELINE_DURATION_SECONDS = 3 * 60 + 30
 NODE_MIN_SIZE = 7
 NODE_SIZE_RANGE = 63
 NODE_SIZE_POWER = 1.25
+UNTAGGED_ARTIST_LABEL = "Untagged MP3s"
 VIS_NETWORK_CDN = "https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"
 LISTEN_COUNTS_FILE = "listen_counts.json"
 MID_LISTEN_COUNTS_FILE = "mid_listen_counts.json"
@@ -558,6 +559,9 @@ def build_artist_payload(
     artist_before_context = defaultdict(Counter)
     artist_after_context = defaultdict(Counter)
     song_artist_rows = []
+    unassigned_song_details = []
+    unassigned_timestamps = []
+    unassigned_listen_seconds = 0.0
     tagged_song_count = 0
     tagged_play_count = 0
     unassigned_play_count = 0
@@ -566,17 +570,29 @@ def build_artist_payload(
     for song_name, play_count_raw in song_counts.items():
         play_count = max(0, int(play_count_raw or 0))
         artists = list(song_artists.get(song_name, []) or [])
-        if not artists:
-            unassigned_play_count += play_count
-            continue
-        tagged_song_count += 1
-        tagged_play_count += play_count
         duration_seconds = max(0.0, float(durations.get(song_name, 0.0) or 0.0))
         history = [
             int(timestamp)
             for timestamp in history_mapping.get(song_name, [])
             if isinstance(timestamp, (int, float))
         ]
+        if not artists:
+            unassigned_play_count += play_count
+            unassigned_listen_seconds += duration_seconds * play_count
+            unassigned_timestamps.extend(history)
+            unassigned_song_details.append(
+                {
+                    "name": song_name,
+                    "playCount": play_count,
+                    "historyCount": len(history),
+                    "durationSeconds": round(duration_seconds, 2),
+                    "listenTimeSeconds": round(duration_seconds * play_count, 2),
+                    "history": encode_timestamps(sorted(history)),
+                }
+            )
+            continue
+        tagged_song_count += 1
+        tagged_play_count += play_count
         for artist in artists:
             artist_song_sets[artist].add(song_name)
             artist_play_counts[artist] += play_count
@@ -849,6 +865,7 @@ def build_artist_payload(
     all_artist_timestamps = [
         timestamp for timestamps in artist_timestamps.values() for timestamp in timestamps
     ]
+    all_artist_timestamps.extend(unassigned_timestamps)
     all_artist_timestamps.sort()
     artist_trending_rows = []
     for node in artist_nodes:
@@ -932,6 +949,100 @@ def build_artist_payload(
         ),
     ]
     highlights = [item for item in highlights if item is not None]
+
+    unassigned_timestamps.sort()
+    unassigned_day_counts = Counter(
+        datetime.fromtimestamp(timestamp).date().isoformat()
+        for timestamp in unassigned_timestamps
+    )
+    unassigned_peak_day, unassigned_peak_day_count = (None, 0)
+    if unassigned_day_counts:
+        unassigned_peak_day, unassigned_peak_day_count = sorted(
+            unassigned_day_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[0]
+    unassigned_gaps = [
+        (right - left) / 86400
+        for left, right in zip(unassigned_timestamps, unassigned_timestamps[1:])
+        if right >= left
+    ]
+    unassigned_top_song, unassigned_top_song_plays = (None, 0)
+    sorted_unassigned_song_details = sorted(
+        unassigned_song_details,
+        key=lambda row: (-int(row["playCount"]), row["name"].casefold()),
+    )
+    if sorted_unassigned_song_details:
+        unassigned_top_song = sorted_unassigned_song_details[0]["name"]
+        unassigned_top_song_plays = int(sorted_unassigned_song_details[0]["playCount"])
+    unassigned_first_listen = unassigned_timestamps[0] if unassigned_timestamps else None
+    unassigned_last_listen = unassigned_timestamps[-1] if unassigned_timestamps else None
+    unassigned_active_span_days = (
+        round((unassigned_last_listen - unassigned_first_listen) / 86400, 1)
+        if unassigned_first_listen is not None and unassigned_last_listen is not None
+        else 0.0
+    )
+    unassigned_recent_cutoff = generated_timestamp - 30 * 86400
+    unassigned_artist_node = None
+    if unassigned_song_details:
+        unassigned_artist_node = {
+            "id": "__untagged__",
+            "label": UNTAGGED_ARTIST_LABEL,
+            "isUntagged": True,
+            "playCount": int(unassigned_play_count),
+            "songCount": len(unassigned_song_details),
+            "historyCount": len(unassigned_timestamps),
+            "listenTimeSeconds": round(unassigned_listen_seconds, 2),
+            "playsPerSong": round(unassigned_play_count / len(unassigned_song_details), 2)
+            if unassigned_song_details
+            else 0.0,
+            "topSong": unassigned_top_song,
+            "topSongPlays": int(unassigned_top_song_plays),
+            "topSongShare": round(unassigned_top_song_plays / unassigned_play_count, 4)
+            if unassigned_play_count
+            else 0.0,
+            "firstListen": unassigned_first_listen,
+            "lastListen": unassigned_last_listen,
+            "activeSpanDays": unassigned_active_span_days,
+            "activeDayCount": len(unassigned_day_counts),
+            "peakDay": unassigned_peak_day,
+            "peakDayCount": int(unassigned_peak_day_count),
+            "recent30PlayCount": int(
+                sum(timestamp >= unassigned_recent_cutoff for timestamp in unassigned_timestamps)
+            ),
+            "averageGapDays": round(sum(unassigned_gaps) / len(unassigned_gaps), 2)
+            if unassigned_gaps
+            else None,
+            "longestGapDays": round(max(unassigned_gaps), 2)
+            if unassigned_gaps
+            else None,
+            "playSize": round(
+                scale_node_size(
+                    unassigned_play_count,
+                    max(max_artist_plays, unassigned_play_count, 1),
+                ),
+                2,
+            ),
+            "listenTimeSize": round(
+                scale_node_size(
+                    unassigned_listen_seconds,
+                    max(max_artist_listen_seconds, unassigned_listen_seconds, 1.0),
+                ),
+                2,
+            ),
+            "songs": sorted(
+                (row["name"] for row in unassigned_song_details),
+                key=str.casefold,
+            ),
+            "songDetails": sorted_unassigned_song_details,
+            "context": {"before": [], "after": []},
+            "history": encode_timestamps(unassigned_timestamps),
+            "title": (
+                f"<b>{UNTAGGED_ARTIST_LABEL}</b><br>"
+                f"Plays: {unassigned_play_count}<br>"
+                f"Songs: {len(unassigned_song_details)}<br>"
+                f"Listen time: {unassigned_listen_seconds / 3600:.2f} hours"
+            ),
+        }
     return {
         "summary": {
             "folder": str(folder),
@@ -952,6 +1063,7 @@ def build_artist_payload(
         },
         "topArtists": top_artists,
         "highlights": highlights,
+        "unassignedArtist": unassigned_artist_node,
         "artistGraph": {"nodes": artist_nodes, "edges": artist_edges},
         "songArtistGraph": {"nodes": song_artist_nodes, "edges": song_artist_edges},
         "trending": {"artists": artist_trending_rows},
@@ -1335,6 +1447,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
         or {
             "summary": {},
             "topArtists": [],
+            "unassignedArtist": None,
             "artistGraph": {"nodes": [], "edges": []},
             "songArtistGraph": {"nodes": [], "edges": []},
             "trending": {"artists": []},
@@ -1445,19 +1558,25 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     body.artist-mode .layout {{
       display: none;
     }}
+    body.orbit-mode .layout {{
+      display: none;
+    }}
     body.stats-mode .layout {{
       display: none;
     }}
     body.graph-mode .trending-layout {{
       display: none;
     }}
-    body.artist-mode .trending-layout, body.stats-mode .trending-layout {{
+    body.artist-mode .trending-layout, body.orbit-mode .trending-layout, body.stats-mode .trending-layout {{
       display: none;
     }}
-    body.graph-mode .artist-layout, body.trending-mode .artist-layout, body.stats-mode .artist-layout {{
+    body.graph-mode .artist-layout, body.trending-mode .artist-layout, body.orbit-mode .artist-layout, body.stats-mode .artist-layout {{
       display: none;
     }}
-    body.graph-mode .artist-stats-layout, body.trending-mode .artist-stats-layout, body.artist-mode .artist-stats-layout {{
+    body.graph-mode .artist-stats-layout, body.trending-mode .artist-stats-layout, body.artist-mode .artist-stats-layout, body.orbit-mode .artist-stats-layout {{
+      display: none;
+    }}
+    body.graph-mode .orbit-layout, body.trending-mode .orbit-layout, body.artist-mode .orbit-layout, body.stats-mode .orbit-layout {{
       display: none;
     }}
     body.trending-mode {{
@@ -1470,7 +1589,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     body.stats-mode {{
       overflow: auto;
     }}
-    body.graph-mode .trending-timeline-dock, body.artist-mode .trending-timeline-dock, body.stats-mode .trending-timeline-dock {{
+    body.graph-mode .trending-timeline-dock, body.artist-mode .trending-timeline-dock, body.orbit-mode .trending-timeline-dock, body.stats-mode .trending-timeline-dock {{
       display: none;
     }}
     .trending-layout {{
@@ -1877,6 +1996,107 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     .artist-timeline {{
       width: 100%;
       accent-color: var(--accent);
+    }}
+    .orbit-layout {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
+    }}
+    .orbit-main {{
+      min-height: 0;
+      overflow: hidden;
+      position: relative;
+      background:
+        radial-gradient(circle at center, rgba(47, 128, 237, 0.10), transparent 34%),
+        linear-gradient(180deg, #f9fcff 0%, #eef5fb 100%);
+    }}
+    .orbit-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: end;
+    }}
+    .orbit-controls label {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 120px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .orbit-controls input, .orbit-controls button {{
+      font: inherit;
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+    }}
+    .orbit-canvas-wrap {{
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+    }}
+    #song-orbit-canvas {{
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+    }}
+    #song-orbit-canvas.dragging {{
+      cursor: grabbing;
+    }}
+    .orbit-hint {{
+      position: absolute;
+      left: 14px;
+      bottom: 14px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+      pointer-events: none;
+    }}
+    .orbit-sidebar {{
+      border-left: 1px solid var(--border);
+      background: rgba(248, 251, 255, 0.94);
+      padding: 18px;
+      overflow-y: auto;
+      min-height: 0;
+    }}
+    .orbit-sidebar h2 {{
+      margin: 0 0 8px;
+    }}
+    .orbit-mini-list {{
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .orbit-mini-row {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 64px;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(200, 216, 232, 0.68);
+      border-left: 0;
+      border-right: 0;
+      border-top: 0;
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      font-size: 13px;
+      text-align: left;
+    }}
+    .orbit-mini-row:last-child {{ border-bottom: 0; }}
+    .orbit-mini-row strong {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .orbit-timeline {{
+      width: 100%;
+      accent-color: #56cc9d;
     }}
     .artist-stats-layout {{
       padding: 14px 16px 32px;
@@ -2376,7 +2596,16 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       #artist-network {{
         height: 70vh;
       }}
+      .orbit-layout {{
+        grid-template-columns: 1fr;
+        height: auto;
+        overflow: visible;
+      }}
+      .orbit-main {{
+        min-height: 72vh;
+      }}
       .artist-sidebar {{ border-left: none; border-top: 1px solid var(--border); }}
+      .orbit-sidebar {{ border-left: none; border-top: 1px solid var(--border); }}
       .sidebar {{ border-left: none; border-top: 1px solid var(--border); }}
     }}
     @media (max-width: 680px) {{
@@ -2407,6 +2636,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     <div class=\"app-tabs\" aria-label=\"Dashboard mode\">
       <button id=\"graph-mode-button\" class=\"active\" type=\"button\">Graph</button>
       <button id=\"trending-mode-button\" type=\"button\">Trending</button>
+      <button id=\"orbit-mode-button\" type=\"button\">Song Orbit</button>
       <button id=\"artist-mode-button\" type=\"button\">Artists</button>
       <button id=\"stats-mode-button\" type=\"button\">Artist Stats</button>
     </div>
@@ -2499,6 +2729,55 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       <div class=\"trending-empty\" id=\"trending-empty\" hidden>No timestamped plays at this point in the timeline.</div>
       <div class=\"trending-stage\" id=\"trending-stage\"></div>
     </section>
+  </main>
+  <main class=\"orbit-layout\">
+    <section class=\"orbit-main\">
+      <div class=\"orbit-canvas-wrap\">
+        <canvas id=\"song-orbit-canvas\"></canvas>
+        <div class=\"orbit-hint\">Drag to pan · wheel to zoom · drag a song to nudge it</div>
+      </div>
+    </section>
+    <aside class=\"orbit-sidebar\">
+      <section class=\"card\">
+        <h2>Song Orbit</h2>
+        <div class=\"muted\" id=\"orbit-subtitle\"></div>
+        <div class=\"orbit-controls\" style=\"margin-top: 12px;\">
+          <label>
+            Recent window
+            <input id=\"orbit-window-days\" type=\"number\" min=\"1\" max=\"365\" value=\"30\" step=\"1\">
+          </label>
+          <label>
+            Labels
+            <input id=\"orbit-label-limit\" type=\"number\" min=\"0\" max=\"200\" value=\"42\" step=\"1\">
+          </label>
+          <label>
+            Search song
+            <input id=\"orbit-search\" type=\"text\" placeholder=\"Type part of a song name\">
+          </label>
+          <button id=\"orbit-focus-button\" type=\"button\">Focus</button>
+        </div>
+        <div class=\"metric-grid\">
+          <div class=\"metric\"><div class=\"label\">Songs</div><div class=\"value\" id=\"orbit-song-count\"></div></div>
+          <div class=\"metric\"><div class=\"label\">Recent Plays</div><div class=\"value\" id=\"orbit-recent-count\"></div></div>
+          <div class=\"metric\"><div class=\"label\">Active Songs</div><div class=\"value\" id=\"orbit-active-count\"></div></div>
+          <div class=\"metric\"><div class=\"label\">Timeline</div><div class=\"value\" id=\"orbit-timeline-span\"></div></div>
+        </div>
+      </section>
+      <section class=\"card\">
+        <h3>Timeline</h3>
+        <div class=\"muted\" id=\"orbit-date\"></div>
+        <input id=\"song-orbit-timeline\" class=\"orbit-timeline\" type=\"range\" min=\"0\" max=\"1000\" value=\"1000\" step=\"1\">
+      </section>
+      <section class=\"card\">
+        <h3>Recent Gravity</h3>
+        <div id=\"orbit-recent-list\" class=\"orbit-mini-list\"></div>
+      </section>
+      <section class=\"card\">
+        <h3>Selection</h3>
+        <div id=\"orbit-selection-summary\" class=\"muted\">Select a song dot.</div>
+        <div id=\"orbit-selection-content\"></div>
+      </section>
+    </aside>
   </main>
   <main class=\"artist-layout\">
     <section class=\"artist-main\">
@@ -2677,6 +2956,16 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     let trendingLastPlaybackFrame = null;
     const trendingColorStorageKey = 'audiotagTrendingSongColors:v1';
     let trendingColorOverrides = loadTrendingColorOverrides();
+    let orbitSongs = [];
+    let orbitSongLookup = new Map();
+    let orbitSelectedSong = null;
+    let orbitHoverSong = null;
+    let orbitPoints = [];
+    let orbitManualOffsets = new Map();
+    let orbitView = {{ x: 0, y: 0, scale: 1 }};
+    let orbitDrag = null;
+    let orbitAnimationFrame = null;
+    let orbitHasFit = false;
 
     const container = document.getElementById('network');
     const networkStatus = document.getElementById('network-status');
@@ -2687,6 +2976,11 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     const trendingEmpty = document.getElementById('trending-empty');
     const trendingPlayToggle = document.getElementById('trending-play-toggle');
     const trendingPlaySpeed = document.getElementById('trending-play-speed');
+    const songOrbitCanvas = document.getElementById('song-orbit-canvas');
+    const songOrbitTimeline = document.getElementById('song-orbit-timeline');
+    const orbitWindowDays = document.getElementById('orbit-window-days');
+    const orbitLabelLimit = document.getElementById('orbit-label-limit');
+    const orbitSearch = document.getElementById('orbit-search');
     const secondsPerDay = 86400;
     const artistContainer = document.getElementById('artist-network');
     const artistTimeline = document.getElementById('artist-timeline');
@@ -2979,6 +3273,13 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       return Array.from(new Set(keys));
     }}
 
+    function defaultTrendingColorSeed(songName) {{
+      if (songName.includes('/')) {{
+        return songName.split('/').slice(1).join('/');
+      }}
+      return songName;
+    }}
+
     function mutedSongColors(songName) {{
       const override = fallbackColorKeys(songName)
         .map((key) => trendingColorOverrides[key])
@@ -2998,7 +3299,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
         ['#8b7aa2', '#ada2bd'],
         ['#5f8e9e', '#95b1ba'],
       ];
-      const index = hashString(songName) % palette.length;
+      const index = hashString(defaultTrendingColorSeed(songName)) % palette.length;
       return {{ a: palette[index][0], b: palette[index][1] }};
     }}
 
@@ -3043,6 +3344,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
 
     function applyTrendingData(nextTrendingData) {{
       const keepAtEnd = Number(trendingTimeline.value || 0) >= Number(trendingTimeline.max || 1);
+      const keepOrbitAtEnd = Number(songOrbitTimeline.value || 0) >= Number(songOrbitTimeline.max || 1);
       trendingData = nextTrendingData || trendingData;
       const summary = trendingData.summary || {{}};
       trendingSongs = (trendingData.songs || []).map((song) => ({{
@@ -3060,13 +3362,19 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       document.getElementById('trending-song-count').textContent = formatNumber(summary.songCount);
       document.getElementById('trending-event-count').textContent = formatNumber(summary.historyEventCount);
       trendingTimeline.disabled = !summary.timelinePointCount;
+      songOrbitTimeline.disabled = !summary.timelinePointCount;
       if (keepAtEnd) {{
         trendingTimeline.value = trendingTimeline.max;
+      }}
+      if (keepOrbitAtEnd) {{
+        songOrbitTimeline.value = songOrbitTimeline.max;
       }}
       if (trendingTimeline.disabled) {{
         stopTrendingPlayback();
       }}
       renderTrending();
+      buildOrbitSongs();
+      renderSongOrbit();
     }}
 
     function renderTrending() {{
@@ -3251,6 +3559,534 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       trendingPlayAnimationFrame = requestAnimationFrame(stepTrendingPlayback);
     }}
 
+    function orbitTimestamp() {{
+      const ratio = Math.max(0, Math.min(1, Number(songOrbitTimeline.value || 0) / Number(songOrbitTimeline.max || 1)));
+      return trendingFirstTimestamp + ((trendingLastTimestamp - trendingFirstTimestamp) * ratio);
+    }}
+
+    function buildOrbitSongs() {{
+      const trendByName = new Map(trendingSongs.map((song) => [song.name, song]));
+      orbitSongs = (allNodes || []).map((node) => {{
+        const trend = trendByName.get(node.id) || trendByName.get(node.label) || {{}};
+        const timestamps = Array.isArray(trend.timestamps) ? trend.timestamps : [];
+        return {{
+          id: node.id,
+          name: node.id,
+          label: node.label || node.id,
+          sourceGroup: node.sourceGroup || null,
+          playCount: Number(node.playCount || trend.playCount || 0),
+          historyCount: Number(node.historyCount || trend.historyCount || timestamps.length || 0),
+          durationSeconds: Number(node.durationSeconds || trend.durationSeconds || 0),
+          listenTimeSeconds: Number(node.listenTimeSeconds || 0),
+          timestamps,
+          angle: (hashString(node.id) % 62831) / 10000,
+        }};
+      }});
+      orbitSongLookup = new Map(orbitSongs.map((song) => [song.id, song]));
+      if (orbitSelectedSong && !orbitSongLookup.has(orbitSelectedSong)) {{
+        orbitSelectedSong = null;
+      }}
+    }}
+
+    function countRecentSongPlays(timestamps, startTimestamp, endTimestamp) {{
+      let count = 0;
+      let lastListen = null;
+      for (const timestamp of timestamps || []) {{
+        if (timestamp > endTimestamp) {{
+          break;
+        }}
+        if (timestamp >= startTimestamp) {{
+          count += 1;
+          lastListen = timestamp;
+        }}
+      }}
+      return {{ count, lastListen }};
+    }}
+
+    function scoreOrbitSong(song, timestamp, windowDays) {{
+      const windowSeconds = Math.max(1, Number(windowDays || 30) * secondsPerDay);
+      const startTimestamp = timestamp - windowSeconds;
+      const recent = countRecentSongPlays(song.timestamps, startTimestamp, timestamp);
+      let score = 0;
+      for (const playedAt of song.timestamps || []) {{
+        if (playedAt > timestamp) {{
+          break;
+        }}
+        const age = timestamp - playedAt;
+        if (age <= windowSeconds) {{
+          score += Math.pow(2, -age / Math.max(1, windowSeconds / 4));
+        }}
+      }}
+      return {{
+        ...recent,
+        score,
+        ageDays: recent.lastListen ? Math.max(0, (timestamp - recent.lastListen) / secondsPerDay) : Infinity,
+      }};
+    }}
+
+    function orbitColor(song, scored, maxScore) {{
+      if (scored.score > 0) {{
+        const heat = Math.max(0, Math.min(1, scored.score / Math.max(1, maxScore)));
+        return mixHex('#56cc9d', '#eb5757', heat * 0.88);
+      }}
+      if (song.sourceGroup === 'mid-mp3s') {{
+        return '#ff9f5a';
+      }}
+      return '#5aa9ff';
+    }}
+
+    function orbitBasePosition(song, scored, maxScore, index) {{
+      const minimumRadius = 95;
+      const maximumRadius = Math.max(360, 90 + Math.sqrt(Math.max(1, orbitSongs.length)) * 58);
+      const heat = Math.max(0, Math.min(1, scored.score / Math.max(1, maxScore)));
+      const ageRatio = Number.isFinite(scored.ageDays)
+        ? Math.max(0, Math.min(1, scored.ageDays / Math.max(1, Number(orbitWindowDays.value || 30))))
+        : 1;
+      const radius = minimumRadius + (maximumRadius - minimumRadius) * Math.max(0.08, Math.min(1, ageRatio * 0.82 + (1 - heat) * 0.18));
+      const drift = Math.sin((song.angle * 1.7) + index) * 0.08;
+      const angle = song.angle + drift;
+      return {{
+        x: Math.cos(angle) * radius,
+        y: Math.sin(angle) * radius,
+        radius,
+      }};
+    }}
+
+    function orbitBorderColor(song, scored) {{
+      if (scored.score > 0) {{
+        return '#eb5757';
+      }}
+      if (song.sourceGroup === 'mid-mp3s') {{
+        return '#d66d1f';
+      }}
+      return '#1f6fd6';
+    }}
+
+    function buildOrbitPoint(song, scored, maxScore, maxPlayCount, labelIds, query, index) {{
+      const basePosition = orbitBasePosition(song, scored, maxScore, index);
+      const offset = orbitManualOffsets.get(song.id) || {{ x: 0, y: 0 }};
+      const heatSize = 15 + 36 * Math.sqrt(Math.max(0, scored.score) / maxScore);
+      const playSize = 9 + 18 * Math.sqrt(Math.max(0, song.playCount) / maxPlayCount);
+      const size = Math.max(9, Math.min(54, heatSize + playSize * 0.34));
+      const matchesQuery = !query || song.label.toLowerCase().includes(query);
+      return {{
+        id: song.id,
+        label: song.label,
+        x: basePosition.x + offset.x,
+        y: basePosition.y + offset.y,
+        size,
+        color: orbitSelectedSong === song.id ? '#ff8a65' : orbitColor(song, scored, maxScore),
+        borderColor: orbitSelectedSong === song.id ? '#eb5757' : orbitBorderColor(song, scored),
+        dimmed: Boolean(query && !matchesQuery),
+        showLabel: labelIds.has(song.id),
+        score: scored.score,
+        recentCount: scored.count,
+        lastListen: scored.lastListen,
+        ageDays: scored.ageDays,
+        playCount: song.playCount,
+        historyCount: song.historyCount,
+        durationSeconds: song.durationSeconds,
+      }};
+    }}
+
+    function resizeOrbitCanvas() {{
+      if (!songOrbitCanvas) {{
+        return {{ width: 0, height: 0, dpr: 1 }};
+      }}
+      const rect = songOrbitCanvas.getBoundingClientRect();
+      const width = Math.max(1, rect.width || 1);
+      const height = Math.max(1, rect.height || 1);
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const nextWidth = Math.round(width * dpr);
+      const nextHeight = Math.round(height * dpr);
+      if (songOrbitCanvas.width !== nextWidth || songOrbitCanvas.height !== nextHeight) {{
+        songOrbitCanvas.width = nextWidth;
+        songOrbitCanvas.height = nextHeight;
+      }}
+      return {{ width, height, dpr }};
+    }}
+
+    function orbitWorldToScreen(point, dimensions = null) {{
+      const dims = dimensions || resizeOrbitCanvas();
+      return {{
+        x: dims.width / 2 + orbitView.x + point.x * orbitView.scale,
+        y: dims.height / 2 + orbitView.y + point.y * orbitView.scale,
+      }};
+    }}
+
+    function orbitScreenToWorld(x, y, dimensions = null) {{
+      const dims = dimensions || resizeOrbitCanvas();
+      return {{
+        x: (x - dims.width / 2 - orbitView.x) / orbitView.scale,
+        y: (y - dims.height / 2 - orbitView.y) / orbitView.scale,
+      }};
+    }}
+
+    function fitOrbitView(dimensions = null) {{
+      const dims = dimensions || resizeOrbitCanvas();
+      const farthest = orbitPoints.reduce((maxValue, point) => {{
+        return Math.max(maxValue, Math.hypot(point.x, point.y) + point.size + 80);
+      }}, 420);
+      orbitView.scale = Math.max(0.18, Math.min(1.25, Math.min(dims.width, dims.height) / (2 * farthest)));
+      orbitView.x = 0;
+      orbitView.y = 0;
+      orbitHasFit = true;
+    }}
+
+    function drawOrbitText(ctx, text, x, y, maxWidth, align = 'left') {{
+      const label = String(text || '');
+      if (!label) {{
+        return;
+      }}
+      let output = label;
+      while (ctx.measureText(output).width > maxWidth && output.length > 4) {{
+        output = `${{output.slice(0, -4)}}...`;
+      }}
+      ctx.textAlign = align;
+      ctx.fillText(output, x, y);
+    }}
+
+    function drawSongOrbit() {{
+      if (!songOrbitCanvas) {{
+        return;
+      }}
+      orbitAnimationFrame = null;
+      const dims = resizeOrbitCanvas();
+      const ctx = songOrbitCanvas.getContext('2d');
+      if (!ctx) {{
+        return;
+      }}
+      ctx.setTransform(dims.dpr, 0, 0, dims.dpr, 0, 0);
+      ctx.clearRect(0, 0, dims.width, dims.height);
+      ctx.fillStyle = '#f9fcff';
+      ctx.fillRect(0, 0, dims.width, dims.height);
+
+      const origin = orbitWorldToScreen({{ x: 0, y: 0 }}, dims);
+      const ringRadii = [95, 220, 360, Math.max(480, 90 + Math.sqrt(Math.max(1, orbitSongs.length)) * 58)];
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = 'rgba(94, 122, 147, 0.22)';
+      ctx.fillStyle = 'rgba(93, 114, 136, 0.86)';
+      ctx.font = '700 12px Inter, system-ui, sans-serif';
+      ringRadii.forEach((radius, index) => {{
+        ctx.beginPath();
+        ctx.arc(origin.x, origin.y, radius * orbitView.scale, 0, Math.PI * 2);
+        ctx.stroke();
+        const label = index === 0
+          ? 'now'
+          : index === 1
+            ? `${{Math.max(1, Math.round(Number(orbitWindowDays.value || 30) / 4))}}d`
+            : index === 2
+              ? `${{Math.max(1, Math.round(Number(orbitWindowDays.value || 30)))}}d`
+              : 'older';
+        ctx.fillText(label, origin.x + radius * orbitView.scale + 8, origin.y - 7);
+      }});
+
+      ctx.beginPath();
+      ctx.arc(origin.x, origin.y, Math.max(20, 46 * orbitView.scale), 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#2f80ed';
+      ctx.stroke();
+      ctx.fillStyle = '#255ea8';
+      ctx.font = '800 13px Inter, system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('RECENT', origin.x, origin.y + 4);
+
+      const sortedPoints = orbitPoints.slice().sort((left, right) => {{
+        const leftRank = (left.id === orbitSelectedSong ? 2 : left.id === orbitHoverSong ? 1 : 0);
+        const rightRank = (right.id === orbitSelectedSong ? 2 : right.id === orbitHoverSong ? 1 : 0);
+        return leftRank - rightRank || left.size - right.size;
+      }});
+
+      for (const point of sortedPoints) {{
+        const screen = orbitWorldToScreen(point, dims);
+        const radius = Math.max(4.5, Math.min(42, point.size * Math.sqrt(orbitView.scale)));
+        ctx.globalAlpha = point.dimmed ? 0.18 : 1;
+        if (point.score > 0) {{
+          ctx.beginPath();
+          ctx.arc(screen.x, screen.y, radius + 5, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(235, 87, 87, 0.12)';
+          ctx.fill();
+        }}
+        ctx.beginPath();
+        ctx.arc(screen.x, screen.y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = point.color;
+        ctx.fill();
+        ctx.lineWidth = point.id === orbitSelectedSong ? 3 : 1.8;
+        ctx.strokeStyle = point.id === orbitSelectedSong ? '#eb5757' : 'rgba(255, 255, 255, 0.95)';
+        ctx.stroke();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = point.borderColor;
+        ctx.stroke();
+        if (point.showLabel || point.id === orbitHoverSong || point.id === orbitSelectedSong) {{
+          ctx.font = `${{point.score > 0 ? '800' : '700'}} 12px Inter, system-ui, sans-serif`;
+          const textWidth = Math.min(190, ctx.measureText(point.label).width + 14);
+          const labelX = screen.x + radius + 8;
+          const labelY = screen.y - 10;
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.86)';
+          ctx.strokeStyle = 'rgba(200, 216, 232, 0.9)';
+          ctx.lineWidth = 1;
+          const boxHeight = 22;
+          const boxY = labelY - 14;
+          ctx.beginPath();
+          if (typeof ctx.roundRect === 'function') {{
+            ctx.roundRect(labelX, boxY, textWidth, boxHeight, 8);
+          }} else {{
+            ctx.rect(labelX, boxY, textWidth, boxHeight);
+          }}
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = '#142130';
+          drawOrbitText(ctx, point.label, labelX + 7, labelY + 1, textWidth - 14);
+        }}
+      }}
+      ctx.globalAlpha = 1;
+    }}
+
+    function renderSongOrbit(options = {{}}) {{
+      if (!songOrbitCanvas) {{
+        return;
+      }}
+      const canvasRect = songOrbitCanvas.getBoundingClientRect();
+      const canvasIsVisible = canvasRect.width > 20 && canvasRect.height > 20;
+      const timestamp = orbitTimestamp();
+      const windowDays = Math.max(1, Math.min(365, Number(orbitWindowDays.value || 30)));
+      orbitWindowDays.value = windowDays;
+      const labelLimit = Math.max(0, Math.min(200, Number(orbitLabelLimit.value || 0)));
+      orbitLabelLimit.value = labelLimit;
+      const query = String(orbitSearch.value || '').trim().toLowerCase();
+      buildOrbitSongs();
+
+      const scoredSongs = orbitSongs.map((song) => ({{
+        ...song,
+        orbit: scoreOrbitSong(song, timestamp, windowDays),
+      }}));
+      const maxScore = Math.max(1, ...scoredSongs.map((song) => song.orbit.score));
+      const maxPlayCount = Math.max(1, ...scoredSongs.map((song) => song.playCount));
+      const recentCount = scoredSongs.reduce((sum, song) => sum + song.orbit.count, 0);
+      const activeSongs = scoredSongs.filter((song) => song.orbit.count > 0).length;
+      const labelIds = new Set(scoredSongs
+        .slice()
+        .sort((left, right) => right.orbit.score - left.orbit.score || right.playCount - left.playCount || left.label.localeCompare(right.label))
+        .slice(0, labelLimit)
+        .map((song) => song.id));
+      if (orbitSelectedSong) {{
+        labelIds.add(orbitSelectedSong);
+      }}
+      if (query) {{
+        scoredSongs.filter((song) => song.label.toLowerCase().includes(query)).slice(0, 20).forEach((song) => labelIds.add(song.id));
+      }}
+
+      document.getElementById('orbit-subtitle').textContent =
+        `${{graphData.summary.folder || '-'}} · pan, zoom, and drag like the graph`;
+      document.getElementById('orbit-song-count').textContent = formatNumber(scoredSongs.length);
+      document.getElementById('orbit-recent-count').textContent = formatNumber(recentCount);
+      document.getElementById('orbit-active-count').textContent = formatNumber(activeSongs);
+      document.getElementById('orbit-timeline-span').textContent =
+        trendingFirstTimestamp && trendingLastTimestamp
+          ? `${{Math.max(0, Math.ceil((trendingLastTimestamp - trendingFirstTimestamp) / secondsPerDay))}}d`
+          : '-';
+      document.getElementById('orbit-date').textContent = songOrbitTimeline.disabled
+        ? 'No timestamped plays yet.'
+        : `Through ${{formatDateTime(timestamp)}}`;
+
+      orbitPoints = scoredSongs.map((song, index) =>
+        buildOrbitPoint(song, song.orbit, maxScore, maxPlayCount, labelIds, query, index)
+      );
+      if (!orbitHasFit || options.resetView) {{
+        if (canvasIsVisible) {{
+          fitOrbitView();
+        }}
+      }}
+
+      renderOrbitRecentList(scoredSongs);
+      if (orbitSelectedSong) {{
+        showOrbitSelection(orbitSelectedSong, scoredSongs.find((song) => song.id === orbitSelectedSong));
+      }}
+      if (canvasIsVisible) {{
+        requestOrbitDraw();
+      }}
+    }}
+
+    function requestOrbitDraw() {{
+      if (orbitAnimationFrame !== null) {{
+        return;
+      }}
+      orbitAnimationFrame = requestAnimationFrame(drawSongOrbit);
+    }}
+
+    function orbitPointAt(canvasX, canvasY) {{
+      for (let index = orbitPoints.length - 1; index >= 0; index -= 1) {{
+        const point = orbitPoints[index];
+        const screen = orbitWorldToScreen(point);
+        const radius = Math.max(7, Math.min(46, point.size * Math.sqrt(orbitView.scale))) + 4;
+        if (Math.hypot(canvasX - screen.x, canvasY - screen.y) <= radius) {{
+          return point;
+        }}
+      }}
+      return null;
+    }}
+
+    function renderOrbitRecentList(scoredSongs) {{
+      const container = document.getElementById('orbit-recent-list');
+      const rows = scoredSongs
+        .filter((song) => song.orbit.score > 0)
+        .sort((left, right) => right.orbit.score - left.orbit.score || left.label.localeCompare(right.label))
+        .slice(0, 14);
+      container.innerHTML = rows.map((song) => `
+        <button class=\"orbit-mini-row\" type=\"button\" data-song-id=\"${{escapeHtml(song.id)}}\" title=\"${{escapeHtml(song.label)}}\">
+          <strong>${{escapeHtml(song.label)}}</strong>
+          <span>+${{formatScore(song.orbit.score)}}</span>
+        </button>
+      `).join('') || '<div class=\"muted\">No recent plays in this window.</div>';
+      container.querySelectorAll('button[data-song-id]').forEach((button) => {{
+        button.addEventListener('click', () => selectOrbitSong(button.dataset.songId));
+      }});
+    }}
+
+    function showOrbitSelection(songId, scoredSong = null) {{
+      const song = scoredSong || orbitSongLookup.get(songId);
+      if (!song) {{
+        return;
+      }}
+      const scored = scoredSong ? scoredSong.orbit : scoreOrbitSong(song, orbitTimestamp(), Number(orbitWindowDays.value || 30));
+      document.getElementById('orbit-selection-summary').innerHTML = `<strong>${{escapeHtml(song.label)}}</strong>`;
+      document.getElementById('orbit-selection-content').innerHTML = `
+        <div class=\"metric-grid\">
+          <div class=\"metric\"><div class=\"label\">Recent plays</div><div class=\"value\">${{formatNumber(scored.count)}}</div></div>
+          <div class=\"metric\"><div class=\"label\">Recent score</div><div class=\"value\">+${{formatScore(scored.score)}}</div></div>
+          <div class=\"metric\"><div class=\"label\">Total plays</div><div class=\"value\">${{formatNumber(song.playCount)}}</div></div>
+          <div class=\"metric\"><div class=\"label\">History</div><div class=\"value\">${{formatNumber(song.historyCount)}}</div></div>
+          <div class=\"metric\"><div class=\"label\">Duration</div><div class=\"value\">${{formatDuration(song.durationSeconds)}}</div></div>
+          <div class=\"metric\"><div class=\"label\">Last listen</div><div class=\"value\" style=\"font-size:13px;\">${{scored.lastListen ? formatDateTime(scored.lastListen) : '-'}}</div></div>
+        </div>
+      `;
+    }}
+
+    function selectOrbitSong(songId) {{
+      orbitSelectedSong = songId;
+      showOrbitSelection(songId);
+      renderSongOrbit();
+      const point = orbitPoints.find((item) => item.id === songId);
+      if (point) {{
+        orbitView.x = -point.x * orbitView.scale;
+        orbitView.y = -point.y * orbitView.scale;
+        requestOrbitDraw();
+      }}
+    }}
+
+    function focusOrbitSong() {{
+      const query = String(orbitSearch.value || '').trim().toLowerCase();
+      if (!query) {{
+        renderSongOrbit();
+        return;
+      }}
+      const match = orbitSongs.find((song) => song.label.toLowerCase().includes(query));
+      if (!match) {{
+        document.getElementById('orbit-selection-summary').textContent = `No song matched "${{query}}".`;
+        document.getElementById('orbit-selection-content').innerHTML = '';
+        renderSongOrbit();
+        return;
+      }}
+      orbitSelectedSong = match.id;
+      showOrbitSelection(match.id);
+      selectOrbitSong(match.id);
+    }}
+
+    function orbitCanvasPoint(event) {{
+      const rect = songOrbitCanvas.getBoundingClientRect();
+      return {{
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+      }};
+    }}
+
+    function handleOrbitPointerDown(event) {{
+      if (!songOrbitCanvas) {{
+        return;
+      }}
+      const point = orbitCanvasPoint(event);
+      const hit = orbitPointAt(point.x, point.y);
+      songOrbitCanvas.classList.add('dragging');
+      if (hit) {{
+        const world = orbitScreenToWorld(point.x, point.y);
+        orbitSelectedSong = hit.id;
+        showOrbitSelection(hit.id);
+        orbitDrag = {{
+          type: 'node',
+          id: hit.id,
+          startWorld: world,
+          startOffset: orbitManualOffsets.get(hit.id) || {{ x: 0, y: 0 }},
+        }};
+      }} else {{
+        orbitDrag = {{
+          type: 'pan',
+          startX: point.x,
+          startY: point.y,
+          startView: {{ ...orbitView }},
+        }};
+      }}
+      requestOrbitDraw();
+    }}
+
+    function handleOrbitPointerMove(event) {{
+      if (!songOrbitCanvas) {{
+        return;
+      }}
+      const point = orbitCanvasPoint(event);
+      if (orbitDrag) {{
+        if (orbitDrag.type === 'pan') {{
+          orbitView.x = orbitDrag.startView.x + point.x - orbitDrag.startX;
+          orbitView.y = orbitDrag.startView.y + point.y - orbitDrag.startY;
+        }} else {{
+          const world = orbitScreenToWorld(point.x, point.y);
+          orbitManualOffsets.set(orbitDrag.id, {{
+            x: orbitDrag.startOffset.x + world.x - orbitDrag.startWorld.x,
+            y: orbitDrag.startOffset.y + world.y - orbitDrag.startWorld.y,
+          }});
+          renderSongOrbit();
+          return;
+        }}
+        requestOrbitDraw();
+        return;
+      }}
+      const hit = orbitPointAt(point.x, point.y);
+      const nextHover = hit ? hit.id : null;
+      if (nextHover !== orbitHoverSong) {{
+        orbitHoverSong = nextHover;
+        songOrbitCanvas.style.cursor = hit ? 'pointer' : 'grab';
+        requestOrbitDraw();
+      }}
+    }}
+
+    function handleOrbitPointerUp() {{
+      orbitDrag = null;
+      if (songOrbitCanvas) {{
+        songOrbitCanvas.classList.remove('dragging');
+      }}
+    }}
+
+    function handleOrbitWheel(event) {{
+      if (!songOrbitCanvas) {{
+        return;
+      }}
+      event.preventDefault();
+      const point = orbitCanvasPoint(event);
+      const before = orbitScreenToWorld(point.x, point.y);
+      const zoomFactor = Math.exp(-event.deltaY * 0.001);
+      orbitView.scale = Math.max(0.12, Math.min(3.5, orbitView.scale * zoomFactor));
+      const dims = resizeOrbitCanvas();
+      orbitView.x = point.x - dims.width / 2 - before.x * orbitView.scale;
+      orbitView.y = point.y - dims.height / 2 - before.y * orbitView.scale;
+      requestOrbitDraw();
+    }}
+
+    function resetOrbitView() {{
+      fitOrbitView();
+      requestOrbitDraw();
+    }}
+
     function decodeArtistHistory(encoded) {{
       return decodeTrendingTimestamps(encoded);
     }}
@@ -3280,7 +4116,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       document.getElementById('artist-unassigned-songs').textContent = formatNumber(summary.unassignedSongCount);
       document.getElementById('artist-edge-count').textContent = formatNumber(summary.artistEdgeCount);
       document.getElementById('artist-stats-subtitle').textContent =
-        `${{summary.folder || '-'}} · moving artist plots use timestamped plays only`;
+        `${{summary.folder || '-'}} · untagged MP3s are available in the artist selector`;
       document.getElementById('stats-artist-count').textContent = formatNumber(summary.artistCount);
       document.getElementById('stats-tagged-plays').textContent = formatNumber(summary.taggedPlayCount);
       document.getElementById('stats-unassigned-plays').textContent = formatNumber(summary.unassignedPlayCount);
@@ -3704,21 +4540,46 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       return artistWeeklyData;
     }}
 
+    function getUnassignedArtistNode() {{
+      const node = artistData.unassignedArtist || null;
+      if (!node || !Array.isArray(node.songDetails) || !node.songDetails.length) {{
+        return null;
+      }}
+      return node;
+    }}
+
     function findArtistNodeByName(name) {{
       if (!name) {{
         return null;
       }}
       const normalized = String(name).toLowerCase();
+      const unassignedNode = getUnassignedArtistNode();
+      if (unassignedNode) {{
+        const unassignedKeys = [
+          unassignedNode.label,
+          unassignedNode.id,
+          'untagged',
+          'unassigned',
+        ].map((value) => String(value || '').toLowerCase());
+        if (unassignedKeys.includes(normalized)) {{
+          return unassignedNode;
+        }}
+      }}
       return (((artistData.artistGraph || {{}}).nodes || []).find((node) =>
         String(node.label || node.id || '').toLowerCase() === normalized
       )) || null;
     }}
 
     function getSortedArtistNodes() {{
-      return ((artistData.artistGraph || {{}}).nodes || [])
+      const artists = ((artistData.artistGraph || {{}}).nodes || [])
         .filter((node) => node && node.label)
         .slice()
         .sort((left, right) => Number(right.playCount || 0) - Number(left.playCount || 0) || String(left.label || '').localeCompare(String(right.label || '')));
+      const unassignedNode = getUnassignedArtistNode();
+      if (unassignedNode) {{
+        artists.push(unassignedNode);
+      }}
+      return artists;
     }}
 
     function populateArtistInspectorSelect() {{
@@ -4421,14 +5282,17 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     function setAppMode(mode) {{
       const isTrending = mode === 'trending';
       const isArtist = mode === 'artist';
+      const isOrbit = mode === 'orbit';
       const isStats = mode === 'stats';
-      const isGraph = !isTrending && !isArtist && !isStats;
+      const isGraph = !isTrending && !isArtist && !isOrbit && !isStats;
       document.body.classList.toggle('trending-mode', isTrending);
       document.body.classList.toggle('artist-mode', isArtist);
+      document.body.classList.toggle('orbit-mode', isOrbit);
       document.body.classList.toggle('stats-mode', isStats);
       document.body.classList.toggle('graph-mode', isGraph);
       document.getElementById('graph-mode-button').classList.toggle('active', isGraph);
       document.getElementById('trending-mode-button').classList.toggle('active', isTrending);
+      document.getElementById('orbit-mode-button').classList.toggle('active', isOrbit);
       document.getElementById('artist-mode-button').classList.toggle('active', isArtist);
       document.getElementById('stats-mode-button').classList.toggle('active', isStats);
       if (isGraph && network) {{
@@ -4441,6 +5305,11 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       if (isTrending) {{
         stopArtistStatsPlayback();
         renderTrending();
+      }}
+      if (isOrbit) {{
+        stopTrendingPlayback();
+        stopArtistStatsPlayback();
+        window.setTimeout(renderSongOrbit, 0);
       }}
       if (isArtist && artistNetwork) {{
         stopTrendingPlayback();
@@ -4499,6 +5368,8 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       allNodes = graphData.nodes || [];
       allEdges = graphData.edges || [];
       rebuildLookups();
+      orbitHasFit = false;
+      orbitManualOffsets.clear();
 
       if (options.clearSelection || (selectedNodeId && !nodeLookup.has(selectedNodeId))) {{
         selectedNodeId = null;
@@ -4515,6 +5386,8 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       }} else {{
         refreshGraph({{ relayout: Boolean(options.relayout) }});
       }}
+      buildOrbitSongs();
+      renderSongOrbit();
 
       if (selectedNodeId) {{
         network.selectNodes([selectedNodeId]);
@@ -4812,6 +5685,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     }});
     document.getElementById('graph-mode-button').addEventListener('click', () => setAppMode('graph'));
     document.getElementById('trending-mode-button').addEventListener('click', () => setAppMode('trending'));
+    document.getElementById('orbit-mode-button').addEventListener('click', () => setAppMode('orbit'));
     document.getElementById('artist-mode-button').addEventListener('click', () => setAppMode('artist'));
     document.getElementById('stats-mode-button').addEventListener('click', () => setAppMode('stats'));
     document.getElementById('artist-transition-button').addEventListener('click', () => {{
@@ -4857,6 +5731,28 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
         trendingLastPlaybackFrame = null;
       }}
     }});
+    songOrbitTimeline.addEventListener('input', renderSongOrbit);
+    orbitWindowDays.addEventListener('input', renderSongOrbit);
+    orbitLabelLimit.addEventListener('input', renderSongOrbit);
+    orbitSearch.addEventListener('input', renderSongOrbit);
+    document.getElementById('orbit-focus-button').addEventListener('click', focusOrbitSong);
+    orbitSearch.addEventListener('keydown', (event) => {{
+      if (event.key === 'Enter') {{
+        focusOrbitSong();
+      }}
+    }});
+    if (songOrbitCanvas) {{
+      songOrbitCanvas.addEventListener('pointerdown', handleOrbitPointerDown);
+      songOrbitCanvas.addEventListener('pointermove', handleOrbitPointerMove);
+      songOrbitCanvas.addEventListener('pointerup', handleOrbitPointerUp);
+      songOrbitCanvas.addEventListener('pointerleave', handleOrbitPointerUp);
+      songOrbitCanvas.addEventListener('wheel', handleOrbitWheel, {{ passive: false }});
+      songOrbitCanvas.addEventListener('dblclick', resetOrbitView);
+      window.addEventListener('resize', () => {{
+        orbitHasFit = false;
+        renderSongOrbit({{ resetView: true }});
+      }});
+    }}
 
     async function pollGraphData() {{
       if (!liveConfig.enabled) {{

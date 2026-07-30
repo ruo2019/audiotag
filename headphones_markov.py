@@ -45,8 +45,24 @@ MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_MP3_FOLDER = Path("static/mp3")
 DEFAULT_MID_MP3_FOLDER = Path("static/mid-mp3s")
 DEFAULT_TAGS_FILE = Path("tags.json")
+DEFAULT_ARTISTS_FILE = Path("artists.json")
+DEFAULT_MID_ARTISTS_FILE = Path("mid_artists.json")
 DEFAULT_SAMPLE_MP3 = "Deep Stone Crypt Theme.mp3"
 PLAYLISTS_FILE = "queue_playlists.json"
+DOWNLOAD_LIST_FILE = "download_list.txt"
+DOWNLOAD_LIST_BLANK_AFTER_DAYS = 3
+AUTO_COMMIT_STATE_DEFAULT_DAYS = 1
+AUTO_COMMIT_STATE_CHECK_SECONDS = 10 * 60
+AUTO_COMMIT_STATE_PATTERNS = (
+    "listen_counts*.json",
+    "listen_timestamps*.json",
+    "tags.json",
+    "mid_tags.json",
+    "artists.json",
+    "mid_artists.json",
+    "queue_playlists*.json",
+    DOWNLOAD_LIST_FILE,
+)
 
 # Exit policy
 LOCK_EXIT_MINUTES = 30
@@ -59,7 +75,7 @@ DEFAULT_TOP_N = 5
 DEFAULT_YOUTUBE_TOP_N = 10
 
 # Between-track (and post-unlock) gap
-GAP_SECONDS = 5.0
+GAP_SECONDS = 7.0
 
 # Caches stored inside mp3 folder
 EMB_CACHE_VERSION = "v3"
@@ -214,6 +230,92 @@ def safe_read_json(path: Path, default: object) -> object:
         return default
 
 
+def auto_commit_state_changes(
+    cadence_days: int,
+    logging: bool = False,
+    push: bool = True,
+) -> Optional[str]:
+    if cadence_days <= 0:
+        return None
+    git = shutil.which("git")
+    if not git:
+        return None
+
+    script_dir = Path(__file__).resolve().parent
+    pathspecs = list(AUTO_COMMIT_STATE_PATTERNS)
+
+    def run_git(args: List[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [git, *args],
+            cwd=script_dir,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=check,
+        )
+
+    try:
+        if run_git(["rev-parse", "--is-inside-work-tree"]).returncode != 0:
+            return None
+
+        tracked = run_git(["ls-files", "--", *pathspecs])
+        if tracked.returncode != 0:
+            return None
+        candidate_files = {
+            line.strip() for line in tracked.stdout.splitlines() if line.strip()
+        }
+        for pattern in AUTO_COMMIT_STATE_PATTERNS:
+            candidate_files.update(
+                str(path.relative_to(script_dir))
+                for path in script_dir.glob(pattern)
+                if path.is_file()
+            )
+        if not candidate_files:
+            return None
+        changed_files = sorted(candidate_files)
+        has_untracked_state_files = any(
+            run_git(["ls-files", "--error-unmatch", "--", path]).returncode != 0
+            for path in changed_files
+        )
+
+        last = run_git(["log", "-1", "--format=%ct", "--", *pathspecs])
+        if (
+            not has_untracked_state_files
+            and last.returncode == 0
+            and last.stdout.strip()
+        ):
+            elapsed = time.time() - int(last.stdout.strip().splitlines()[0])
+            if elapsed < cadence_days * 24 * 60 * 60:
+                return None
+
+        run_git(["add", "-A", "-f", "--", *changed_files], check=True)
+        diff = run_git(["diff", "--cached", "--quiet", "--", *changed_files])
+        if diff.returncode == 0:
+            return None
+
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        message = f"Auto-commit player state {stamp}"
+        commit = run_git(["commit", "--only", "-m", message, "--", *changed_files])
+        if commit.returncode != 0:
+            if logging:
+                print(f"State auto-commit skipped: {commit.stderr.strip()}")
+            return None
+        summary = f"State auto-commit created: {message}"
+        if push:
+            push_result = run_git(["push"])
+            if push_result.returncode == 0:
+                summary += "; pushed"
+            elif logging:
+                print(f"State auto-commit push failed: {push_result.stderr.strip()}")
+        if logging:
+            print(summary)
+        return summary
+    except Exception as e:
+        if logging:
+            print(f"State auto-commit skipped: {e}")
+        return None
+
+
 # ============================== LISTEN COUNTS ==============================
 
 
@@ -293,9 +395,11 @@ class LibraryState:
     label: str
     mp3_folder: Path
     tags_file: Path
+    artists_file: Path
     listen_db_filename: str
     listen_timestamps_filename: str
     tags_data: Dict[str, List[str]]
+    artists_data: Dict[str, List[str]]
     counts: Dict[str, int]
     listen_timestamps: List[dict]
     history_duration_by_track_name: Dict[str, float]
@@ -311,6 +415,7 @@ class LibraryState:
     resolved_target_loudness: Optional[float] = None
     duration_by_stem: Dict[str, float] = field(default_factory=dict)
     active_playlist_name: Optional[str] = None
+    status_msg: str = ""
 
 
 @dataclass
@@ -348,8 +453,14 @@ def load_library_state(
 ) -> LibraryState:
     label = mp3_folder.name or "default"
     tags_data = load_tags(tags_file)
+    artists_file = default_artists_file(mp3_folder)
+    artists_data = load_artists(artists_file)
     if logging:
         print(f"Loaded {len(tags_data)} tag items from '{tags_file}' ({label}).")
+        print(
+            f"Loaded {len(artists_data)} artist items from "
+            f"'{artists_file}' ({label})."
+        )
 
     counts = load_listen_counts(mp3_folder, listen_db_filename)
     listen_timestamps_filename = listen_timestamps_filename_for_folder(mp3_folder)
@@ -377,9 +488,11 @@ def load_library_state(
         label=label,
         mp3_folder=mp3_folder,
         tags_file=tags_file,
+        artists_file=artists_file,
         listen_db_filename=listen_db_filename,
         listen_timestamps_filename=listen_timestamps_filename,
         tags_data=tags_data,
+        artists_data=artists_data,
         counts=counts,
         listen_timestamps=listen_timestamps,
         history_duration_by_track_name=history_duration_by_track_name,
@@ -574,16 +687,25 @@ def sanitize_download_title(title: str) -> str:
     return cleaned or "download"
 
 
-def parse_youtube_download_name(raw: str) -> Tuple[str, str]:
+def parse_youtube_download_name(raw: str) -> Tuple[str, str, List[str]]:
     text = raw.strip()
     if not text.endswith("]") or " [" not in text:
         raise ValueError("Use a name ending in [m] or [mm].")
     title, marker = text.rsplit(" [", 1)
+    artist_names: List[str] = []
+    if title.startswith("["):
+        match = re.match(r"^\[([^\]]+)\]\s+(.+)$", title)
+        if not match:
+            raise ValueError("Use optional artist as [artist] title [m].")
+        artist_names = split_artist_input(match.group(1))
+        if not artist_names:
+            raise ValueError("Artist prefix cannot be empty.")
+        title = match.group(2)
     title = sanitize_download_title(title)
     marker = marker[:-1].strip().lower()
     if marker not in {"m", "mm"}:
         raise ValueError("Folder marker must be [m] or [mm].")
-    return title, marker
+    return title, marker, artist_names
 
 
 def run_youtube_download(url: str, output_path: Path) -> None:
@@ -609,6 +731,61 @@ def run_youtube_download(url: str, output_path: Path) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def download_list_path(filename: str = DOWNLOAD_LIST_FILE) -> Path:
+    return Path(__file__).resolve().parent / filename
+
+
+def youtube_video_id_for_history(result: YouTubeResult) -> str:
+    if result.video_id.strip():
+        return result.video_id.strip()
+    url = result.url.strip()
+    for pattern in (
+        r"(?:\?|&)v=([A-Za-z0-9_-]{6,})",
+        r"youtu\.be/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/shorts/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/embed/([A-Za-z0-9_-]{6,})",
+    ):
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return url
+
+
+def append_download_list_entry(
+    result: YouTubeResult,
+    title: str,
+    marker: str,
+    artist_names: Optional[List[str]] = None,
+    filename: str = DOWNLOAD_LIST_FILE,
+) -> None:
+    path = download_list_path(filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    artist_prefix = ""
+    if artist_names:
+        artist_prefix = f"[{', '.join(artist_names)}] "
+    line = (
+        f"# {youtube_video_id_for_history(result)} "
+        f"{artist_prefix}{title} [{marker}]\n"
+    )
+    prefix = ""
+    if path.exists():
+        stat = path.stat()
+        should_add_blank = (
+            stat.st_size > 0
+            and (time.time() - stat.st_mtime)
+            >= DOWNLOAD_LIST_BLANK_AFTER_DAYS * 24 * 60 * 60
+        )
+        if should_add_blank:
+            prefix = "\n"
+    if path.exists() and path.stat().st_size > 0:
+        with path.open("rb") as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) not in {b"\n", b"\r"}:
+                prefix = "\n" + prefix
+    with path.open("a", encoding="utf-8") as f:
+        f.write(prefix + line)
 
 
 def load_listen_timestamps(mp3_dir: Path, db_filename: str) -> List[dict]:
@@ -896,7 +1073,7 @@ def build_audio_data_for_playlist(
     logging: bool = False,
 ) -> Tuple[float, Dict[Path, Dict[str, float | None]]]:
     if target_lufs is None:
-        sample_path = mp3_folder / sample_filename
+        sample_path = DEFAULT_MP3_FOLDER / sample_filename
         sample_key = str(sample_path)
         sample_mtime = sample_path.stat().st_mtime if sample_path.exists() else 0.0
         entry = cache.get(sample_key)
@@ -1544,7 +1721,7 @@ class CursesTUI:
             "TAB: focus visible panes (YouTube/Queue/Similar/Playlists/Most)",
             "↑/↓ PgUp/PgDn: move in focused panel",
             "→: skip track",
-            "Ctrl+G: stop",
+            "Ctrl+G: stop active tab",
             "Enter: add selected (Similar)",
             "Drag in Queue: reorder",
             "Ctrl+X: delete (Queue)",
@@ -1557,6 +1734,7 @@ class CursesTUI:
             "Most: click [by:count/time] or Ctrl+T",
             "Stats: click [Most]/[Stats], or type stats/count>200/hours>10",
             "YouTube: search at bottom; use top=10 for more results; [download] saves",
+            "YouTube download: title [m], or [artist] title [m]",
             "Playlists: click to edit, double-click to load; [add] adds tracks",
             "Playlist edit: click loop/once, drag reorder, double-click remove",
             "Ctrl+W: save queue (Playlists)",
@@ -2303,7 +2481,7 @@ class CursesTUI:
             self.status_msg = f"Skipping to next in {int(GAP_SECONDS)}s..."
         elif key == self.CTRL_G:
             self.stop_requested = True
-            self.status_msg = "Stopped. Waiting for mood..."
+            self.status_msg = "Stop requested..."
         elif key == self.CTRL_X and self.focus_panel == "queue":
             self.queue_delete = True
         elif key == self.CTRL_X and self.focus_panel == "playlists" and self.playlist_editor_open:
@@ -2770,7 +2948,17 @@ class CursesTUI:
                 self.similar_scroll = self.similar_selected - s_content_h + 1
             self.similar_scroll = min(self.similar_scroll, s_max_scroll)
             s_rows: List[str] = []
-            s_name_w = max(1, right_w - (2 + 3 + 3 + 6 + 5))
+            s_count_w = max(
+                1,
+                max(
+                    (
+                        len(str(max(0, int(counts.get(str(base), 0)))))
+                        for base, _ in entries
+                    ),
+                    default=1,
+                ),
+            )
+            s_name_w = max(1, right_w - (8 + 2 + s_count_w + 3 + 6 + 3))
             self.similar_add_col_start = (
                 right_x + 8 + s_name_w - len(playlist_add_chip)
                 if playlist_add_chip
@@ -2784,12 +2972,13 @@ class CursesTUI:
             for i in range(self.similar_scroll, min(len(entries), self.similar_scroll + s_content_h)):
                 base, score = entries[i]
                 sel = ">" if i == self.similar_selected and self.focus_panel == "similar" else " "
+                listen_count = max(0, int(counts.get(str(base), 0)))
                 if playlist_add_chip and i == self.similar_selected:
                     base_w = max(1, s_name_w - len(playlist_add_chip) - 1)
                     base = str(base)[:base_w].ljust(base_w) + " " + playlist_add_chip
                 else:
                     base = str(base)[:s_name_w].ljust(s_name_w)
-                row = f"{sel} {i+1:>3} | {base}| {score:>6.3f}  "
+                row = f"{sel} {i+1:>3} | {base}| {listen_count:>{s_count_w}} | {score:>6.3f}  "
                 s_rows.append(row)
             s_title = "[Similar]" if self.focus_panel == "similar" else " Similar "
             if similar_mood:
@@ -3110,7 +3299,7 @@ class CursesTUI:
             prompt = ""
         elif self.input_mode == "youtube_download":
             self._hline(input_y - 1, "-")
-            prompt = "name [m|mm]: "
+            prompt = "download: "
         elif self.input_mode == "youtube_search" or self.youtube_active:
             self._hline(input_y - 1, "-")
             prompt = "youtube: "
@@ -3129,7 +3318,7 @@ class CursesTUI:
         elif not self.input_buffer and self.input_mode == "youtube_search":
             self._draw(input_y, 2, prompt + "(search YouTube; optional top=10)")
         elif not self.input_buffer and self.input_mode == "youtube_download":
-            self._draw(input_y, 2, prompt + "(track name ending with [m] or [mm])")
+            self._draw(input_y, 2, prompt + "(title [m], or [artist] title [mm])")
         elif self.input_mode in ("tag_add", "tag_edit"):
             self._draw(input_y, 2, "Tags panel: type in panel, click edit/delete/close")
         else:
@@ -3138,7 +3327,7 @@ class CursesTUI:
         self._draw(
             h - 1,
             2,
-            "Tabs switch libraries/YouTube • [download] saves selected YouTube result • [add] adds to playlist • Ctrl+G stop • --help",
+            "Tabs switch libraries/YouTube • [download] saves selected YouTube result • [add] adds to playlist • Ctrl+G stops active tab • --help",
         )
 
         try:
@@ -3245,6 +3434,57 @@ def load_tags(tags_file: Path) -> Dict[str, List[str]]:
 
 def save_tags(tags_file: Path, tags_data: Dict[str, List[str]]) -> None:
     atomic_write_json(tags_file, tags_data)
+
+
+def default_artists_file(mp3_folder: Path) -> Path:
+    if mp3_folder.name == "mid-mp3s":
+        return DEFAULT_MID_ARTISTS_FILE
+    return DEFAULT_ARTISTS_FILE
+
+
+def normalize_artist_names(values: object) -> List[str]:
+    if isinstance(values, str):
+        raw_items: Iterable[object] = [values]
+    elif isinstance(values, list):
+        raw_items = values
+    elif isinstance(values, Iterable):
+        raw_items = values
+    else:
+        raw_items = []
+
+    seen = set()
+    names: List[str] = []
+    for item in raw_items:
+        name = " ".join(str(item).strip().split())
+        key = name.casefold()
+        if name and key not in seen:
+            seen.add(key)
+            names.append(name)
+    return names
+
+
+def split_artist_input(value: str) -> List[str]:
+    normalized = re.sub(r"\s+(?:and|&|\+)\s+", ",", value.strip(), flags=re.IGNORECASE)
+    parts = re.split(r"\s*[,;/]\s*", normalized)
+    return normalize_artist_names(parts)
+
+
+def load_artists(artists_file: Path) -> Dict[str, List[str]]:
+    if not artists_file.exists():
+        return {}
+    data = safe_read_json(artists_file, {})
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for key, value in data.items():
+        names = normalize_artist_names(value)
+        if names:
+            out[str(key)] = names
+    return out
+
+
+def save_artists(artists_file: Path, artists_data: Dict[str, List[str]]) -> None:
+    atomic_write_json(artists_file, artists_data)
 
 
 def add_tags_for_track(
@@ -3421,6 +3661,7 @@ def main(
     enable_tui: bool,
     listen_db_filename: str,
     playback_mode: str,
+    auto_commit_state_days: int,
     library_configs: Optional[List[Tuple[str, Path, Path, str]]] = None,
 ) -> None:
     if library_configs is None:
@@ -3527,7 +3768,24 @@ def main(
     youtube_side_duration = 0.0
     youtube_side_generation = 0
     youtube_side_lock = threading.Lock()
+    youtube_status_msg = ""
     playback_mode = str(playback_mode)
+    last_auto_commit_state_check = 0.0
+
+    def maybe_auto_commit_state(force: bool = False) -> None:
+        nonlocal last_auto_commit_state_check
+        if auto_commit_state_days <= 0:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and now - last_auto_commit_state_check < AUTO_COMMIT_STATE_CHECK_SECONDS
+        ):
+            return
+        last_auto_commit_state_check = now
+        auto_commit_state_changes(auto_commit_state_days, logging=logging)
+
+    maybe_auto_commit_state(force=True)
 
     def item_effective_play_once(item: Dict[str, object]) -> bool:
         play_once = bool(item.get("play_once"))
@@ -3584,7 +3842,20 @@ def main(
         if switch_context and current_playing_item is not None:
             skip_requeue_item = current_playing_item
 
+    def clear_finished_youtube_side_player() -> None:
+        nonlocal youtube_side_player, youtube_side_title, youtube_side_started_at
+        nonlocal youtube_side_duration
+        with youtube_side_lock:
+            proc = youtube_side_player
+            if proc is None or proc.poll() is None:
+                return
+            youtube_side_player = None
+            youtube_side_title = None
+            youtube_side_started_at = None
+            youtube_side_duration = 0.0
+
     def youtube_side_now_playing() -> str:
+        clear_finished_youtube_side_player()
         with youtube_side_lock:
             title = youtube_side_title
             proc = youtube_side_player
@@ -3592,15 +3863,25 @@ def main(
             return f"yt: {title}"
         return ""
 
+    def current_local_playback_visible() -> bool:
+        return (
+            active_tab_idx != youtube_tab_idx
+            and current_playing_item is not None
+            and queue_item_library_idx(current_playing_item) == active_library_idx
+        )
+
     def display_now_playing(local_name: str = "") -> str:
         yt_name = youtube_side_now_playing()
         if active_tab_idx == youtube_tab_idx:
             return yt_name
-        return local_name
+        return local_name if current_local_playback_visible() else ""
 
     def display_progress(local_elapsed: float, local_total: float) -> Tuple[float, float]:
-        if active_tab_idx != youtube_tab_idx:
+        if active_tab_idx != youtube_tab_idx and current_local_playback_visible():
             return local_elapsed, local_total
+        if active_tab_idx != youtube_tab_idx:
+            return 0.0, 0.0
+        clear_finished_youtube_side_player()
         with youtube_side_lock:
             started_at = youtube_side_started_at
             duration = youtube_side_duration
@@ -3646,8 +3927,7 @@ def main(
         def _run() -> None:
             nonlocal youtube_side_player, youtube_side_title, youtube_side_started_at
             nonlocal youtube_side_duration
-            if tui and tui.enable:
-                tui.status_msg = f"Resolving YouTube: {result.title}"
+            set_youtube_status(f"Resolving YouTube: {result.title}", tui)
             try:
                 direct_url, title, headers, duration = resolve_youtube_audio(result.url)
                 with youtube_side_lock:
@@ -3659,8 +3939,7 @@ def main(
                     youtube_mpv_audio_device,
                 )
             except Exception as e:
-                if tui and tui.enable:
-                    tui.status_msg = f"YouTube playback failed: {e}"
+                set_youtube_status(f"YouTube playback failed: {e}", tui)
                 with youtube_side_lock:
                     if generation == youtube_side_generation:
                         youtube_side_title = None
@@ -3677,8 +3956,7 @@ def main(
             if should_stop:
                 stop_process(proc)
                 return
-            if tui and tui.enable:
-                tui.status_msg = f"Playing YouTube alongside queue: {title}"
+            set_youtube_status(f"Playing YouTube alongside queue: {title}", tui)
             try:
                 proc.wait()
             finally:
@@ -3693,6 +3971,43 @@ def main(
 
     current_top_n = clamp_int(top_n, TOP_MIN, TOP_MAX)
     runtime_target_lufs: Optional[float] = target_lufs
+
+    def store_active_tab_status(tui: Optional[CursesTUI]) -> None:
+        nonlocal youtube_status_msg
+        if not (tui and tui.enable):
+            return
+        if active_tab_idx == youtube_tab_idx:
+            youtube_status_msg = tui.status_msg
+        else:
+            library_states[active_library_idx].status_msg = tui.status_msg
+
+    def restore_active_tab_status(tui: Optional[CursesTUI]) -> None:
+        if not (tui and tui.enable):
+            return
+        if active_tab_idx == youtube_tab_idx:
+            tui.status_msg = youtube_status_msg
+        else:
+            tui.status_msg = library_states[active_library_idx].status_msg
+
+    def set_youtube_status(message: str, tui: Optional[CursesTUI]) -> None:
+        nonlocal youtube_status_msg
+        youtube_status_msg = message
+        if tui and tui.enable and active_tab_idx == youtube_tab_idx:
+            tui.status_msg = message
+
+    def set_library_status(
+        state: LibraryState,
+        message: str,
+        tui: Optional[CursesTUI],
+    ) -> None:
+        state.status_msg = message
+        if (
+            tui
+            and tui.enable
+            and active_tab_idx != youtube_tab_idx
+            and library_states[active_library_idx] is state
+        ):
+            tui.status_msg = message
 
     def store_active_library_state() -> None:
         state = library_states[active_library_idx]
@@ -3715,6 +4030,7 @@ def main(
             return
         if idx == active_library_idx and active_tab_idx == idx:
             return
+        store_active_tab_status(tui)
         store_active_library_state()
         active_library_idx = idx
         active_tab_idx = idx
@@ -3755,12 +4071,13 @@ def main(
             tui.input_mode = "mood"
             tui.input_buffer = ""
             tui.youtube_active = False
-            tui.status_msg = f"Switched to {active_state.label}"
+            restore_active_tab_status(tui)
 
     def activate_youtube_tab(tui: Optional[CursesTUI] = None) -> None:
         nonlocal active_tab_idx
         if active_tab_idx == youtube_tab_idx:
             return
+        store_active_tab_status(tui)
         store_active_library_state()
         active_tab_idx = youtube_tab_idx
         if tui and tui.enable:
@@ -3769,7 +4086,7 @@ def main(
             tui.input_buffer = ""
             tui.tag_panel_open = False
             tui.youtube_active = True
-            tui.status_msg = "YouTube search ready."
+            restore_active_tab_status(tui)
 
     def library_state_for_item(item: Dict[str, object]) -> LibraryState:
         idx = item.get("library_idx")
@@ -3783,9 +4100,6 @@ def main(
             if state.mp3_folder.name == wanted:
                 return idx
         raise ValueError(f"No configured library matches [{marker}].")
-
-    def default_download_marker() -> str:
-        return "mm" if active_state.mp3_folder.name == "mid-mp3s" else "m"
 
     def refresh_library_after_download(state_idx: int, track_path: Path) -> None:
         state = library_states[state_idx]
@@ -4319,16 +4633,43 @@ def main(
                 if tui and tui.enable:
                     tui.status_msg = f"No matches for mood: “{mood_text}”"
 
-    def reset_to_idle(tui: Optional[CursesTUI]) -> None:
-        nonlocal current_similar_entries, current_similar_mood
+    def stop_active_tab_playback(tui: Optional[CursesTUI]) -> bool:
+        """Stop playback for the selected playback surface.
+
+        The YouTube tab stops only the side-player. Library tabs clear the shared
+        MP3 queue and stop any currently playing local MP3.
+        """
+        nonlocal skip_requeue_item
+
+        if active_tab_idx == youtube_tab_idx:
+            stop_youtube_side_players()
+            if tui and tui.enable:
+                tui.status_msg = "Stopped YouTube playback."
+            return False
+
+        removed = len(queue)
         queue.clear()
         for state in library_states:
             state.tag_session.abandon()
-        stop_youtube_side_players()
+        stop_current = current_playing_item is not None
+        if stop_current:
+            skip_requeue_item = current_playing_item
+
         if tui and tui.enable:
             tui.focus_panel = "queue"
             tui.input_mode = "mood"
-            tui.status_msg = "Stopped. Waiting for mood..."
+            tui.queue_selected = 0
+            tui.queue_scroll = 0
+            if stop_current:
+                if removed:
+                    tui.status_msg = f"Stopped MP3 playback and cleared {removed} queued track(s)."
+                else:
+                    tui.status_msg = "Stopped MP3 playback."
+            elif removed:
+                tui.status_msg = f"Cleared {removed} queued MP3 track(s)."
+            else:
+                tui.status_msg = "No active MP3 playback to stop."
+        return stop_current
 
     def handle_tag_submission(submitted: str, tui: CursesTUI) -> bool:
         if tui.input_mode not in ("tag_add", "tag_edit"):
@@ -4367,11 +4708,11 @@ def main(
         if pl:
             if not enable_tui:
                 enqueue_tracks(pl, initial_mood)
-                headers = ["#", "File (Base Name)", "Similarity"]
                 table_data = [
-                    [i + 1, base, f"{score:.4f}"]
+                    [i + 1, base, counts.get(str(base), 0), f"{score:.4f}"]
                     for i, (base, score) in enumerate(current_similar_entries or [])
                 ]
+                headers = ["#", "File (Base Name)", "Listens", "Similarity"]
                 print("\n--- Top Mood Matches ---")
                 print(tabulate(table_data, headers=headers, tablefmt="rounded_grid"))
         elif logging:
@@ -4573,8 +4914,7 @@ def main(
                 tui.input_buffer = ""
                 tui.focus_panel = "youtube"
                 tui.status_msg = (
-                    f"Enter download name ending in [m] or [mm]. "
-                    f"Default tab marker: [{default_download_marker()}]"
+                    "Enter title [m/mm], or [artist] title [m/mm]."
                 )
 
         def handle_youtube_search_input(submitted: str) -> bool:
@@ -4611,16 +4951,26 @@ def main(
                 tui.status_msg = "No YouTube result selected."
                 return True
             try:
-                title, marker = parse_youtube_download_name(submitted)
+                title, marker, artist_names = parse_youtube_download_name(submitted)
                 target_idx = library_index_for_marker(marker)
                 target_state = library_states[target_idx]
                 output_path = target_state.mp3_folder / f"{title}.mp3"
                 tui.status_msg = f"Downloading to {target_state.label}: {title}"
                 run_youtube_download(result.url, output_path)
                 refresh_library_after_download(target_idx, output_path)
+                if artist_names:
+                    target_state.artists_data[output_path.stem] = artist_names
+                    save_artists(target_state.artists_file, target_state.artists_data)
+                append_download_list_entry(result, title, marker, artist_names)
                 tui.input_mode = "youtube_search"
                 tui.input_buffer = ""
-                tui.status_msg = f"Downloaded: {output_path.name} -> {target_state.label}"
+                artist_msg = (
+                    f"; artist: {', '.join(artist_names)}" if artist_names else ""
+                )
+                tui.status_msg = (
+                    f"Downloaded: {output_path.name} -> {target_state.label}"
+                    f"{artist_msg}"
+                )
             except subprocess.CalledProcessError as e:
                 tui.status_msg = f"Download failed: yt-dlp exited {e.returncode}"
             except Exception as e:
@@ -4821,6 +5171,8 @@ def main(
                         tui.status_msg = "No playlists to delete."
 
         def handle_common_actions() -> None:
+            clear_finished_youtube_side_player()
+            maybe_auto_commit_state()
             if tui.library_switch_request is not None:
                 idx = tui.library_switch_request
                 tui.library_switch_request = None
@@ -4885,8 +5237,16 @@ def main(
                     max(0.0, seconds - max(0.0, end - time.monotonic())),
                     seconds,
                 )
+                pause_item = (
+                    current_playing_item
+                    if isinstance(current_playing_item, dict)
+                    else None
+                )
+                pause_path = pause_item.get("path") if pause_item else None
+                pause_name = pause_path.name if isinstance(pause_path, Path) else ""
+                show_local_playback = current_local_playback_visible()
                 submitted = tui.render(
-                    now_playing=display_now_playing(),
+                    now_playing=display_now_playing(pause_name),
                     target_lufs=None,
                     current_lufs=None,
                     loudness_diff=None,
@@ -4894,7 +5254,9 @@ def main(
                     elapsed_sec=header_elapsed,
                     total_sec=header_total,
                     playback_mode=playback_mode,
-                    current_play_once=None,
+                    current_play_once=item_effective_play_once(pause_item)
+                    if pause_item is not None and show_local_playback
+                    else None,
                     counts=counts,
                     listen_hours_for_stem=listen_hours_for_stem,
                     total_listens=total_listens,
@@ -4935,8 +5297,8 @@ def main(
 
                 if tui.stop_requested:
                     tui.stop_requested = False
-                    reset_to_idle(tui)
-                    return True, lock_since_wall
+                    if stop_active_tab_playback(tui):
+                        return True, lock_since_wall
 
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
@@ -5037,6 +5399,9 @@ def main(
                             except Exception as e:
                                 tui.status_msg = f"Error building queue: {e}"
                     handle_common_actions()
+                    if tui.stop_requested:
+                        tui.stop_requested = False
+                        stop_active_tab_playback(tui)
                     time.sleep(0.01)
                     continue
 
@@ -5130,20 +5495,27 @@ def main(
                                     elapsed,
                                     total_dur,
                                 )
+                                show_local_playback = current_local_playback_visible()
                                 submitted = tui.render(
                                     now_playing=display_now_playing(filename_ext),
-                                    target_lufs=track_state.resolved_target_loudness,
+                                    target_lufs=track_state.resolved_target_loudness
+                                    if show_local_playback
+                                    else None,
                                     current_lufs=float(current_loudness)
-                                    if isinstance(current_loudness, (int, float))
+                                    if show_local_playback
+                                    and isinstance(current_loudness, (int, float))
                                     else None,
                                     loudness_diff=float(loudness_diff)
-                                    if isinstance(loudness_diff, (int, float))
+                                    if show_local_playback
+                                    and isinstance(loudness_diff, (int, float))
                                     else None,
-                                    volume_scale=vol_scale,
+                                    volume_scale=vol_scale if show_local_playback else None,
                                     elapsed_sec=header_elapsed,
                                     total_sec=header_total,
                                     playback_mode=playback_mode,
-                                    current_play_once=item_effective_play_once(current_item),
+                                    current_play_once=item_effective_play_once(current_item)
+                                    if show_local_playback
+                                    else None,
                                     counts=counts,
                                     listen_hours_for_stem=listen_hours_for_stem,
                                     total_listens=total_listens,
@@ -5152,8 +5524,12 @@ def main(
                                     similar_mood=current_similar_mood,
                                     queue_items=visible_queue_items(),
                                     playlists=get_playlists_list(),
-                                    current_tags=track_tag_session.existing_tags(),
-                                    pending_tags=track_tag_session.pending_tags(),
+                                    current_tags=track_tag_session.existing_tags()
+                                    if show_local_playback
+                                    else None,
+                                    pending_tags=track_tag_session.pending_tags()
+                                    if show_local_playback
+                                    else None,
                                     active_playlist_name=active_playlist_name
                                     if tui.playlist_editor_open
                                     else None,
@@ -5203,10 +5579,11 @@ def main(
                                     break
 
                                 if tui.stop_requested:
-                                    user_stop = True
                                     tui.stop_requested = False
-                                    pygame.mixer.stop()
-                                    break
+                                    if stop_active_tab_playback(tui):
+                                        user_stop = True
+                                        pygame.mixer.stop()
+                                        break
                                 handle_common_actions()
 
                             # Lock mid-track?
@@ -5262,19 +5639,17 @@ def main(
                                     track_state.listen_timestamps,
                                     track_state.listen_timestamps_filename,
                                 )
-                                if tui and tui.enable:
-                                    listen_msg = (
-                                        f"Recorded listen: {track_path.stem} "
-                                        f"({track_state.counts.get(track_path.stem, 0)})"
-                                    )
-                                    if saved_tags:
-                                        listen_msg += f"; saved {saved_tags} tag(s)"
-                                    tui.status_msg = listen_msg
+                                listen_msg = (
+                                    f"Recorded listen: {track_path.stem} "
+                                    f"({track_state.counts.get(track_path.stem, 0)})"
+                                )
+                                if saved_tags:
+                                    listen_msg += f"; saved {saved_tags} tag(s)"
+                                set_library_status(track_state, listen_msg, tui)
                         else:
                             track_tag_session.abandon()
 
                         if user_stop:
-                            reset_to_idle(tui)
                             lock_since_wall = sleep_with_exit_checks(
                                 0.2, lock_since_wall, next_exit_dt
                             )
@@ -5345,6 +5720,7 @@ def main(
                     save_loudness_cache(state.loud_cache, state.mp3_folder)
             except Exception:
                 pass
+            maybe_auto_commit_state(force=True)
 
     try:
         pygame.mixer.quit()
@@ -5400,6 +5776,17 @@ def parse_args() -> argparse.Namespace:
         default="manual",
         help="Manual mode records listens; auto mode uses the Markov chain without recording.",
     )
+    p.add_argument(
+        "--auto-commit-state-days",
+        "--auto-commit-json-days",
+        dest="auto_commit_state_days",
+        type=int,
+        default=AUTO_COMMIT_STATE_DEFAULT_DAYS,
+        help=(
+            "Auto-commit changed player state files after this many days since "
+            "the last state commit. Use 0 to disable."
+        ),
+    )
     p.add_argument("--no-tui", action="store_true", help="Disable curses UI.")
     return p.parse_args()
 
@@ -5442,6 +5829,7 @@ if __name__ == "__main__":
             enable_tui=(not args.no_tui),
             listen_db_filename=listen_db,
             playback_mode=str(args.mode),
+            auto_commit_state_days=max(0, int(args.auto_commit_state_days)),
             library_configs=library_configs,
         )
     except SystemExit:

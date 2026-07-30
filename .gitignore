@@ -32,6 +32,8 @@ tags.json
 mid_tags.json
 artists.json
 mid_artists.json
+listen_counts*.json
+listen_timestamps*.json
 artists.json.bak
 mid_artists.json.bak
 artists_reviewed.json

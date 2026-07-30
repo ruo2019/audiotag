@@ -25,3 +25,37 @@ python mp3_trimmer.py
 Then open `http://127.0.0.1:5050`.
 
 The trimmer uses FFmpeg copy mode (`-c copy`) so MP3 audio frames are not re-encoded. Output files go to `static/trimmed/`, and uploaded files go to `static/trim-uploads/`. Trim points are entered in milliseconds; the actual cut lands on MP3 frame boundaries, which is normally much smaller than half a second.
+
+## Rename an MP3 and update metadata
+
+Run the interactive helper:
+
+```bash
+python rename_mp3.py
+```
+
+It lets you choose a library, choose a track, type the new name, preview the metadata changes, and confirm before anything is written.
+
+You can still preview a rename directly:
+
+```bash
+python rename_mp3.py "Old Name" "New Name"
+```
+
+Apply it:
+
+```bash
+python rename_mp3.py "Old Name" "New Name" --apply
+```
+
+For the mid library, pass the folder:
+
+```bash
+python rename_mp3.py "Old Name" "New Name" --folder static/mid-mp3s --apply
+```
+
+Or use the shortcut:
+
+```bash
+python rename_mp3.py --mid
+```

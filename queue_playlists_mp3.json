@@ -134,5 +134,19 @@
       "base": "7 Years",
       "play_once": false
     }
+  ],
+  "petal": [
+    {
+      "base": "[AG] petal",
+      "play_once": false
+    },
+    {
+      "base": "[AG] like i do",
+      "play_once": false
+    },
+    {
+      "base": "[AG] oh well",
+      "play_once": false
+    }
   ]
 }

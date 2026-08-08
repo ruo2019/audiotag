@@ -96,5 +96,19 @@
       "base": "BLUE",
       "play_once": false
     }
+  ],
+  "tossed": [
+    {
+      "base": "Douce",
+      "play_once": false
+    },
+    {
+      "base": "Jamais",
+      "play_once": false
+    },
+    {
+      "base": "La symphonie des éclairs",
+      "play_once": false
+    }
   ]
 }

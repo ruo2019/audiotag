@@ -799,7 +799,11 @@ def load_listen_timestamps(mp3_dir: Path, db_filename: str) -> List[dict]:
             ts = item.get("timestamp")
             track = item.get("track")
             if ts and track:
-                events.append({"timestamp": str(ts), "track": str(track)})
+                event = {"timestamp": str(ts), "track": str(track)}
+                source = item.get("source")
+                if source:
+                    event["source"] = str(source)
+                events.append(event)
         return events
 
     # Backward compatibility for the earlier {stem: [timestamp, ...]} format.
@@ -833,9 +837,14 @@ def record_listen_timestamp(
     track_path: Path,
     history: List[dict],
     listened_at: Optional[datetime] = None,
+    source: str = "manual",
 ) -> dict:
     when = (listened_at or datetime.now().astimezone()).isoformat(timespec="seconds")
-    event = {"timestamp": when, "track": _listen_event_track_name(track_path)}
+    event = {
+        "timestamp": when,
+        "track": _listen_event_track_name(track_path),
+        "source": source,
+    }
     history.append(event)
     return event
 
@@ -868,10 +877,11 @@ def build_markov_transition_counts(
     except Exception:
         pass
 
-    events: List[Tuple[datetime, str]] = []
+    events: List[Tuple[datetime, str, bool]] = []
     for item in history:
         if not isinstance(item, dict):
             continue
+        is_auto = str(item.get("source") or "manual").lower() == "auto"
         track = item.get("track")
         stamp = item.get("timestamp")
         if not track or not stamp:
@@ -880,18 +890,22 @@ def build_markov_transition_counts(
         if known_tracks and track_name not in known_tracks:
             continue
         try:
-            events.append((datetime.fromisoformat(str(stamp)), track_name))
+            events.append((datetime.fromisoformat(str(stamp)), track_name, is_auto))
         except Exception:
             continue
 
     events.sort(key=lambda item: item[0])
 
-    for _, track_name in events:
+    for _, track_name, is_auto in events:
+        if is_auto:
+            continue
         global_counts[track_name] = global_counts.get(track_name, 0) + 1
 
     for index in range(len(events) - 1):
-        current_finish, current_track = events[index]
-        next_finish, next_track = events[index + 1]
+        current_finish, current_track, current_is_auto = events[index]
+        next_finish, next_track, next_is_auto = events[index + 1]
+        if current_is_auto or next_is_auto:
+            continue
         next_duration = float(duration_by_track_name.get(next_track, 0.0) or 0.0)
         if next_duration <= 0.0:
             next_path = mp3_dir / next_track
@@ -5627,25 +5641,28 @@ def main(
                             saved_tags = track_tag_session.finish(trailing_tag)
                             if trailing_tag and enable_tui and tui.input_mode in ("tag_add", "tag_edit"):
                                 tui.input_buffer = ""
-                            if track_source == "manual":
-                                increment_listen(track_path, track_state.counts)
-                                save_listen_counts(
-                                    track_state.counts, track_state.listen_db_filename
-                                )
-                                record_listen_timestamp(
-                                    track_path, track_state.listen_timestamps
-                                )
-                                save_listen_timestamps(
-                                    track_state.listen_timestamps,
-                                    track_state.listen_timestamps_filename,
-                                )
-                                listen_msg = (
-                                    f"Recorded listen: {track_path.stem} "
-                                    f"({track_state.counts.get(track_path.stem, 0)})"
-                                )
-                                if saved_tags:
-                                    listen_msg += f"; saved {saved_tags} tag(s)"
-                                set_library_status(track_state, listen_msg, tui)
+                            increment_listen(track_path, track_state.counts)
+                            save_listen_counts(
+                                track_state.counts, track_state.listen_db_filename
+                            )
+                            record_listen_timestamp(
+                                track_path,
+                                track_state.listen_timestamps,
+                                source=track_source,
+                            )
+                            save_listen_timestamps(
+                                track_state.listen_timestamps,
+                                track_state.listen_timestamps_filename,
+                            )
+                            listen_msg = (
+                                f"Recorded listen: {track_path.stem} "
+                                f"({track_state.counts.get(track_path.stem, 0)})"
+                            )
+                            if track_source == "auto":
+                                listen_msg += "; marked auto"
+                            if saved_tags:
+                                listen_msg += f"; saved {saved_tags} tag(s)"
+                            set_library_status(track_state, listen_msg, tui)
                         else:
                             track_tag_session.abandon()
 

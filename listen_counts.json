@@ -30,7 +30,7 @@
   "Dystopia": 5,
   "Rynos Theme": 2,
   "Phantom": 0,
-  "Moonlight Sonata": 10,
+  "Moonlight Sonata": 12,
   "Mariage d'Amour": 4,
   "Primavera": 11,
   "Liszt": 3,
@@ -42,13 +42,13 @@
   "Bo's Theme 2": 0,
   "Tempest": 0,
   "[D2] Hidden Truth": 2,
-  "Reverie": 2,
+  "Reverie": 14,
   "Hedwig's Theme": 3,
   "Never Back Down": 0,
   "Overwhelmed": 3,
   "The Complex": 1,
   "Deep Stone Crypt Theme": 3,
-  "Aurora": 24,
+  "Aurora": 55,
   "Blood": 3,
   "Samara's Theme": 2,
   "Toss": 25,
@@ -170,5 +170,5 @@
   "stupid song": 92,
   "Chlorine": 163,
   "Nico and the Niners": 233,
-  "Overcompensate": 145
+  "Overcompensate": 179
 }

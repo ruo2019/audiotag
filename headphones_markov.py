@@ -36,6 +36,14 @@ except Exception:
 
 HEADPHONES_LOST = threading.Event()
 
+_BROWSER_COOKIE_RE = re.compile(
+    r"(?x)"
+    r"(?P<name>[^+:]+)"
+    r"(?:\s*\+\s*(?P<keyring>[^:]+))?"
+    r"(?:\s*:\s*(?!:)(?P<profile>.+?))?"
+    r"(?:\s*::\s*(?P<container>.+))?"
+)
+
 # ============================== CONFIG ==============================
 
 locale.setlocale(locale.LC_ALL, "")
@@ -48,6 +56,7 @@ DEFAULT_TAGS_FILE = Path("tags.json")
 DEFAULT_ARTISTS_FILE = Path("artists.json")
 DEFAULT_MID_ARTISTS_FILE = Path("mid_artists.json")
 DEFAULT_SAMPLE_MP3 = "Deep Stone Crypt Theme.mp3"
+DEFAULT_YOUTUBE_COOKIES_FILE = Path("/Volumes/Calc 2/yt-dlp/cookies.txt")
 PLAYLISTS_FILE = "queue_playlists.json"
 DOWNLOAD_LIST_FILE = "download_list.txt"
 DOWNLOAD_LIST_BLANK_AFTER_DAYS = 3
@@ -78,7 +87,7 @@ DEFAULT_YOUTUBE_TOP_N = 10
 GAP_SECONDS = 7.0
 
 # Caches stored inside mp3 folder
-EMB_CACHE_VERSION = "v3"
+EMB_CACHE_VERSION = "v4"
 EMB_CACHE_NAME = ".track_emb_cache.npz"
 
 LOUD_CACHE_VERSION = 2
@@ -426,6 +435,81 @@ class YouTubeResult:
     video_id: str = ""
 
 
+@dataclass(frozen=True)
+class YouTubeCookieConfig:
+    cookies_from_browser: Optional[str] = None
+    cookies_file: Optional[Path] = None
+
+    def ydl_options(self) -> Dict[str, object]:
+        opts: Dict[str, object] = {}
+        if self.cookies_from_browser:
+            opts["cookiesfrombrowser"] = parse_youtube_browser_cookie_spec(
+                self.cookies_from_browser
+            )
+        if self.cookies_file:
+            opts["cookiefile"] = str(self.cookies_file)
+        return opts
+
+    def cli_args(self) -> List[str]:
+        if self.cookies_from_browser:
+            return ["--cookies-from-browser", self.cookies_from_browser]
+        if self.cookies_file:
+            return ["--cookies", str(self.cookies_file)]
+        return []
+
+
+def parse_youtube_browser_cookie_spec(
+    raw: str,
+) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+    spec = raw.strip()
+    match = _BROWSER_COOKIE_RE.fullmatch(spec)
+    if not match:
+        raise ValueError(f"Invalid browser cookie spec: {raw!r}")
+    browser_name, keyring, profile, container = match.group(
+        "name", "keyring", "profile", "container"
+    )
+    return (
+        browser_name.strip().lower(),
+        profile.strip() if profile else None,
+        keyring.strip().upper() if keyring else None,
+        container.strip() if container else None,
+    )
+
+
+def build_youtube_cookie_config(
+    cookies_from_browser: Optional[str],
+    cookies_file: Optional[str],
+) -> YouTubeCookieConfig:
+    browser = (cookies_from_browser or "").strip()
+    cookiefile = (cookies_file or "").strip()
+    if not browser and not cookiefile and DEFAULT_YOUTUBE_COOKIES_FILE.exists():
+        cookiefile = str(DEFAULT_YOUTUBE_COOKIES_FILE)
+    if browser and cookiefile:
+        raise ValueError("Use either browser cookies or a cookies file, not both.")
+    if browser:
+        parse_youtube_browser_cookie_spec(browser)
+        return YouTubeCookieConfig(cookies_from_browser=browser)
+    if cookiefile:
+        return YouTubeCookieConfig(cookies_file=Path(cookiefile).expanduser())
+    return YouTubeCookieConfig()
+
+
+def youtube_error_text(
+    exc: Exception,
+    cookie_config: Optional[YouTubeCookieConfig],
+) -> str:
+    message = str(exc)
+    configured = bool(
+        cookie_config
+        and (cookie_config.cookies_from_browser or cookie_config.cookies_file)
+    )
+    if not configured and (
+        "not a bot" in message.lower() or "cookies-from-browser" in message
+    ):
+        message += " Try restarting with --youtube-cookies-from-browser chrome."
+    return message
+
+
 def library_defaults_for_folder(
     mp3_folder: Path,
     tags_file: Optional[Path] = None,
@@ -517,7 +601,11 @@ def suppress_terminal_output():
             yield
 
 
-def search_youtube(query: str, limit: int) -> List[YouTubeResult]:
+def search_youtube(
+    query: str,
+    limit: int,
+    cookie_config: Optional[YouTubeCookieConfig] = None,
+) -> List[YouTubeResult]:
     if YoutubeDL is None:
         raise RuntimeError("yt-dlp Python package is not installed.")
     ydl_opts = {
@@ -527,6 +615,8 @@ def search_youtube(query: str, limit: int) -> List[YouTubeResult]:
         "skip_download": True,
         "extract_flat": True,
     }
+    if cookie_config:
+        ydl_opts.update(cookie_config.ydl_options())
     with suppress_terminal_output():
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
@@ -568,11 +658,10 @@ def search_youtube(query: str, limit: int) -> List[YouTubeResult]:
     return results
 
 
-def resolve_youtube_audio(
-    video_url: str,
-) -> Tuple[str, str, Dict[str, str], float]:
+def resolve_youtube_audio(video_url: str) -> Tuple[str, str, Dict[str, str], float]:
     if YoutubeDL is None:
         raise RuntimeError("yt-dlp Python package is not installed.")
+
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -708,7 +797,11 @@ def parse_youtube_download_name(raw: str) -> Tuple[str, str, List[str]]:
     return title, marker, artist_names
 
 
-def run_youtube_download(url: str, output_path: Path) -> None:
+def run_youtube_download(
+    url: str,
+    output_path: Path,
+    cookie_config: Optional[YouTubeCookieConfig] = None,
+) -> None:
     yt_dlp = shutil.which("yt-dlp")
     if not yt_dlp:
         raise RuntimeError("yt-dlp command not found.")
@@ -725,12 +818,19 @@ def run_youtube_download(url: str, output_path: Path) -> None:
         "-o",
         str(output_path),
     ]
-    subprocess.run(
+    if cookie_config:
+        cmd[5:5] = cookie_config.cli_args()
+    result = subprocess.run(
         cmd,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        check=False,
+        capture_output=True,
+        text=True,
     )
+    if result.returncode != 0:
+        error_text = result.stderr.strip() or result.stdout.strip()
+        if not error_text:
+            error_text = f"yt-dlp exited {result.returncode}"
+        raise RuntimeError(error_text)
 
 
 def download_list_path(filename: str = DOWNLOAD_LIST_FILE) -> Path:
@@ -1219,7 +1319,9 @@ def normalize_track_name_for_search(name: object) -> str:
     return text.strip()
 
 
-def tags_fingerprint(tags_data: dict, mp3_folder: Path) -> str:
+def tags_fingerprint(
+    tags_data: dict, artists_data: dict, mp3_folder: Path
+) -> str:
     rows: List[str] = []
     try:
         mp3_paths = sorted(
@@ -1236,13 +1338,15 @@ def tags_fingerprint(tags_data: dict, mp3_folder: Path) -> str:
     for p in mp3_paths:
         base = p.stem
         tag_list = (tags_data or {}).get(base, [])
+        artist_list = (artists_data or {}).get(base, [])
         try:
             mtime = p.stat().st_mtime
         except Exception:
             mtime = 0.0
         rows.append(
             f"{base}|{normalize_track_name_for_search(base)}|"
-            f"{canonicalize_tags(tag_list or [])}|{mtime:.0f}"
+            f"{canonicalize_tags(tag_list or [])}|"
+            f"{canonicalize_tags(artist_list or [])}|{mtime:.0f}"
         )
     rows.sort()
     return sha256("\n".join(rows).encode("utf-8")).hexdigest()
@@ -1270,10 +1374,11 @@ class EmbeddingCache:
         self,
         model: SentenceTransformer,
         tags_data: dict,
+        artists_data: dict,
         mp3_folder: Path,
         logging: bool = False,
     ) -> None:
-        fp_now = tags_fingerprint(tags_data, mp3_folder)
+        fp_now = tags_fingerprint(tags_data, artists_data, mp3_folder)
         cache_file = emb_cache_path(mp3_folder)
 
         # Try load once per process
@@ -1326,12 +1431,16 @@ class EmbeddingCache:
         for p in mp3_paths:
             base = str(p.stem)
             tag_text = canonicalize_tags((tags_data or {}).get(base, []) or [])
+            artist_text = canonicalize_tags((artists_data or {}).get(base, []) or [])
             name_text = normalize_track_name_for_search(base)
             names.append(base)
+            artist_clause = f"; by artist {artist_text}" if artist_text else ""
             if tag_text:
-                texts.append(f"music track named {name_text}; music that is {tag_text}")
+                texts.append(
+                    f"music track named {name_text}{artist_clause}; music that is {tag_text}"
+                )
             else:
-                texts.append(f"music track named {name_text}")
+                texts.append(f"music track named {name_text}{artist_clause}")
 
         if not names:
             self.names, self.matrix, self.fingerprint = [], None, fp_now
@@ -1372,6 +1481,7 @@ EMB_CACHE = EmbeddingCache()
 def compute_top_for_mood(
     model: SentenceTransformer,
     tags_data: Dict[str, List[str]],
+    artists_data: Dict[str, List[str]],
     mood: str,
     mp3_folder: Path,
     top_n: int,
@@ -1380,7 +1490,7 @@ def compute_top_for_mood(
     if not mood:
         return [], []
 
-    EMB_CACHE.ensure(model, tags_data, mp3_folder, logging=logging)
+    EMB_CACHE.ensure(model, tags_data, artists_data, mp3_folder, logging=logging)
     if EMB_CACHE.matrix is None or not EMB_CACHE.names:
         return [], []
 
@@ -1401,12 +1511,28 @@ def compute_top_for_mood(
     sims = EMB_CACHE.matrix @ q
 
     match_counts: List[int] = []
+    artist_match_scores: List[int] = []
     name_match_scores: List[int] = []
     for base in EMB_CACHE.names:
         tag_set = {str(t).strip().lower() for t in (tags_data.get(base, []) or [])}
         match_counts.append(
             sum(1 for tok in token_set if tok in tag_set) if token_set else 0
         )
+        artist_score = 0
+        artist_names = artists_data.get(base, []) or []
+        artist_texts = [normalize_track_name_for_search(name) for name in artist_names]
+        for artist_text in artist_texts:
+            if not artist_text:
+                continue
+            artist_words = set(re.findall(r"[a-z0-9]+", artist_text))
+            if query_name_text:
+                if query_name_text == artist_text:
+                    artist_score = max(artist_score, 1000)
+                elif query_name_text in artist_text:
+                    artist_score = max(artist_score, 500)
+            if query_words:
+                artist_score += 10 * len(query_words & artist_words)
+        artist_match_scores.append(artist_score)
         name_text = normalize_track_name_for_search(base)
         name_words = set(re.findall(r"[a-z0-9]+", name_text))
         name_score = 0
@@ -1422,6 +1548,7 @@ def compute_top_for_mood(
     idxs = list(range(len(EMB_CACHE.names)))
     idxs.sort(
         key=lambda i: (
+            -artist_match_scores[i],
             -match_counts[i],
             -name_match_scores[i],
             -float(sims[i]),
@@ -1429,7 +1556,9 @@ def compute_top_for_mood(
         )
     )
     top_n = clamp_int(top_n, TOP_MIN, TOP_MAX)
-    idxs = idxs[:top_n]
+    strong_artist_matches = sum(1 for score in artist_match_scores if score >= 500)
+    result_n = clamp_int(max(top_n, strong_artist_matches), TOP_MIN, TOP_MAX)
+    idxs = idxs[:result_n]
 
     playlist = [mp3_folder / f"{EMB_CACHE.names[i]}.mp3" for i in idxs]
     table = [(EMB_CACHE.names[i], float(sims[i])) for i in idxs]
@@ -1731,7 +1860,7 @@ class CursesTUI:
         help_lines = [
             "Shortcuts",
             "",
-            "Enter: submit mood",
+            "Enter: submit search (mood/tag/title/artist)",
             "TAB: focus visible panes (YouTube/Queue/Similar/Playlists/Most)",
             "↑/↓ PgUp/PgDn: move in focused panel",
             "→: skip track",
@@ -3319,7 +3448,7 @@ class CursesTUI:
             prompt = "youtube: "
         else:
             self._hline(input_y - 1, "-")
-            prompt = "mood: "
+            prompt = "search: "
         if (
             not self.input_buffer
             and not now_playing
@@ -3327,7 +3456,10 @@ class CursesTUI:
             and not self.youtube_active
         ):
             self._draw(
-                input_y, 2, prompt + "(type a mood + Enter; optional: (top N) / top=N)"
+                input_y,
+                2,
+                prompt
+                + "(type mood/tag/title/artist + Enter; optional: (top N) / top=N)",
             )
         elif not self.input_buffer and self.input_mode == "youtube_search":
             self._draw(input_y, 2, prompt + "(search YouTube; optional top=10)")
@@ -3676,6 +3808,7 @@ def main(
     listen_db_filename: str,
     playback_mode: str,
     auto_commit_state_days: int,
+    youtube_cookie_config: Optional[YouTubeCookieConfig] = None,
     library_configs: Optional[List[Tuple[str, Path, Path, str]]] = None,
 ) -> None:
     if library_configs is None:
@@ -3709,6 +3842,7 @@ def main(
     tags_file = active_state.tags_file
     listen_db_filename = active_state.listen_db_filename
     tags_data = active_state.tags_data
+    artists_data = active_state.artists_data
     counts = active_state.counts
     listen_timestamps = active_state.listen_timestamps
     listen_timestamps_filename = active_state.listen_timestamps_filename
@@ -3725,7 +3859,7 @@ def main(
     duration_by_stem = active_state.duration_by_stem
     active_playlist_name = active_state.active_playlist_name
 
-    EMB_CACHE.ensure(model, tags_data, mp3_folder, logging=logging)
+    EMB_CACHE.ensure(model, tags_data, artists_data, mp3_folder, logging=logging)
 
     FORCE_DEVICE: Optional[str] = None
     youtube_mpv_audio_device: Optional[str] = None
@@ -3953,7 +4087,10 @@ def main(
                     youtube_mpv_audio_device,
                 )
             except Exception as e:
-                set_youtube_status(f"YouTube playback failed: {e}", tui)
+                set_youtube_status(
+                    f"YouTube playback failed: {youtube_error_text(e, youtube_cookie_config)}",
+                    tui,
+                )
                 with youtube_side_lock:
                     if generation == youtube_side_generation:
                         youtube_side_title = None
@@ -4034,7 +4171,7 @@ def main(
 
     def activate_library(idx: int, tui: Optional[CursesTUI] = None) -> None:
         nonlocal active_library_idx, active_tab_idx, active_state, mp3_folder, tags_file
-        nonlocal listen_db_filename, tags_data, counts, listen_timestamps
+        nonlocal listen_db_filename, tags_data, artists_data, counts, listen_timestamps
         nonlocal listen_timestamps_filename, markov_transitions, markov_global_counts
         nonlocal loud_cache, playlists_filename, playlists_db, tag_session
         nonlocal current_similar_entries, current_similar_mood, audio_data
@@ -4053,6 +4190,7 @@ def main(
         tags_file = active_state.tags_file
         listen_db_filename = active_state.listen_db_filename
         tags_data = active_state.tags_data
+        artists_data = active_state.artists_data
         counts = active_state.counts
         listen_timestamps = active_state.listen_timestamps
         listen_timestamps_filename = active_state.listen_timestamps_filename
@@ -4068,7 +4206,7 @@ def main(
         resolved_target_loudness = active_state.resolved_target_loudness
         duration_by_stem = active_state.duration_by_stem
         active_playlist_name = active_state.active_playlist_name
-        EMB_CACHE.ensure(model, tags_data, mp3_folder, logging=logging)
+        EMB_CACHE.ensure(model, tags_data, artists_data, mp3_folder, logging=logging)
         if tui and tui.enable:
             tui.playlist_editor_open = bool(active_playlist_name)
             tui.queue_selected = 0
@@ -4155,7 +4293,13 @@ def main(
             duration_by_stem[track_path.stem] = duration
             audio_data.update(state.audio_data)
         try:
-            EMB_CACHE.ensure(model, state.tags_data, state.mp3_folder, logging=logging)
+            EMB_CACHE.ensure(
+                model,
+                state.tags_data,
+                state.artists_data,
+                state.mp3_folder,
+                logging=logging,
+            )
         except Exception:
             pass
 
@@ -4313,6 +4457,7 @@ def main(
         pl, sim = compute_top_for_mood(
             model=model,
             tags_data=tags_data or {},
+            artists_data=artists_data or {},
             mood=mood_text,
             mp3_folder=mp3_folder,
             top_n=current_top_n,
@@ -4639,13 +4784,13 @@ def main(
                 if tui and tui.enable:
                     tui.focus_panel = "similar"
                     tui.status_msg = (
-                        f"Loaded mood: “{mood_text}” (top {current_top_n}) — double click to add"
+                        f"Loaded search: “{mood_text}” (top {len(pl)}) — double click to add"
                     )
                 if not enable_tui:
                     enqueue_tracks(pl, mood_text)
             else:
                 if tui and tui.enable:
-                    tui.status_msg = f"No matches for mood: “{mood_text}”"
+                    tui.status_msg = f"No matches for search: “{mood_text}”"
 
     def stop_active_tab_playback(tui: Optional[CursesTUI]) -> bool:
         """Stop playback for the selected playback surface.
@@ -4946,14 +5091,21 @@ def main(
             youtube_query = query
             tui.status_msg = f"Searching YouTube: {query} (top {result_limit})"
             try:
-                youtube_results = search_youtube(query, result_limit)
+                youtube_results = search_youtube(
+                    query,
+                    result_limit,
+                    youtube_cookie_config,
+                )
                 tui.youtube_selected = 0
                 tui.youtube_scroll = 0
                 tui.focus_panel = "youtube"
                 tui.status_msg = f"YouTube results: {len(youtube_results)} (top {result_limit})"
             except Exception as e:
                 youtube_results = []
-                tui.status_msg = f"YouTube search failed: {e}"
+                tui.status_msg = (
+                    f"YouTube search failed: "
+                    f"{youtube_error_text(e, youtube_cookie_config)}"
+                )
             return True
 
         def handle_youtube_download_input(submitted: str) -> bool:
@@ -4970,11 +5122,11 @@ def main(
                 target_state = library_states[target_idx]
                 output_path = target_state.mp3_folder / f"{title}.mp3"
                 tui.status_msg = f"Downloading to {target_state.label}: {title}"
-                run_youtube_download(result.url, output_path)
-                refresh_library_after_download(target_idx, output_path)
+                run_youtube_download(result.url, output_path, youtube_cookie_config)
                 if artist_names:
                     target_state.artists_data[output_path.stem] = artist_names
                     save_artists(target_state.artists_file, target_state.artists_data)
+                refresh_library_after_download(target_idx, output_path)
                 append_download_list_entry(result, title, marker, artist_names)
                 tui.input_mode = "youtube_search"
                 tui.input_buffer = ""
@@ -4988,7 +5140,9 @@ def main(
             except subprocess.CalledProcessError as e:
                 tui.status_msg = f"Download failed: yt-dlp exited {e.returncode}"
             except Exception as e:
-                tui.status_msg = f"Download failed: {e}"
+                tui.status_msg = (
+                    f"Download failed: {youtube_error_text(e, youtube_cookie_config)}"
+                )
             return True
 
         def apply_playlist_editor_actions() -> None:
@@ -5256,11 +5410,9 @@ def main(
                     if isinstance(current_playing_item, dict)
                     else None
                 )
-                pause_path = pause_item.get("path") if pause_item else None
-                pause_name = pause_path.name if isinstance(pause_path, Path) else ""
                 show_local_playback = current_local_playback_visible()
                 submitted = tui.render(
-                    now_playing=display_now_playing(pause_name),
+                    now_playing=display_now_playing(),
                     target_lufs=None,
                     current_lufs=None,
                     loudness_diff=None,
@@ -5406,10 +5558,10 @@ def main(
                                 if pl:
                                     tui.focus_panel = "similar"
                                     tui.status_msg = (
-                                        f"Loaded mood: “{mood_text}” (top {current_top_n}) — double click to add"
+                                        f"Loaded search: “{mood_text}” (top {len(pl)}) — double click to add"
                                     )
                                 else:
-                                    tui.status_msg = f"No matches for mood: “{mood_text}”"
+                                    tui.status_msg = f"No matches for search: “{mood_text}”"
                             except Exception as e:
                                 tui.status_msg = f"Error building queue: {e}"
                     handle_common_actions()
@@ -5804,6 +5956,24 @@ def parse_args() -> argparse.Namespace:
             "the last state commit. Use 0 to disable."
         ),
     )
+    p.add_argument(
+        "--youtube-cookies-from-browser",
+        type=str,
+        default=os.environ.get("YTDLP_COOKIES_FROM_BROWSER"),
+        help=(
+            "Browser to load YouTube cookies from, e.g. chrome, firefox, "
+            "brave, or chrome:Profile 1. Defaults to YTDLP_COOKIES_FROM_BROWSER."
+        ),
+    )
+    p.add_argument(
+        "--youtube-cookies",
+        type=str,
+        default=os.environ.get("YTDLP_COOKIES"),
+        help=(
+            "Netscape cookies.txt file for YouTube. Defaults to YTDLP_COOKIES, "
+            f"then {DEFAULT_YOUTUBE_COOKIES_FILE} when present."
+        ),
+    )
     p.add_argument("--no-tui", action="store_true", help="Disable curses UI.")
     return p.parse_args()
 
@@ -5835,6 +6005,10 @@ if __name__ == "__main__":
     listen_db = library_configs[0][3]
 
     try:
+        youtube_cookie_config = build_youtube_cookie_config(
+            args.youtube_cookies_from_browser,
+            args.youtube_cookies,
+        )
         main(
             initial_mood=args.mood,
             top_n=args.top,
@@ -5847,6 +6021,7 @@ if __name__ == "__main__":
             listen_db_filename=listen_db,
             playback_mode=str(args.mode),
             auto_commit_state_days=max(0, int(args.auto_commit_state_days)),
+            youtube_cookie_config=youtube_cookie_config,
             library_configs=library_configs,
         )
     except SystemExit:

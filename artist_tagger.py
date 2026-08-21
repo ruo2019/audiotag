@@ -622,7 +622,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--ordered",
         action="store_true",
-        help="Process tracks alphabetically instead of shuffled.",
+        help="Process tracks alphabetically. This is now the default.",
+    )
+    parser.add_argument(
+        "--random",
+        action="store_true",
+        help="Shuffle tracks before processing.",
     )
     parser.add_argument(
         "--no-play",
@@ -730,7 +735,7 @@ def main(argv=None) -> int:
             listen_counts_file=listen_counts_file,
             include_existing=args.all,
             review_existing=args.review_existing,
-            random_order=not args.ordered,
+            random_order=args.random,
             no_play=args.no_play,
             count_listens=args.count_listens,
             limit=args.limit,

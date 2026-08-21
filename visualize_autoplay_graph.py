@@ -471,10 +471,34 @@ def encode_timestamps(timestamps):
     return encoded
 
 
+def encode_weighted_timestamps(events):
+    encoded = []
+    previous = None
+    for timestamp, weight in sorted(
+        (int(timestamp), float(weight))
+        for timestamp, weight in events
+        if isinstance(timestamp, (int, float)) and isinstance(weight, (int, float))
+    ):
+        delta = timestamp if previous is None else timestamp - previous
+        encoded.append([delta, round(weight, 6)])
+        previous = timestamp
+    return encoded
+
+
 def trending_weight(duration_seconds: float | None) -> float:
     if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
         return 1.0
     return max(0.0, float(duration_seconds) / TRENDING_BASELINE_DURATION_SECONDS)
+
+
+def decayed_trending_score(weighted_events, timestamp):
+    score = 0.0
+    for played_at, weight in weighted_events:
+        if played_at > timestamp:
+            break
+        age = max(0, timestamp - played_at)
+        score += math.pow(2, -age / TRENDING_HALF_LIFE_SECONDS) * weight
+    return score
 
 
 def build_trending_payload(
@@ -554,6 +578,7 @@ def build_artist_payload(
     artist_history_counts = Counter()
     artist_listen_seconds = defaultdict(float)
     artist_timestamps = defaultdict(list)
+    artist_weighted_events = defaultdict(list)
     artist_song_play_counts = defaultdict(Counter)
     artist_song_details = defaultdict(dict)
     artist_before_context = defaultdict(Counter)
@@ -576,6 +601,7 @@ def build_artist_payload(
             for timestamp in history_mapping.get(song_name, [])
             if isinstance(timestamp, (int, float))
         ]
+        weight = trending_weight(duration_seconds)
         if not artists:
             unassigned_play_count += play_count
             unassigned_listen_seconds += duration_seconds * play_count
@@ -599,6 +625,7 @@ def build_artist_payload(
             artist_history_counts[artist] += len(history)
             artist_listen_seconds[artist] += duration_seconds * play_count
             artist_timestamps[artist].extend(history)
+            artist_weighted_events[artist].extend((timestamp, weight) for timestamp in history)
             artist_song_play_counts[artist][song_name] += play_count
             artist_song_details[artist][song_name] = {
                 "name": song_name,
@@ -626,6 +653,8 @@ def build_artist_payload(
         play_count = int(artist_play_counts[artist])
         listen_seconds = float(artist_listen_seconds[artist])
         timestamps = sorted(artist_timestamps[artist])
+        weighted_events = sorted(artist_weighted_events[artist])
+        current_trending_score = decayed_trending_score(weighted_events, generated_timestamp)
         first_listen = timestamps[0] if timestamps else None
         last_listen = timestamps[-1] if timestamps else None
         active_span_days = (
@@ -682,6 +711,7 @@ def build_artist_payload(
                 "peakDay": peak_day,
                 "peakDayCount": int(peak_day_count),
                 "recent30PlayCount": int(recent_30_play_count),
+                "currentTrendingScore": round(current_trending_score, 6),
                 "averageGapDays": average_gap_days,
                 "longestGapDays": longest_gap_days,
                 "playSize": round(play_size, 2),
@@ -702,11 +732,13 @@ def build_artist_payload(
                     ],
                 },
                 "history": encode_timestamps(timestamps),
+                "weightedHistory": encode_weighted_timestamps(weighted_events),
                 "title": (
                     f"<b>{artist}</b><br>"
                     f"Plays: {play_count}<br>"
                     f"Songs: {song_count}<br>"
-                    f"Listen time: {listen_seconds / 3600:.2f} hours"
+                    f"Listen time: {listen_seconds / 3600:.2f} hours<br>"
+                    f"Trend score: +{current_trending_score:.2f}"
                 ),
             }
         )
@@ -821,6 +853,7 @@ def build_artist_payload(
                 "peakDay": node["peakDay"],
                 "peakDayCount": node["peakDayCount"],
                 "recent30PlayCount": node["recent30PlayCount"],
+                "currentTrendingScore": node["currentTrendingScore"],
                 "averageGapDays": node["averageGapDays"],
                 "longestGapDays": node["longestGapDays"],
                 "songs": node["songs"],
@@ -877,6 +910,8 @@ def build_artist_payload(
                 "songCount": node["songCount"],
                 "listenTimeSeconds": node["listenTimeSeconds"],
                 "history": node["history"],
+                "weightedHistory": node["weightedHistory"],
+                "currentTrendingScore": node["currentTrendingScore"],
             }
         )
 
@@ -898,7 +933,7 @@ def build_artist_payload(
 
     most_played = max(eligible_nodes, key=lambda node: node["playCount"], default=None)
     widest_catalog = max(eligible_nodes, key=lambda node: node["songCount"], default=None)
-    hottest_recent = max(eligible_nodes, key=lambda node: node["recent30PlayCount"], default=None)
+    hottest_recent = max(eligible_nodes, key=lambda node: node["currentTrendingScore"], default=None)
     most_focused = max(
         [node for node in eligible_nodes if node["playCount"] >= 20],
         key=lambda node: node["topSongShare"],
@@ -926,8 +961,8 @@ def build_artist_payload(
         highlight(
             "Hottest lately",
             hottest_recent,
-            f"{hottest_recent['recent30PlayCount']} timestamped plays" if hottest_recent else "",
-            "last 30 days",
+            f"+{hottest_recent['currentTrendingScore']:.2f}" if hottest_recent else "",
+            "same weighted 2d decay as MP3 trending",
         ),
         highlight(
             "Most single-song dominated",
@@ -1009,6 +1044,26 @@ def build_artist_payload(
             "recent30PlayCount": int(
                 sum(timestamp >= unassigned_recent_cutoff for timestamp in unassigned_timestamps)
             ),
+            "currentTrendingScore": round(
+                decayed_trending_score(
+                    [
+                        (
+                            timestamp,
+                            trending_weight(
+                                float(row.get("durationSeconds", 0.0) or 0.0)
+                            ),
+                        )
+                        for row in unassigned_song_details
+                        for timestamp in [
+                            int(value)
+                            for value in history_mapping.get(row["name"], [])
+                            if isinstance(value, (int, float))
+                        ]
+                    ],
+                    generated_timestamp,
+                ),
+                6,
+            ),
             "averageGapDays": round(sum(unassigned_gaps) / len(unassigned_gaps), 2)
             if unassigned_gaps
             else None,
@@ -1060,6 +1115,7 @@ def build_artist_payload(
             "generatedTimestamp": generated_timestamp,
             "generatedFrom": generated_from,
             "trendingHalfLifeSeconds": TRENDING_HALF_LIFE_SECONDS,
+            "trendingBaselineDurationSeconds": TRENDING_BASELINE_DURATION_SECONDS,
         },
         "topArtists": top_artists,
         "highlights": highlights,
@@ -1968,10 +2024,31 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     }}
     .artist-bar-row {{
       display: grid;
-      grid-template-columns: 34px minmax(0, 1fr) 64px;
+      grid-template-columns: 34px 28px minmax(0, 1fr) 64px;
       gap: 8px;
       align-items: center;
       font-size: 13px;
+    }}
+    .artist-color {{
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border: 1px solid var(--trend-track-border);
+      border-radius: 999px;
+      background: transparent;
+      cursor: pointer;
+      overflow: hidden;
+    }}
+    .artist-color::-webkit-color-swatch-wrapper {{
+      padding: 0;
+    }}
+    .artist-color::-webkit-color-swatch {{
+      border: 0;
+      border-radius: 999px;
+    }}
+    .artist-color::-moz-color-swatch {{
+      border: 0;
+      border-radius: 999px;
     }}
     .artist-bar-name {{
       overflow: hidden;
@@ -1980,7 +2057,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       font-weight: 700;
     }}
     .artist-bar-track {{
-      grid-column: 2 / 4;
+      grid-column: 3 / 5;
       height: 8px;
       overflow: hidden;
       border-radius: 999px;
@@ -2386,6 +2463,9 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       margin-bottom: 10px;
     }}
     .artist-inspector-title strong {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
       font-size: 18px;
     }}
     .song-breakdown-row {{
@@ -2956,6 +3036,8 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     let trendingLastPlaybackFrame = null;
     const trendingColorStorageKey = 'audiotagTrendingSongColors:v1';
     let trendingColorOverrides = loadTrendingColorOverrides();
+    const artistColorStorageKey = 'audiotagArtistColors:v1';
+    let artistColorOverrides = loadArtistColorOverrides();
     let orbitSongs = [];
     let orbitSongLookup = new Map();
     let orbitSelectedSong = null;
@@ -3225,6 +3307,23 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       }}
     }}
 
+    function loadArtistColorOverrides() {{
+      try {{
+        const parsed = JSON.parse(localStorage.getItem(artistColorStorageKey) || '{{}}');
+        return parsed && typeof parsed === 'object' ? parsed : {{}};
+      }} catch (_error) {{
+        return {{}};
+      }}
+    }}
+
+    function saveArtistColorOverrides() {{
+      try {{
+        localStorage.setItem(artistColorStorageKey, JSON.stringify(artistColorOverrides));
+      }} catch (_error) {{
+        // Ignore private-mode or quota errors; the picker still works for this session.
+      }}
+    }}
+
     function hexToRgb(hex) {{
       const match = /^#?([a-f\\d]{{2}})([a-f\\d]{{2}})([a-f\\d]{{2}})$/i.exec(hex || '');
       if (!match) {{
@@ -3301,6 +3400,50 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       ];
       const index = hashString(defaultTrendingColorSeed(songName)) % palette.length;
       return {{ a: palette[index][0], b: palette[index][1] }};
+    }}
+
+    function artistColorKey(name) {{
+      return String(name || '').trim();
+    }}
+
+    function artistColors(name) {{
+      const key = artistColorKey(name);
+      const override = artistColorOverrides[key];
+      if (/^#[0-9a-f]{{6}}$/i.test(override || '')) {{
+        return {{
+          a: override,
+          b: mixHex(override, '#ffffff', 0.42),
+          border: mixHex(override, '#142130', 0.2),
+          highlight: mixHex(override, '#ffffff', 0.24),
+        }};
+      }}
+      const colors = mutedSongColors(name);
+      return {{
+        ...colors,
+        border: mixHex(colors.a, '#142130', 0.2),
+        highlight: mixHex(colors.a, '#ffffff', 0.24),
+      }};
+    }}
+
+    function artistColorInput(name) {{
+      const color = artistColors(name).a;
+      return `<input class=\"artist-color\" type=\"color\" value=\"${{escapeHtml(color)}}\" data-artist-color=\"${{escapeHtml(name)}}\" title=\"Set artist color\" aria-label=\"Set artist color for ${{escapeHtml(name)}}\">`;
+    }}
+
+    function wireArtistColorInputs(root = document) {{
+      root.querySelectorAll('input[data-artist-color]').forEach((input) => {{
+        input.addEventListener('click', (event) => event.stopPropagation());
+        input.addEventListener('change', (event) => {{
+          event.stopPropagation();
+          const artist = artistColorKey(event.target.dataset.artistColor || '');
+          const nextColor = String(event.target.value || '').toLowerCase();
+          if (artist && /^#[0-9a-f]{{6}}$/i.test(nextColor)) {{
+            artistColorOverrides[artist] = nextColor;
+            saveArtistColorOverrides();
+            refreshArtistColors();
+          }}
+        }});
+      }});
     }}
 
     function decodeTrendingTimestamps(encoded) {{
@@ -4091,6 +4234,25 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       return decodeTrendingTimestamps(encoded);
     }}
 
+    function decodeArtistWeightedHistory(encoded, fallbackTimestamps) {{
+      if (!Array.isArray(encoded) || !encoded.length) {{
+        return (fallbackTimestamps || []).map((timestamp) => ({{ timestamp, weight: 1 }}));
+      }}
+      const out = [];
+      let current = null;
+      for (let index = 0; index < encoded.length; index += 1) {{
+        const row = encoded[index];
+        const delta = Array.isArray(row) ? Number(row[0]) : Number(row);
+        const weight = Array.isArray(row) ? Number(row[1]) : 1;
+        if (!Number.isFinite(delta)) {{
+          continue;
+        }}
+        current = current === null || index === 0 ? delta : current + delta;
+        out.push({{ timestamp: current, weight: Number.isFinite(weight) && weight > 0 ? weight : 1 }});
+      }}
+      return out;
+    }}
+
     function artistColor(node) {{
       if (node.kind === 'song') {{
         return {{
@@ -4099,10 +4261,11 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
           highlight: {{ background: '#ffb088', border: '#eb5757' }}
         }};
       }}
+      const colors = artistColors(node.label || node.id);
       return {{
-        background: '#ffb36b',
-        border: '#d8792b',
-        highlight: {{ background: '#ff8a65', border: '#eb5757' }}
+        background: colors.a,
+        border: colors.border,
+        highlight: {{ background: colors.highlight, border: colors.border }}
       }};
     }}
 
@@ -4116,7 +4279,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       document.getElementById('artist-unassigned-songs').textContent = formatNumber(summary.unassignedSongCount);
       document.getElementById('artist-edge-count').textContent = formatNumber(summary.artistEdgeCount);
       document.getElementById('artist-stats-subtitle').textContent =
-        `${{summary.folder || '-'}} · untagged MP3s are available in the artist selector`;
+        `${{summary.folder || '-'}} · artist trend scores use the same duration-weighted 2d decay as MP3 trending`;
       document.getElementById('stats-artist-count').textContent = formatNumber(summary.artistCount);
       document.getElementById('stats-tagged-plays').textContent = formatNumber(summary.taggedPlayCount);
       document.getElementById('stats-unassigned-plays').textContent = formatNumber(summary.unassignedPlayCount);
@@ -4124,6 +4287,9 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       artistTimelineRows = ((artistData.trending || {{}}).artists || []).map((artist) => ({{
         ...artist,
         timestamps: decodeArtistHistory(artist.history),
+      }})).map((artist) => ({{
+        ...artist,
+        weightedEvents: decodeArtistWeightedHistory(artist.weightedHistory, artist.timestamps),
       }}));
       artistWeeklyData = null;
       artistFirstTimestamp = Number(summary.firstTimestamp || summary.generatedTimestamp || 0);
@@ -4198,11 +4364,13 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       container.innerHTML = artists.slice(0, 18).map((artist, index) => `
         <div class=\"artist-bar-row\" title=\"${{escapeHtml(artist.label)}}\">
           <div class=\"muted\">#${{index + 1}}</div>
+          ${{artistColorInput(artist.label)}}
           <div class=\"artist-bar-name\">${{escapeHtml(artist.label)}}</div>
           <div>${{formatNumber(artist.playCount)}}</div>
-          <div class=\"artist-bar-track\"><div class=\"artist-bar-fill\" style=\"width:${{Math.max(2, 100 * Number(artist.playCount || 0) / maxPlays).toFixed(1)}}%\"></div></div>
+          <div class=\"artist-bar-track\"><div class=\"artist-bar-fill\" style=\"width:${{Math.max(2, 100 * Number(artist.playCount || 0) / maxPlays).toFixed(1)}}%; background:${{artistMapColor(artist.label)}};\"></div></div>
         </div>
       `).join('') || '<div class=\"muted\">No tagged artists yet.</div>';
+      wireArtistColorInputs(container);
     }}
 
     function renderArtistHighlights() {{
@@ -4228,12 +4396,13 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       let score = 0;
       let count = 0;
       const halfLifeSeconds = Math.max(1, Number((artistData.summary || {{}}).trendingHalfLifeSeconds || 172800));
-      for (const playedAt of artist.timestamps || []) {{
+      for (const event of artist.weightedEvents || []) {{
+        const playedAt = Number(event.timestamp || 0);
         if (playedAt > timestamp) {{
           break;
         }}
         count += 1;
-        score += Math.pow(2, -Math.max(0, timestamp - playedAt) / halfLifeSeconds);
+        score += Math.pow(2, -Math.max(0, timestamp - playedAt) / halfLifeSeconds) * Math.max(0, Number(event.weight || 1));
       }}
       return {{ score, count }};
     }}
@@ -4243,7 +4412,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       const timestamp = artistTimelineTimestamp();
       document.getElementById('artist-timeline-date').textContent = artistTimeline.disabled
         ? 'No timestamped plays for tagged artists.'
-        : `Through ${{formatDateTime(timestamp)}}`;
+        : `Through ${{formatDateTime(timestamp)}} · same weighted score as MP3 trending`;
       const ranked = [];
       for (const artist of artistTimelineRows) {{
         const scored = scoreArtist(artist, timestamp);
@@ -4257,11 +4426,13 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       container.innerHTML = selected.map((artist, index) => `
         <div class=\"artist-bar-row\" title=\"${{escapeHtml(artist.name)}}\">
           <div class=\"muted\">#${{index + 1}}</div>
+          ${{artistColorInput(artist.name)}}
           <div class=\"artist-bar-name\">${{escapeHtml(artist.name)}}</div>
           <div>+${{formatScore(artist.score)}}</div>
-          <div class=\"artist-bar-track\"><div class=\"artist-bar-fill\" style=\"width:${{Math.max(2, 100 * artist.score / maxScore).toFixed(1)}}%\"></div></div>
+          <div class=\"artist-bar-track\"><div class=\"artist-bar-fill\" style=\"width:${{Math.max(2, 100 * artist.score / maxScore).toFixed(1)}}%; background:${{artistMapColor(artist.name)}};\"></div></div>
         </div>
       `).join('') || '<div class=\"muted\">No active artists at this point.</div>';
+      wireArtistColorInputs(container);
     }}
 
     function artistStatsTimestamp() {{
@@ -4311,7 +4482,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     }}
 
     function artistMapColor(name) {{
-      const colors = mutedSongColors(name);
+      const colors = artistColors(name);
       return colors.a;
     }}
 
@@ -4645,14 +4816,15 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
         : 'No top song yet';
       summary.innerHTML = `
         <div class=\"artist-inspector-title\">
-          <strong>${{escapeHtml(node.label)}}</strong>
+          <strong>${{artistColorInput(node.label)}} ${{escapeHtml(node.label)}}</strong>
           <span class=\"muted\">${{formatNumber(node.songCount)}} songs · ${{formatListenTime(node.listenTimeSeconds)}}</span>
         </div>
         <div class=\"muted\">Top song: ${{topSong}}</div>
       `;
+      wireArtistColorInputs(summary);
       metrics.innerHTML = `
         <div class=\"metric\"><div class=\"label\">Plays</div><div class=\"value\">${{formatNumber(node.playCount)}}</div></div>
-        <div class=\"metric\"><div class=\"label\">Recent 30d</div><div class=\"value\">${{formatNumber(node.recent30PlayCount)}}</div></div>
+        <div class=\"metric\"><div class=\"label\">Trend score</div><div class=\"value\">+${{formatScore(node.currentTrendingScore)}}</div></div>
         <div class=\"metric\"><div class=\"label\">Active days</div><div class=\"value\">${{formatNumber(node.activeDayCount)}}</div></div>
         <div class=\"metric\"><div class=\"label\">Longest gap</div><div class=\"value\">${{node.longestGapDays === null || node.longestGapDays === undefined ? '-' : Number(node.longestGapDays).toFixed(1) + 'd'}}</div></div>
       `;
@@ -4665,6 +4837,25 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       renderArtistTakeoverPlot();
       renderArtistOrbitPlot();
       renderSelectedArtistDetails();
+    }}
+
+    function refreshArtistColors() {{
+      const selectedGraphNodeId = artistSelectedId;
+      renderArtistBars();
+      renderArtistTimeline();
+      renderArtistStatsRace();
+      renderArtistTakeoverPlot();
+      renderArtistOrbitPlot();
+      if (selectedStatsArtist) {{
+        showArtistInspector(selectedStatsArtist);
+      }} else {{
+        renderSelectedArtistDetails();
+      }}
+      createArtistNetwork();
+      if (selectedGraphNodeId && artistNetwork) {{
+        artistNetwork.selectNodes([selectedGraphNodeId]);
+        showArtistNodeDetails(selectedGraphNodeId);
+      }}
     }}
 
     function wireStatsStageSelection(stage) {{
@@ -4685,7 +4876,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       }}
       const timestamp = artistStatsTimestamp();
       document.getElementById('artist-orbit-caption').textContent =
-        artistStatsTimeline.disabled ? 'No timestamped artist plays yet.' : `Through ${{formatDateTime(timestamp)}} · closer to center = stronger current momentum`;
+        artistStatsTimeline.disabled ? 'No timestamped artist plays yet.' : `Through ${{formatDateTime(timestamp)}} · closer to center = stronger weighted trend`;
       const ranked = [];
       for (const artist of artistTimelineRows) {{
         const scored = scoreArtist(artist, timestamp);
@@ -4704,7 +4895,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
         const top = 50 + Math.sin(angle) * radius * 0.72;
         const label = escapeHtml(artist.name);
         return `
-          <button class=\"moving-point\" data-artist=\"${{label}}\" style=\"left:${{left.toFixed(2)}}%; top:${{top.toFixed(2)}}%; background:${{artistMapColor(artist.name)}};\" title=\"${{label}} · +${{formatScore(artist.score)}} momentum\">${{indexSafeLabel(artist.name)}}</button>
+          <button class=\"moving-point\" data-artist=\"${{label}}\" style=\"left:${{left.toFixed(2)}}%; top:${{top.toFixed(2)}}%; background:${{artistMapColor(artist.name)}};\" title=\"${{label}} · +${{formatScore(artist.score)}} weighted trend\">${{indexSafeLabel(artist.name)}}</button>
           <div class=\"moving-label\" style=\"left:${{left.toFixed(2)}}%; top:${{top.toFixed(2)}}%;\">${{label}}</div>
         `;
       }}).join('') || '<div class=\"muted\" style=\"padding:18px;\">No artist orbit at this point.</div>';
@@ -4750,7 +4941,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       const timestamp = artistStatsTimestamp();
       document.getElementById('artist-stats-date').textContent = artistStatsTimeline.disabled
         ? 'No timestamped artist plays yet.'
-        : `Through ${{formatDateTime(timestamp)}}`;
+        : `Through ${{formatDateTime(timestamp)}} · same weighted score as MP3 trending`;
       const ranked = [];
       for (const artist of artistTimelineRows) {{
         const progress = artistProgressAt(artist, timestamp);
@@ -4765,11 +4956,13 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       container.innerHTML = selected.map((artist, index) => `
         <div class=\"artist-bar-row\" title=\"${{escapeHtml(artist.name)}}\">
           <div class=\"muted\">#${{index + 1}}</div>
+          ${{artistColorInput(artist.name)}}
           <div class=\"artist-bar-name\">${{escapeHtml(artist.name)}}</div>
           <div>+${{formatScore(artist.score)}}</div>
           <div class=\"artist-bar-track\"><div class=\"artist-bar-fill\" style=\"width:${{Math.max(2, 100 * artist.score / maxScore).toFixed(1)}}%; background:${{artistMapColor(artist.name)}};\"></div></div>
         </div>
       `).join('') || '<div class=\"muted\">No active artists at this point.</div>';
+      wireArtistColorInputs(container);
     }}
 
     function renderArtistPhaseMap() {{
@@ -5153,7 +5346,11 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       if (node.kind !== 'song') {{
         showArtistInspector(node.label);
       }}
-      document.getElementById('artist-selection-summary').innerHTML = `<strong>${{escapeHtml(node.label)}}</strong>`;
+      const selectionSummary = document.getElementById('artist-selection-summary');
+      selectionSummary.innerHTML = node.kind === 'song'
+        ? `<strong>${{escapeHtml(node.label)}}</strong>`
+        : `<strong style=\"display:inline-flex;align-items:center;gap:8px;\">${{artistColorInput(node.label)}} ${{escapeHtml(node.label)}}</strong>`;
+      wireArtistColorInputs(selectionSummary);
       const songs = (node.songs || []).slice(0, 12).map((song) => `<div class=\"item\"><strong>${{escapeHtml(song)}}</strong></div>`).join('');
       const topSongLine = node.topSong
         ? `<div class=\"item\"><strong>Top song</strong><div class=\"muted\">${{escapeHtml(node.topSong)}} · ${{formatNumber(node.topSongPlays)}} plays · ${{(Number(node.topSongShare || 0) * 100).toFixed(0)}}% of artist plays</div></div>`
@@ -5174,7 +5371,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
           <div class=\"metric\"><div class=\"label\">Listen time</div><div class=\"value\">${{formatListenTime(node.listenTimeSeconds)}}</div></div>
           <div class=\"metric\"><div class=\"label\">History</div><div class=\"value\">${{formatNumber(node.historyCount)}}</div></div>
           <div class=\"metric\"><div class=\"label\">Plays/song</div><div class=\"value\">${{Number(node.playsPerSong || 0).toFixed(1)}}</div></div>
-          <div class=\"metric\"><div class=\"label\">Last 30d</div><div class=\"value\">${{formatNumber(node.recent30PlayCount)}}</div></div>
+          <div class=\"metric\"><div class=\"label\">Trend score</div><div class=\"value\">+${{formatScore(node.currentTrendingScore)}}</div></div>
         </div>
         <div class=\"list\">${{topSongLine}}${{timeWindowLine}}${{peakLine}}${{gapLine}}</div>
         ${{songs ? `<h4>Tagged songs</h4><div class=\"list\">${{songs}}</div>` : ''}}

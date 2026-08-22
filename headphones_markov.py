@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import numpy as np
 import pygame
@@ -62,6 +62,8 @@ DOWNLOAD_LIST_FILE = "download_list.txt"
 DOWNLOAD_LIST_BLANK_AFTER_DAYS = 3
 AUTO_COMMIT_STATE_DEFAULT_DAYS = 1
 AUTO_COMMIT_STATE_CHECK_SECONDS = 10 * 60
+AUTO_COMMIT_STATE_AFTER_LOCAL_HOUR = 11
+AUTO_COMMIT_STATE_AFTER_LOCAL_MINUTE = 0
 AUTO_COMMIT_STATE_PATTERNS = (
     "listen_counts*.json",
     "listen_timestamps*.json",
@@ -99,6 +101,9 @@ TRUE_PEAK_LIMIT_DBTP = -1.0
 LISTEN_DB_FILE = "listen_counts.json"
 LISTEN_TIMESTAMPS_FILE = "listen_timestamps.json"
 MARKOV_SESSION_CUTOFF_SECONDS = 10 * 60
+MARKOV_RANDOM_FALLBACK_PROBABILITY = 0.05
+AutoTrackKey = Tuple[int, str]
+ChoiceKey = TypeVar("ChoiceKey")
 
 # Globals for exit/lock state
 EXIT_NOW = threading.Event()
@@ -282,19 +287,23 @@ def auto_commit_state_changes(
         if not candidate_files:
             return None
         changed_files = sorted(candidate_files)
-        has_untracked_state_files = any(
-            run_git(["ls-files", "--error-unmatch", "--", path]).returncode != 0
-            for path in changed_files
+        now_dt = datetime.now()
+        auto_commit_after = now_dt.replace(
+            hour=AUTO_COMMIT_STATE_AFTER_LOCAL_HOUR,
+            minute=AUTO_COMMIT_STATE_AFTER_LOCAL_MINUTE,
+            second=0,
+            microsecond=0,
         )
+        if now_dt < auto_commit_after:
+            return None
 
         last = run_git(["log", "-1", "--format=%ct", "--", *pathspecs])
-        if (
-            not has_untracked_state_files
-            and last.returncode == 0
-            and last.stdout.strip()
-        ):
-            elapsed = time.time() - int(last.stdout.strip().splitlines()[0])
-            if elapsed < cadence_days * 24 * 60 * 60:
+        if last.returncode == 0 and last.stdout.strip():
+            last_commit_dt = datetime.fromtimestamp(
+                int(last.stdout.strip().splitlines()[0])
+            )
+            elapsed_days = (now_dt.date() - last_commit_dt.date()).days
+            if elapsed_days < cadence_days:
                 return None
 
         run_git(["add", "-A", "-f", "--", *changed_files], check=True)
@@ -1024,7 +1033,88 @@ def build_markov_transition_counts(
     return transitions, global_counts
 
 
-def weighted_choice(weights: Dict[str, float]) -> Optional[str]:
+def build_combined_markov_transition_counts(
+    library_states: List[LibraryState],
+    session_cutoff_seconds: float = MARKOV_SESSION_CUTOFF_SECONDS,
+) -> Tuple[Dict[AutoTrackKey, Dict[AutoTrackKey, int]], Dict[AutoTrackKey, int]]:
+    transitions: Dict[AutoTrackKey, Dict[AutoTrackKey, int]] = {}
+    global_counts: Dict[AutoTrackKey, int] = {}
+    known_tracks_by_library: Dict[int, set[str]] = {}
+    duration_by_key: Dict[AutoTrackKey, float] = {}
+
+    for library_idx, state in enumerate(library_states):
+        known_tracks: set[str] = set()
+        try:
+            for path in state.mp3_folder.iterdir():
+                if path.is_file() and path.suffix.lower() == ".mp3":
+                    known_tracks.add(path.name)
+                    duration_by_key[(library_idx, path.name)] = float(
+                        state.history_duration_by_track_name.get(path.name, 0.0) or 0.0
+                    )
+        except Exception:
+            pass
+        known_tracks_by_library[library_idx] = known_tracks
+
+    events: List[Tuple[datetime, AutoTrackKey, bool]] = []
+    for library_idx, state in enumerate(library_states):
+        known_tracks = known_tracks_by_library.get(library_idx, set())
+        for item in state.listen_timestamps:
+            if not isinstance(item, dict):
+                continue
+            is_auto = str(item.get("source") or "manual").lower() == "auto"
+            track = item.get("track")
+            stamp = item.get("timestamp")
+            if not track or not stamp:
+                continue
+            track_name = str(track)
+            if known_tracks and track_name not in known_tracks:
+                continue
+            try:
+                events.append(
+                    (
+                        datetime.fromisoformat(str(stamp)),
+                        (library_idx, track_name),
+                        is_auto,
+                    )
+                )
+            except Exception:
+                continue
+
+    events.sort(key=lambda item: item[0])
+
+    for _, track_key, is_auto in events:
+        if is_auto:
+            continue
+        global_counts[track_key] = global_counts.get(track_key, 0) + 1
+
+    for index in range(len(events) - 1):
+        current_finish, current_key, current_is_auto = events[index]
+        next_finish, next_key, next_is_auto = events[index + 1]
+        if current_is_auto or next_is_auto:
+            continue
+        next_duration = float(duration_by_key.get(next_key, 0.0) or 0.0)
+        if next_duration <= 0.0:
+            next_library_idx, next_track = next_key
+            next_path = library_states[next_library_idx].mp3_folder / next_track
+            if next_path.exists():
+                next_duration = get_audio_duration_seconds(next_path)
+                duration_by_key[next_key] = next_duration
+                library_states[next_library_idx].history_duration_by_track_name[
+                    next_track
+                ] = next_duration
+        next_start = next_finish - timedelta(seconds=max(0.0, next_duration))
+        gap_seconds = (next_start - current_finish).total_seconds()
+        if gap_seconds < 0.0:
+            gap_seconds = 0.0
+        if gap_seconds > float(session_cutoff_seconds):
+            continue
+        current_counts = transitions.setdefault(current_key, {})
+        current_counts[next_key] = current_counts.get(next_key, 0) + 1
+
+    return transitions, global_counts
+
+
+def weighted_choice(weights: Dict[ChoiceKey, float]) -> Optional[ChoiceKey]:
     items = [(name, float(weight)) for name, weight in weights.items() if float(weight) > 0.0]
     if not items:
         return None
@@ -1033,22 +1123,62 @@ def weighted_choice(weights: Dict[str, float]) -> Optional[str]:
     return random.choices(population, weights=probabilities, k=1)[0]
 
 
-def choose_auto_track_name(
-    previous_track_name: Optional[str],
-    transitions: Dict[str, Dict[str, int]],
-    global_counts: Dict[str, int],
-) -> Optional[str]:
-    if previous_track_name:
-        local_weights = transitions.get(previous_track_name) or {}
-        picked = weighted_choice({name: float(weight) for name, weight in local_weights.items()})
+def scaled_choice_weights(
+    primary_weights: Dict[ChoiceKey, float],
+    fallback_weights: Dict[ChoiceKey, float],
+    fallback_probability: float,
+) -> Dict[ChoiceKey, float]:
+    primary_total = sum(
+        max(0.0, float(weight)) for weight in primary_weights.values()
+    )
+    fallback_total = sum(
+        max(0.0, float(weight)) for weight in fallback_weights.values()
+    )
+    fallback_probability = max(0.0, min(1.0, float(fallback_probability)))
+
+    if primary_total <= 0.0:
+        return {name: float(weight) for name, weight in fallback_weights.items()}
+    if fallback_total <= 0.0 or fallback_probability <= 0.0:
+        return {name: float(weight) for name, weight in primary_weights.items()}
+
+    combined: Dict[ChoiceKey, float] = {}
+    primary_probability = 1.0 - fallback_probability
+    for name, weight in primary_weights.items():
+        weight = max(0.0, float(weight))
+        if weight > 0.0:
+            combined[name] = (
+                combined.get(name, 0.0) + primary_probability * weight / primary_total
+            )
+    for name, weight in fallback_weights.items():
+        weight = max(0.0, float(weight))
+        if weight > 0.0:
+            combined[name] = (
+                combined.get(name, 0.0)
+                + fallback_probability * weight / fallback_total
+            )
+    return combined
+
+
+def choose_auto_track_key(
+    previous_track_key: Optional[AutoTrackKey],
+    transitions: Dict[AutoTrackKey, Dict[AutoTrackKey, int]],
+    global_counts: Dict[AutoTrackKey, int],
+) -> Optional[AutoTrackKey]:
+    fallback_weights: Dict[AutoTrackKey, float] = {
+        name: 1.0 for name, count in global_counts.items() if int(count) > 0
+    }
+    if previous_track_key:
+        local_weights = transitions.get(previous_track_key) or {}
+        picked = weighted_choice(
+            scaled_choice_weights(
+                {name: float(weight) for name, weight in local_weights.items()},
+                fallback_weights,
+                MARKOV_RANDOM_FALLBACK_PROBABILITY,
+            )
+        )
         if picked:
             return picked
 
-    fallback_weights: Dict[str, float] = {
-        name: float(count) for name, count in global_counts.items() if int(count) > 0
-    }
-    if previous_track_name:
-        fallback_weights[previous_track_name] = fallback_weights.get(previous_track_name, 0.0) + 3.0
     return weighted_choice(fallback_weights)
 
 
@@ -3830,6 +3960,9 @@ def main(
     display_tabs = library_tabs + ["youtube"]
     for idx, state in enumerate(library_states):
         state.label = library_tabs[idx]
+    auto_markov_transitions, auto_markov_global_counts = (
+        build_combined_markov_transition_counts(library_states)
+    )
 
     if logging:
         print(f"Loading model '{MODEL_NAME}' on '{DEVICE}'...")
@@ -3906,7 +4039,7 @@ def main(
     current_playing_item: Optional[Dict[str, object]] = None
     current_playing_tag_session: Optional[TrackTagSession] = None
     skip_requeue_item: Optional[Dict[str, object]] = None
-    last_completed_track_name: Optional[str] = None
+    last_completed_track_key: Optional[AutoTrackKey] = None
     stats_query_result: Optional[str] = None
     youtube_results: List[YouTubeResult] = []
     youtube_query = ""
@@ -4504,20 +4637,23 @@ def main(
         active_state.duration_by_stem = duration_by_stem
 
     def enqueue_auto_track(tui: Optional[CursesTUI]) -> bool:
-        track_name = choose_auto_track_name(
-            previous_track_name=last_completed_track_name,
-            transitions=markov_transitions,
-            global_counts=markov_global_counts,
+        track_key = choose_auto_track_key(
+            previous_track_key=last_completed_track_key,
+            transitions=auto_markov_transitions,
+            global_counts=auto_markov_global_counts,
         )
-        if not track_name:
+        if not track_key:
             if tui and tui.enable:
                 tui.status_msg = "Auto mode has no Markov data yet."
             return False
-        track_path = mp3_folder / track_name
+        track_library_idx, track_name = track_key
+        track_state = library_states[track_library_idx]
+        track_path = track_state.mp3_folder / track_name
         if not track_path.exists():
             if tui and tui.enable:
                 tui.status_msg = f"Auto track missing on disk: {track_name}"
             return False
+        activate_library(track_library_idx, tui)
         ensure_audio_data_for_tracks([track_path])
         enqueue_item(
             make_queue_item(
@@ -4526,22 +4662,18 @@ def main(
                 False,
                 "auto",
                 "auto",
-                active_library_idx,
+                track_library_idx,
             ),
-            active_library_idx,
+            track_library_idx,
             switch_context=True,
         )
-        if tui and tui.enable:
-            tui.status_msg = f"Auto-picked: {track_path.stem}"
         return True
 
     def toggle_playback_mode(tui: Optional[CursesTUI]) -> None:
         nonlocal playback_mode
         playback_mode = "auto" if playback_mode == "manual" else "manual"
         if tui and tui.enable:
-            if playback_mode == "auto":
-                tui.status_msg = "Auto mode armed. Manual current/queued tracks will finish first."
-            else:
+            if playback_mode == "manual":
                 tui.status_msg = "Manual mode active."
 
     def listen_hours_for_stem(stem: str, listens: int) -> float:
@@ -4798,7 +4930,7 @@ def main(
         The YouTube tab stops only the side-player. Library tabs clear the shared
         MP3 queue and stop any currently playing local MP3.
         """
-        nonlocal skip_requeue_item
+        nonlocal last_completed_track_key, playback_mode, skip_requeue_item
 
         if active_tab_idx == youtube_tab_idx:
             stop_youtube_side_players()
@@ -4806,6 +4938,8 @@ def main(
                 tui.status_msg = "Stopped YouTube playback."
             return False
 
+        playback_mode = "manual"
+        last_completed_track_key = None
         removed = len(queue)
         queue.clear()
         for state in library_states:
@@ -5584,7 +5718,10 @@ def main(
                 if not isinstance(track_path, Path):
                     current_playing_item = None
                     continue
-                track_state = library_state_for_item(current_item)
+                track_library_idx = queue_item_library_idx(current_item)
+                if track_library_idx is None:
+                    track_library_idx = active_library_idx
+                track_state = library_states[track_library_idx]
                 track_tag_session = track_state.tag_session
                 current_playing_tag_session = track_tag_session
                 track_tag_session.start(track_path)
@@ -5784,7 +5921,10 @@ def main(
                                 )
 
                         if reached_end:
-                            last_completed_track_name = track_path.name
+                            last_completed_track_key = (
+                                track_library_idx,
+                                track_path.name,
+                            )
                             trailing_tag = (
                                 tui.input_buffer.strip()
                                 if enable_tui and tui.input_mode in ("tag_add", "tag_edit")
@@ -5810,8 +5950,6 @@ def main(
                                 f"Recorded listen: {track_path.stem} "
                                 f"({track_state.counts.get(track_path.stem, 0)})"
                             )
-                            if track_source == "auto":
-                                listen_msg += "; marked auto"
                             if saved_tags:
                                 listen_msg += f"; saved {saved_tags} tag(s)"
                             set_library_status(track_state, listen_msg, tui)
@@ -5952,8 +6090,10 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=AUTO_COMMIT_STATE_DEFAULT_DAYS,
         help=(
-            "Auto-commit changed player state files after this many days since "
-            "the last state commit. Use 0 to disable."
+            "Auto-commit changed player state files once per local date after "
+            f"{AUTO_COMMIT_STATE_AFTER_LOCAL_HOUR:02d}:"
+            f"{AUTO_COMMIT_STATE_AFTER_LOCAL_MINUTE:02d}. Values above 1 require "
+            "that many local dates since the last state commit. Use 0 to disable."
         ),
     )
     p.add_argument(

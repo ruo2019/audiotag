@@ -65,7 +65,8 @@ AUTO_COMMIT_STATE_CHECK_SECONDS = 10 * 60
 AUTO_COMMIT_STATE_AFTER_LOCAL_HOUR = 11
 AUTO_COMMIT_STATE_AFTER_LOCAL_MINUTE = 0
 AUTO_COMMIT_STATE_PATTERNS = (
-    "listen_counts*.json",
+    "listen_counts.json",
+    "mid_listen_counts.json",
     "listen_timestamps*.json",
     "tags.json",
     "mid_tags.json",
@@ -5147,7 +5148,6 @@ def main(
                     active_library_idx,
                 ),
                 active_library_idx,
-                switch_context=True,
                 tui=tui,
             )
             tui.status_msg = f"Queued: {base}"
@@ -5177,7 +5177,6 @@ def main(
                     active_library_idx,
                 ),
                 active_library_idx,
-                switch_context=True,
                 tui=tui,
             )
             tui.status_msg = f"Queued: {name}"

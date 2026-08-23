@@ -1,61 +1,191 @@
 # Audiotag
 
-Instructions:
+Audiotag is a local MP3 tagging, playback, and library-maintenance toolkit. The
+current repo is centered around mood-tagged playback, listen history, queue
+management, Markov/autoplay experiments, artist tagging, MP3 trimming, renaming,
+and YouTube-audio helper workflows.
 
-1. `git clone https://github.com/qingy1337/audiotag.git`
-2. `cd audiotag`
-3. Put mp3 files into `./static/mp3/`
-4. Open Terminal / iTerm
-5. `python app.py`
-6. Navigate to `127.0.0.1:5000` in a new browser tab
-7. Add tags with `Enter`
-8. If you click `Next MP3` and nothing happens, do *not* click it again. Just refresh the page.
-9. After tagging all mp3 files, run `python app.py -mood "some mood, some other mood, etc" -top 10 # top 10 mp3s that match`
+The default music libraries are:
 
-Note: will load a 110M sentence-transformers model to run locally.
+- `static/mp3/` with metadata in `tags.json`, `artists.json`,
+  `listen_counts.json`, and `listen_timestamps_mp3.json`
+- `static/mid-mp3s/` with metadata in `mid_tags.json`, `mid_artists.json`,
+  `mid_listen_counts.json`, and `listen_timestamps_mid-mp3s.json`
 
-## MP3 trimming without re-encoding
+Older copies and experiments live in files named `*copy*.py`, `*_original.py`,
+`shorter.py`, and `Archive 2/`. Prefer the top-level scripts documented below
+unless you are intentionally comparing old behavior.
 
-Run the interactive trimmer:
+## Setup
+
+Use Python 3.10+ and install FFmpeg before using playback analysis, trimming,
+mixing, or YouTube helpers.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install flask werkzeug pygame sentence-transformers scikit-learn torch pydub tabulate numpy mutagen yt-dlp
+```
+
+On macOS:
+
+```bash
+brew install ffmpeg
+# optional, used by link.py for pinned audio output
+brew install mpv
+```
+
+The first mood-search run downloads a local Sentence Transformers model. Current
+players use `sentence-transformers/all-MiniLM-L6-v2`; the older `player.py` uses
+`sentence-transformers/sentence-t5-base`.
+
+## Main Player
+
+`headphones_markov.py` is the most current player. By default it opens both
+`static/mp3` and `static/mid-mp3s` as TUI library tabs, supports manual mood
+search, listen tracking, and an auto mode backed by play-history transitions.
+
+```bash
+python headphones_markov.py
+python headphones_markov.py --mood "calm ambient study" --top 5
+python headphones_markov.py --mode auto
+python headphones_markov.py --folder static/mp3 --tags tags.json
+python headphones_markov.py --folders static/mp3 static/mid-mp3s
+```
+
+Useful options:
+
+- `--vol -16` sets target integrated LUFS; otherwise the sample track is used.
+- `--sample "Deep Stone Crypt Theme.mp3"` selects the reference track.
+- `--no-tui` disables the curses UI.
+- `--youtube-cookies-from-browser chrome` or `--youtube-cookies cookies.txt`
+  configures YouTube helpers used by the Markov player.
+
+Related players:
+
+- `gui.py` opens the queue GUI by default and has `--tui` for the legacy curses
+  loop.
+- `headphones.py` is the non-Markov mood TUI with listen counters and
+  Similar/Most tabs.
+- `player.py` is the older required-`--mood` looping player.
+- `play.py` is a terminal player for direct folder playback and volume analysis.
+
+## Tag MP3s
+
+The Flask tagger writes mood tags to `tags.json`.
+
+```bash
+python app.py
+```
+
+Open `http://127.0.0.1:5000`, tag tracks from `static/mp3/`, and submit tags
+from the browser. `app.py` only works on the main `static/mp3` library unless you
+change its constants.
+
+For artist metadata:
+
+```bash
+python artist_tagger.py
+python artist_tagger.py --mid
+python artist_tagger.py --all --limit 25
+python artist_tagger.py --list-output-devices
+```
+
+Artist tags are stored separately from mood tags.
+
+## Trim MP3s
+
+`mp3_trimmer.py` runs a browser UI for frame-copy MP3 trimming. It requires
+`ffmpeg` and `ffprobe`.
 
 ```bash
 python mp3_trimmer.py
 ```
 
-Then open `http://127.0.0.1:5050`.
+Open `http://127.0.0.1:5111`. The trimmer reads from `static/mp3/`,
+`static/mid-mp3s/`, `static/trim-uploads/`, and `static/trimmed/`; outputs go to
+`static/trimmed/`. It uses FFmpeg copy mode (`-c copy`), so audio is not
+re-encoded and cuts land on MP3 frame boundaries.
 
-The trimmer uses FFmpeg copy mode (`-c copy`) so MP3 audio frames are not re-encoded. Output files go to `static/trimmed/`, and uploaded files go to `static/trim-uploads/`. Trim points are entered in milliseconds; the actual cut lands on MP3 frame boundaries, which is normally much smaller than half a second.
+## Rename Tracks
 
-## Rename an MP3 and update metadata
-
-Run the interactive helper:
+Use `rename_mp3.py` when changing filenames. It updates MP3 files plus known
+Audiotag metadata, listen counts, playlists, artist files, and caches.
 
 ```bash
 python rename_mp3.py
-```
-
-It lets you choose a library, choose a track, type the new name, preview the metadata changes, and confirm before anything is written.
-
-You can still preview a rename directly:
-
-```bash
 python rename_mp3.py "Old Name" "New Name"
-```
-
-Apply it:
-
-```bash
 python rename_mp3.py "Old Name" "New Name" --apply
+python rename_mp3.py "Old Name" "New Name" --mid --apply
 ```
 
-For the mid library, pass the folder:
+Without `--apply`, command-line mode is a dry run.
+
+## Visualize Play History
+
+Generate an autoplay graph from listen history:
 
 ```bash
-python rename_mp3.py "Old Name" "New Name" --folder static/mid-mp3s --apply
+python visualize_autoplay_graph.py mp3
+python visualize_autoplay_graph.py mid-mp3s
+python visualize_autoplay_graph.py all --live
 ```
 
-Or use the shortcut:
+Generate a simpler Markov transition graph:
 
 ```bash
-python rename_mp3.py --mid
+python markov_graph.py --folder static/mp3
 ```
+
+Both commands write interactive HTML files in the repo root unless `--output` is
+provided.
+
+## YouTube Helpers
+
+Search and preview YouTube audio interactively:
+
+```bash
+python link.py "song search text" -n 10 --titles
+```
+
+Bulk-download audio from a line-based input file:
+
+```bash
+python bulk_download_mp3s.py download_list.txt --dry-run
+python bulk_download_mp3s.py download_list.txt
+```
+
+Each non-empty line should be:
+
+```text
+VIDEO_ID title [m|mm]
+```
+
+Use `[m]` for `static/mp3` and `[mm]` for `static/mid-mp3s`. YouTube cookie
+configuration can come from `YTDLP_COOKIES` or a cookies file passed with
+`--cookies`.
+
+## Other Utilities
+
+```bash
+python mp3_to_json.py static/mp3 -o mp3_filenames.json
+python align_mix.py reference.mp3 overlay.mp3 output.mp3 --dry-run
+python reverse.py
+```
+
+`align_mix.py` uses FFmpeg to align and mix two MP3s. `mp3_to_json.py` exports
+MP3 stems. `reverse.py` is a small ad hoc audio utility.
+
+## Generated Data
+
+The players and tools write local state while you use them:
+
+- Listen counts and timestamps: `listen_counts.json`,
+  `mid_listen_counts.json`, `listen_timestamps_*.json`
+- Queue state: `queue_playlists_*.json`
+- Embedding/loudness caches inside MP3 folders:
+  `.track_emb_cache.npz`, `.loudness_cache.json`
+- Generated visualizations: `autoplay_graph_*.html`, `markov_graph_*.html`
+
+These files are part of the working library state, so expect them to change after
+playback, tagging, renaming, graphing, or trimming.

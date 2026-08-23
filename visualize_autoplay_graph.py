@@ -270,6 +270,8 @@ def load_repo_history_mapping(folder: Path, repo_root: Path, song_counts):
         for item in raw:
             if not isinstance(item, dict):
                 continue
+            if str(item.get("source") or "manual").lower() == "auto":
+                continue
             song_name = item.get("track")
             timestamp = parse_repo_timestamp(item.get("timestamp"))
             if song_name in history_mapping and timestamp is not None:

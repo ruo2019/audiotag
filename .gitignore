@@ -15,14 +15,6 @@ venv/
 .venv/
 demucs-venv/
 
-# Local audio/media files
-*.mp3
-*.wav
-*.flac
-*.m4a
-*.aac
-*.ogg
-
 # Generated audio separation/model outputs
 separated/
 
@@ -46,13 +38,5 @@ download_list.txt
 audio_features_cache.json
 
 # Local/generated artifacts
-*.npz
-*.cache
-.loudness_cache.json
-.track_emb_cache.npz
+static/
 !templates/trimmer.html
-*.midi
-*.pdf
-*.mscz
-static/.mscbackup/.everything_I_wanted_-_billie_eilish.mscz~
-*.DS_Store

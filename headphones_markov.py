@@ -387,12 +387,14 @@ def load_playlists(db_filename: str) -> Dict[str, List[dict]]:
             base = item.get("base")
             if not base:
                 continue
-            clean.append(
-                {
-                    "base": str(base),
-                    "play_once": bool(item.get("play_once", False)),
-                }
-            )
+            clean_item = {
+                "base": str(base),
+                "play_once": bool(item.get("play_once", False)),
+            }
+            library = item.get("library")
+            if library:
+                clean_item["library"] = str(library)
+            clean.append(clean_item)
         out[str(name)] = clean
     return out
 
@@ -2829,6 +2831,7 @@ class CursesTUI:
         current_tags: Optional[List[str]] = None,
         pending_tags: Optional[List[str]] = None,
         active_playlist_name: Optional[str] = None,
+        active_playlist_library_label: str = "",
         active_playlist_items: Optional[List[dict]] = None,
         library_tabs: Optional[List[str]] = None,
         active_library_idx: int = 0,
@@ -3014,6 +3017,25 @@ class CursesTUI:
                     return play_once
                 source = str(item.get("source") or "manual")
                 return play_once or (playback_mode == "auto" and source == "manual")
+
+            def display_library_marker(marker: str) -> str:
+                if marker == "mp3":
+                    return "m"
+                if marker == "mid-mp3s":
+                    return "mm"
+                return marker[:4] or "?"
+
+            def display_playlist_item_name(item: Dict[str, object]) -> str:
+                base = str(item.get("base") or "(unknown)")
+                marker = str(item.get("library") or active_playlist_library_label or "")
+                active_label = (
+                    self.library_tabs[self.active_library_idx]
+                    if 0 <= self.active_library_idx < len(self.library_tabs)
+                    else ""
+                )
+                if marker and marker != active_label:
+                    base = f"[{display_library_marker(marker)}] {base}"
+                return base
 
             def render_pane(
                 title: str, rows: List[str], x: int, y: int, width: int, height: int
@@ -3415,7 +3437,7 @@ class CursesTUI:
                         min(self.playlist_track_len, self.playlist_track_scroll + p_content_h),
                     ):
                         item = playlist_items[order[i]]
-                        base = str(item.get("base") or "(unknown)")
+                        base = display_playlist_item_name(item)
                         mode = "once" if bool(item.get("play_once")) else "loop"
                         if (
                             self.playlist_item_drag_start is not None
@@ -3435,6 +3457,14 @@ class CursesTUI:
                     p_suffix = "]" if p_focused else ""
                     load_chip = "[load]"
                     done_chip = "[done]"
+                    playlist_title = str(active_playlist_name)
+                    active_label = (
+                        self.library_tabs[self.active_library_idx]
+                        if 0 <= self.active_library_idx < len(self.library_tabs)
+                        else ""
+                    )
+                    if active_playlist_library_label and active_playlist_library_label != active_label:
+                        playlist_title = f"{active_playlist_library_label}/{playlist_title}"
                     title_name_w = max(
                         1,
                         right_w
@@ -3445,7 +3475,7 @@ class CursesTUI:
                         - 4,
                     )
                     p_title = (
-                        f"{p_focus}{active_playlist_name[:title_name_w]}{p_suffix} "
+                        f"{p_focus}{playlist_title[:title_name_w]}{p_suffix} "
                         f"{load_chip} {done_chip}"
                     )
                     load_idx = p_title.find(load_chip)
@@ -3992,6 +4022,7 @@ def main(
     resolved_target_loudness = active_state.resolved_target_loudness
     duration_by_stem = active_state.duration_by_stem
     active_playlist_name = active_state.active_playlist_name
+    active_playlist_library_idx = active_library_idx
 
     EMB_CACHE.ensure(model, tags_data, artists_data, mp3_folder, logging=logging)
 
@@ -4301,7 +4332,6 @@ def main(
         state.audio_data = audio_data
         state.resolved_target_loudness = resolved_target_loudness
         state.duration_by_stem = duration_by_stem
-        state.active_playlist_name = active_playlist_name
 
     def activate_library(idx: int, tui: Optional[CursesTUI] = None) -> None:
         nonlocal active_library_idx, active_tab_idx, active_state, mp3_folder, tags_file
@@ -4309,7 +4339,7 @@ def main(
         nonlocal listen_timestamps_filename, markov_transitions, markov_global_counts
         nonlocal loud_cache, playlists_filename, playlists_db, tag_session
         nonlocal current_similar_entries, current_similar_mood, audio_data
-        nonlocal resolved_target_loudness, duration_by_stem, active_playlist_name
+        nonlocal resolved_target_loudness, duration_by_stem
 
         if not 0 <= idx < len(library_states):
             return
@@ -4339,7 +4369,6 @@ def main(
         audio_data = active_state.audio_data
         resolved_target_loudness = active_state.resolved_target_loudness
         duration_by_stem = active_state.duration_by_stem
-        active_playlist_name = active_state.active_playlist_name
         EMB_CACHE.ensure(model, tags_data, artists_data, mp3_folder, logging=logging)
         if tui and tui.enable:
             tui.playlist_editor_open = bool(active_playlist_name)
@@ -4374,18 +4403,48 @@ def main(
             tui.youtube_active = True
             restore_active_tab_status(tui)
 
-    def library_state_for_item(item: Dict[str, object]) -> LibraryState:
-        idx = item.get("library_idx")
-        if isinstance(idx, int) and 0 <= idx < len(library_states):
-            return library_states[idx]
-        return library_states[active_library_idx]
+    def library_marker_for_idx(idx: int) -> str:
+        state = library_states[idx]
+        return state.mp3_folder.name or state.label or str(idx)
 
     def library_index_for_marker(marker: str) -> int:
-        wanted = "mid-mp3s" if marker == "mm" else "mp3"
+        marker = str(marker).strip()
+        wanted = {"m": "mp3", "mm": "mid-mp3s"}.get(marker, marker)
+        wanted_norm = wanted.lower()
         for idx, state in enumerate(library_states):
-            if state.mp3_folder.name == wanted:
+            if state.mp3_folder.name.lower() == wanted_norm:
+                return idx
+            if state.label.lower() == wanted_norm:
                 return idx
         raise ValueError(f"No configured library matches [{marker}].")
+
+    def active_playlist_state() -> LibraryState:
+        if 0 <= active_playlist_library_idx < len(library_states):
+            return library_states[active_playlist_library_idx]
+        return library_states[active_library_idx]
+
+    def playlist_item_library_idx(
+        item: Dict[str, object],
+        default_idx: Optional[int] = None,
+    ) -> int:
+        marker = item.get("library")
+        if marker:
+            try:
+                return library_index_for_marker(str(marker))
+            except ValueError:
+                return default_idx if default_idx is not None else active_library_idx
+        return default_idx if default_idx is not None else active_library_idx
+
+    def make_playlist_item(
+        base: str,
+        play_once: bool,
+        library_idx: int,
+    ) -> Dict[str, object]:
+        return {
+            "base": str(base),
+            "play_once": bool(play_once),
+            "library": library_marker_for_idx(library_idx),
+        }
 
     def refresh_library_after_download(state_idx: int, track_path: Path) -> None:
         state = library_states[state_idx]
@@ -4448,15 +4507,16 @@ def main(
             return None
         if not active_playlist_name:
             return None
-        return playlists_db.get(active_playlist_name, [])
+        return active_playlist_state().playlists_db.get(active_playlist_name, [])
 
     def open_playlist_editor(name: str, tui: Optional[CursesTUI]) -> None:
-        nonlocal active_playlist_name
+        nonlocal active_playlist_name, active_playlist_library_idx
         if name not in playlists_db:
             if tui and tui.enable:
                 tui.status_msg = f"Playlist not found: {name}"
             return
         active_playlist_name = name
+        active_playlist_library_idx = active_library_idx
         if tui and tui.enable:
             tui.playlist_editor_open = True
             tui.focus_panel = "playlists"
@@ -4468,18 +4528,27 @@ def main(
         base: str,
         play_once: bool,
         tui: Optional[CursesTUI],
+        library_idx: Optional[int] = None,
     ) -> None:
-        if not active_playlist_name or active_playlist_name not in playlists_db:
+        playlist_state = active_playlist_state()
+        playlist_db = playlist_state.playlists_db
+        if not active_playlist_name or active_playlist_name not in playlist_db:
             if tui and tui.enable:
                 tui.status_msg = "Click a playlist first."
             return
-        items = playlists_db.setdefault(active_playlist_name, [])
-        if any(str(item.get("base") or "") == base for item in items):
+        if library_idx is None:
+            library_idx = active_library_idx
+        items = playlist_db.setdefault(active_playlist_name, [])
+        if any(
+            str(item.get("base") or "") == base
+            and playlist_item_library_idx(item, active_playlist_library_idx) == library_idx
+            for item in items
+        ):
             if tui and tui.enable:
                 tui.status_msg = f"Already in {active_playlist_name}: {base}"
             return
-        items.append({"base": base, "play_once": bool(play_once)})
-        save_playlists(playlists_db, playlists_filename)
+        items.append(make_playlist_item(base, play_once, library_idx))
+        save_playlists(playlist_db, playlist_state.playlists_filename)
         if tui and tui.enable:
             tui.status_msg = f"Added to {active_playlist_name}: {base}"
 
@@ -4487,36 +4556,34 @@ def main(
         path: Path,
         play_once: bool,
         tui: Optional[CursesTUI],
+        library_idx: Optional[int] = None,
     ) -> None:
-        add_base_to_active_playlist(path.stem, play_once, tui)
+        add_base_to_active_playlist(path.stem, play_once, tui, library_idx)
 
     def save_playlist(name: str, tui: Optional[CursesTUI]) -> None:
         nonlocal playlists_db, current_playing_item
         items: List[dict] = []
         if current_playing_item:
             path = current_playing_item.get("path")
-            if (
-                isinstance(path, Path)
-                and library_state_for_item(current_playing_item)
-                is library_states[active_library_idx]
-            ):
+            library_idx = queue_item_library_idx(current_playing_item)
+            if isinstance(path, Path) and library_idx is not None:
                 items.append(
-                    {
-                        "base": path.stem,
-                        "play_once": item_effective_play_once(current_playing_item),
-                    }
+                    make_playlist_item(
+                        path.stem,
+                        item_effective_play_once(current_playing_item),
+                        library_idx,
+                    )
                 )
         for item in queue:
             path = item.get("path")
-            if (
-                isinstance(path, Path)
-                and library_state_for_item(item) is library_states[active_library_idx]
-            ):
+            library_idx = queue_item_library_idx(item)
+            if isinstance(path, Path) and library_idx is not None:
                 items.append(
-                    {
-                        "base": path.stem,
-                        "play_once": item_effective_play_once(item),
-                    }
+                    make_playlist_item(
+                        path.stem,
+                        item_effective_play_once(item),
+                        library_idx,
+                    )
                 )
         playlists_db[name] = items
         save_playlists(playlists_db, playlists_filename)
@@ -4525,7 +4592,16 @@ def main(
 
     def load_playlist(name: str, tui: Optional[CursesTUI], replace_queue: bool = True) -> None:
         nonlocal current_playing_item, skip_requeue_item
-        items = playlists_db.get(name)
+        source_idx = (
+            active_playlist_library_idx
+            if active_playlist_name == name
+            and tui
+            and tui.enable
+            and tui.playlist_editor_open
+            else active_library_idx
+        )
+        source_state = library_states[source_idx]
+        items = source_state.playlists_db.get(name)
         if items is None:
             if tui and tui.enable:
                 tui.status_msg = f"Playlist not found: {name}"
@@ -4542,7 +4618,9 @@ def main(
             base = it.get("base")
             if not base:
                 continue
-            p = mp3_folder / f"{base}.mp3"
+            library_idx = playlist_item_library_idx(it, source_idx)
+            state = library_states[library_idx]
+            p = state.mp3_folder / f"{base}.mp3"
             if p.exists():
                 enqueue_item(
                     make_queue_item(
@@ -4551,14 +4629,21 @@ def main(
                         True,
                         f"playlist:{name}",
                         "manual",
-                        active_library_idx,
+                        library_idx,
                     ),
-                    active_library_idx,
+                    library_idx,
                     switch_context=replace_queue,
                 )
                 paths.append(p)
         if paths:
-            ensure_audio_data_for_tracks(paths)
+            by_library: Dict[int, List[Path]] = {}
+            for path in paths:
+                for idx, state in enumerate(library_states):
+                    if path.parent == state.mp3_folder:
+                        by_library.setdefault(idx, []).append(path)
+                        break
+            for idx, library_paths in by_library.items():
+                ensure_audio_data_for_tracks(library_paths, library_states[idx])
         if tui and tui.enable:
             mode = "replaced" if replace_queue else "appended"
             if replace_queue and current_playing_item:
@@ -4569,15 +4654,25 @@ def main(
                 tui.status_msg = f"Loaded playlist: {name} ({len(paths)} tracks, {mode})"
 
     def delete_playlist(name: str, tui: Optional[CursesTUI]) -> None:
-        nonlocal active_playlist_name
-        if name not in playlists_db:
+        nonlocal active_playlist_name, active_playlist_library_idx
+        source_idx = (
+            active_playlist_library_idx
+            if active_playlist_name == name
+            and tui
+            and tui.enable
+            and tui.playlist_editor_open
+            else active_library_idx
+        )
+        source_state = library_states[source_idx]
+        if name not in source_state.playlists_db:
             if tui and tui.enable:
                 tui.status_msg = f"Playlist not found: {name}"
             return
-        del playlists_db[name]
-        save_playlists(playlists_db, playlists_filename)
-        if active_playlist_name == name:
+        del source_state.playlists_db[name]
+        save_playlists(source_state.playlists_db, source_state.playlists_filename)
+        if active_playlist_name == name and active_playlist_library_idx == source_idx:
             active_playlist_name = None
+            active_playlist_library_idx = active_library_idx
             if tui and tui.enable:
                 tui.playlist_editor_open = False
         if tui and tui.enable:
@@ -4615,27 +4710,33 @@ def main(
                 active_library_idx,
             )
 
-    def ensure_audio_data_for_tracks(paths: List[Path]) -> None:
-        nonlocal resolved_target_loudness
-        missing = [p for p in paths if p not in audio_data]
+    def ensure_audio_data_for_tracks(
+        paths: List[Path],
+        library_state: Optional[LibraryState] = None,
+    ) -> None:
+        nonlocal audio_data, resolved_target_loudness, duration_by_stem
+
+        state = library_state or active_state
+        missing = [p for p in paths if p not in state.audio_data]
         if not missing:
             return
         resolved, data = build_audio_data_for_playlist(
             playlist=missing,
             target_lufs=runtime_target_lufs,
-            mp3_folder=mp3_folder,
+            mp3_folder=state.mp3_folder,
             sample_filename=sample_filename,
-            cache=loud_cache,
+            cache=state.loud_cache,
             logging=logging,
         )
-        audio_data.update(data)
+        state.audio_data.update(data)
         for p, d in data.items():
-            duration_by_stem[p.stem] = float(d.get("duration") or 0.0)
-        if resolved_target_loudness is None:
-            resolved_target_loudness = resolved
-        active_state.resolved_target_loudness = resolved_target_loudness
-        active_state.audio_data = audio_data
-        active_state.duration_by_stem = duration_by_stem
+            state.duration_by_stem[p.stem] = float(d.get("duration") or 0.0)
+        if state.resolved_target_loudness is None:
+            state.resolved_target_loudness = resolved
+        if state is active_state:
+            audio_data = state.audio_data
+            resolved_target_loudness = state.resolved_target_loudness
+            duration_by_stem = state.duration_by_stem
 
     def enqueue_auto_track(tui: Optional[CursesTUI]) -> bool:
         track_key = choose_auto_track_key(
@@ -5279,7 +5380,7 @@ def main(
             return True
 
         def apply_playlist_editor_actions() -> None:
-            nonlocal active_playlist_name
+            nonlocal active_playlist_name, active_playlist_library_idx
 
             if (
                 tui.playlist_open_pending_idx is not None
@@ -5300,6 +5401,7 @@ def main(
                 tui.playlist_done_request = False
                 tui.playlist_editor_open = False
                 active_playlist_name = None
+                active_playlist_library_idx = active_library_idx
                 tui.status_msg = "Closed playlist."
 
             if tui.playlist_load_request:
@@ -5318,6 +5420,7 @@ def main(
                             path,
                             item_effective_play_once(current_playing_item),
                             tui,
+                            queue_item_library_idx(current_playing_item),
                         )
                     else:
                         tui.status_msg = "No current track to add."
@@ -5335,6 +5438,7 @@ def main(
                             path,
                             item_effective_play_once(item),
                             tui,
+                            queue_item_library_idx(item),
                         )
                     else:
                         tui.status_msg = "Track not found on disk."
@@ -5369,7 +5473,9 @@ def main(
                 else:
                     tui.status_msg = "No track to add."
 
-            items = playlists_db.get(active_playlist_name or "", [])
+            playlist_state = active_playlist_state()
+            playlist_db = playlist_state.playlists_db
+            items = playlist_db.get(active_playlist_name or "", [])
             if tui.playlist_item_toggle_request is not None:
                 idx = tui.playlist_item_toggle_request
                 tui.playlist_item_toggle_request = None
@@ -5377,7 +5483,7 @@ def main(
                     item = items[idx]
                     play_once = not bool(item.get("play_once", False))
                     item["play_once"] = play_once
-                    save_playlists(playlists_db, playlists_filename)
+                    save_playlists(playlist_db, playlist_state.playlists_filename)
                     mode = "once" if play_once else "loop"
                     tui.status_msg = f"Set playlist item to {mode}."
 
@@ -5393,7 +5499,7 @@ def main(
                     if target_idx != start_idx:
                         item = items.pop(start_idx)
                         items.insert(target_idx, item)
-                        save_playlists(playlists_db, playlists_filename)
+                        save_playlists(playlist_db, playlist_state.playlists_filename)
                         tui.playlist_track_selected = target_idx
                         tui.status_msg = f"Reordered {active_playlist_name}."
                 tui.playlist_item_drag_commit_target = None
@@ -5405,7 +5511,7 @@ def main(
                 if 0 <= idx < len(items):
                     base = str(items[idx].get("base") or "track")
                     del items[idx]
-                    save_playlists(playlists_db, playlists_filename)
+                    save_playlists(playlist_db, playlist_state.playlists_filename)
                     if idx >= len(items):
                         tui.playlist_track_selected = max(0, len(items) - 1)
                     tui.status_msg = f"Removed from {active_playlist_name}: {base}"
@@ -5567,6 +5673,9 @@ def main(
                     active_playlist_name=active_playlist_name
                     if tui.playlist_editor_open
                     else None,
+                    active_playlist_library_label=active_playlist_state().label
+                    if tui.playlist_editor_open
+                    else "",
                     active_playlist_items=get_active_playlist_items(tui),
                     library_tabs=display_tabs,
                     active_library_idx=active_tab_idx,
@@ -5646,6 +5755,9 @@ def main(
                         active_playlist_name=active_playlist_name
                         if tui.playlist_editor_open
                         else None,
+                        active_playlist_library_label=active_playlist_state().label
+                        if tui.playlist_editor_open
+                        else "",
                         active_playlist_items=get_active_playlist_items(tui),
                         library_tabs=display_tabs,
                         active_library_idx=active_tab_idx,
@@ -5835,6 +5947,9 @@ def main(
                                     active_playlist_name=active_playlist_name
                                     if tui.playlist_editor_open
                                     else None,
+                                    active_playlist_library_label=active_playlist_state().label
+                                    if tui.playlist_editor_open
+                                    else "",
                                     active_playlist_items=get_active_playlist_items(tui),
                                     library_tabs=display_tabs,
                                     active_library_idx=active_tab_idx,

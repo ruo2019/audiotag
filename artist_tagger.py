@@ -194,9 +194,12 @@ def get_mp3_files(mp3_folder: Path) -> List[Path]:
     if not mp3_folder.is_dir():
         return []
     return sorted(
-        p
-        for p in mp3_folder.iterdir()
-        if p.is_file() and p.suffix.lower() == ".mp3" and not p.name.startswith(".")
+        (
+            p
+            for p in mp3_folder.iterdir()
+            if p.is_file() and p.suffix.lower() == ".mp3" and not p.name.startswith(".")
+        ),
+        key=lambda p: p.name.casefold(),
     )
 
 

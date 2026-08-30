@@ -110,5 +110,174 @@
       "base": "La symphonie des éclairs",
       "play_once": false
     }
+  ],
+  "luna": [
+    {
+      "base": "LC",
+      "play_once": false
+    },
+    {
+      "base": "Paradise",
+      "play_once": false
+    },
+    {
+      "base": "POYH",
+      "play_once": false
+    },
+    {
+      "base": "[ID] Demons",
+      "play_once": false,
+      "library": "mp3"
+    },
+    {
+      "base": "Radioactive",
+      "play_once": false,
+      "library": "mp3"
+    },
+    {
+      "base": "[1R] Counting Stars",
+      "play_once": false,
+      "library": "mp3"
+    },
+    {
+      "base": "Good Life",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Levels",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Without You",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Skyfall",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "A Sky Full of Stars",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Someone",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Pompeii",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "everything i wanted",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "NFY",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Perfect",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Take On Me",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Symphony",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Memories",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Mockingbird",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Dream",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Never Be Lonely",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Where Are You Now",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "House of Memories",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Unstoppable",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Supereroi",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "A",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "AL",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "SYL",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Buon Viaggio",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Ovunque Sarai",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Dancin",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Stay True",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Next to Me",
+      "play_once": false,
+      "library": "mid-mp3s"
+    }
   ]
 }

@@ -24,7 +24,7 @@ mixing, or YouTube helpers.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install flask werkzeug pygame sentence-transformers scikit-learn torch pydub tabulate numpy mutagen yt-dlp
+pip install flask werkzeug pygame sentence-transformers scikit-learn torch librosa pydub tabulate numpy mutagen yt-dlp
 ```
 
 On macOS:
@@ -131,6 +131,15 @@ python visualize_autoplay_graph.py mid-mp3s
 python visualize_autoplay_graph.py all --live
 ```
 
+The graph computes stable sound-derived colors from up to three samples of each
+track using only continuous spectral, pitch, energy, dynamic, and noisiness
+measurements. It does not use mood labels, prompts, palettes, other songs, or
+custom color overrides as analysis inputs. In `--live` mode, the dashboard starts
+without waiting for audio-color analysis: new or modified tracks are analyzed on
+a background thread, cached one at a time, and appear automatically on a later
+refresh without blocking the page. Progress is printed in the terminal; later
+runs reuse `.autoplay_audio_colors.json`.
+
 Generate a simpler Markov transition graph:
 
 ```bash
@@ -145,7 +154,7 @@ provided.
 Search and preview YouTube audio interactively:
 
 ```bash
-python link.py "song search text" -n 10 --titles
+python link.py "song search text" -n 10
 ```
 
 Bulk-download audio from a line-based input file:
@@ -186,6 +195,7 @@ The players and tools write local state while you use them:
 - Embedding/loudness caches inside MP3 folders:
   `.track_emb_cache.npz`, `.loudness_cache.json`
 - Generated visualizations: `autoplay_graph_*.html`, `markov_graph_*.html`
+- Intrinsic audio features and fixed song colors: `.autoplay_audio_colors.json`
 
 These files are part of the working library state, so expect them to change after
 playback, tagging, renaming, graphing, or trimming.

@@ -36,6 +36,7 @@ queue_playlists*.json
 out.json
 download_list.txt
 audio_features_cache.json
+.autoplay_audio_colors.json
 
 # Local/generated artifacts
 static/

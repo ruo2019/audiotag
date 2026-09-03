@@ -2130,8 +2130,8 @@ class CursesTUI:
             )
             lines = [
                 (
-                    f"Current: {ear_level.low_db_spl:.0f}–"
-                    f"{ear_level.high_db_spl:.0f} dB(A) estimated"
+                    f"Current: {ear_level.low_db_spl:.1f}–"
+                    f"{ear_level.high_db_spl:.1f} dB(A) estimated"
                     f" | Mac volume {mac_volume}"
                 ),
                 *exposure_lines,

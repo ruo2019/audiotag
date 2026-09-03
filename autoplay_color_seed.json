@@ -1,0 +1,36 @@
+{
+  "artists": {
+    "21P": "#d32422",
+    "Ariana Grande": "#9d7e87",
+    "Irama": "#7d7d7d",
+    "Jacob's Piano": "#d6c6a4",
+    "Lewis Capaldi": "#a01c0d",
+    "Lost Frequencies": "#d8d8c5",
+    "MEDUZA": "#0c6d8d",
+    "Mr. Rain": "#c2c2c2"
+  },
+  "trending": {
+    "mid-mp3s/BM.mp3": "#da1b54",
+    "mid-mp3s/Belisarius.mp3": "#873024",
+    "mid-mp3s/Dancin.mp3": "#dcdc00",
+    "mid-mp3s/Hollywood's Bleeding.mp3": "#68488e",
+    "mid-mp3s/Jamais.mp3": "#8165a4",
+    "mid-mp3s/LC.mp3": "#dbe6f0",
+    "mid-mp3s/La symphonie des éclairs.mp3": "#bbdcec",
+    "mid-mp3s/Pompeii.mp3": "#a9a38e",
+    "mid-mp3s/Stranger Things.mp3": "#d7b1ec",
+    "mid-mp3s/Therefore I Am.mp3": "#e52424",
+    "mid-mp3s/bury a friend.mp3": "#a1a1a1",
+    "mid-mp3s/go to hell.mp3": "#613605",
+    "mid-mp3s/golden hour.mp3": "#b79d33",
+    "mid-mp3s/lovely.mp3": "#388799",
+    "mp3/7 rings.mp3": "#9d7e87",
+    "mp3/Despacito.mp3": "#f5b914",
+    "mp3/Little Sea.mp3": "#c3af65",
+    "mp3/Nico and the Niners.mp3": "#757143",
+    "mp3/Routines In The Night.mp3": "#a79bab",
+    "mp3/[AU] Runaway.mp3": "#37a3a4",
+    "mp3/a thousand years.mp3": "#8cbde8",
+    "mp3/golden hour.mp3": "#a3891f"
+  }
+}

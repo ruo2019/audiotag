@@ -3,7 +3,7 @@
 Interactive YouTube search + audio player from the terminal (macOS-friendly).
 
 Features:
-- Prints top N YouTube search results (sorted by relevance).
+- Prints each top-N YouTube result's title, uploader, and URL (sorted by relevance).
 - Enter a 1-indexed number to play **audio only** for that result.
 - While audio is playing, press **Ctrl+G** to stop and return to the selector.
 - Enter another number to play a different result, or 'q' to quit.
@@ -15,7 +15,7 @@ Install (macOS):
     brew install mpv
 
 Usage:
-    python3 link_player.py "SEARCH WORDS" -n 15 --titles
+    python3 link.py "SEARCH WORDS" -n 15
 """
 
 import argparse
@@ -42,7 +42,10 @@ def search_youtube(query: str, limit: int) -> List[Result]:
     """Return [(title, url, uploader), ...] for the top-N results sorted by relevance."""
     ydl_opts = {
         "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
         "skip_download": True,
+        "extract_flat": True,
     }
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
@@ -54,6 +57,7 @@ def search_youtube(query: str, limit: int) -> List[Result]:
     results: List[Result] = []
     for e in entries:
         url = e.get("webpage_url") or ""
+        title = e.get("title") or e.get("id") or url or "Untitled video"
         uploader = (
             e.get("uploader")
             or e.get("channel")
@@ -62,14 +66,14 @@ def search_youtube(query: str, limit: int) -> List[Result]:
             or "Unknown uploader"
         )
         if "/watch?v=" in url:
-            results.append((e.get("title", ""), url, uploader))
+            results.append((title, url, uploader))
             continue
         if (
             e.get("ie_key") == "Youtube" or e.get("extractor_key") == "Youtube"
         ) and e.get("id"):
             results.append(
                 (
-                    e.get("title", ""),
+                    title,
                     f"https://www.youtube.com/watch?v={e['id']}",
                     uploader,
                 )
@@ -285,12 +289,9 @@ def play_with_ctrl_g(
     print(" Stopped.\n")
 
 
-def print_results(results: List[Result], show_titles: bool) -> None:
+def print_results(results: List[Result]) -> None:
     for idx, (title, url, uploader) in enumerate(results, start=1):
-        if show_titles:
-            print(f"{idx:>2}. {url}\t# {title} | by {uploader}")
-        else:
-            print(f"{idx:>2}. {url}\t# by {uploader}")
+        print(f"{idx:>2}. {title} | by {uploader} | {url}")
 
 
 def main():
@@ -299,9 +300,6 @@ def main():
     )
     parser.add_argument("query", nargs="*", help="search text")
     parser.add_argument("-n", "--num", type=int, default=10, help="number of results")
-    parser.add_argument(
-        "--titles", action="store_true", help="print titles next to URLs"
-    )
     args = parser.parse_args()
 
     forced_audio_device: Optional[str] = None
@@ -334,7 +332,7 @@ def main():
         print("No results.")
         sys.exit(3)
 
-    print_results(results, args.titles)
+    print_results(results)
 
     while True:
         try:

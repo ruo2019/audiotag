@@ -3,7 +3,7 @@
 Interactive YouTube search + audio player from the terminal (macOS-friendly).
 
 Features:
-- Prints each top-N YouTube result's title, uploader, and URL (sorted by relevance).
+- Prints each top-N YouTube result's title, uploader, and video ID (sorted by relevance).
 - Enter a 1-indexed number to play **audio only** for that result.
 - While audio is playing, press **Ctrl+G** to stop and return to the selector.
 - Enter another number to play a different result, or 'q' to quit.
@@ -291,7 +291,8 @@ def play_with_ctrl_g(
 
 def print_results(results: List[Result]) -> None:
     for idx, (title, url, uploader) in enumerate(results, start=1):
-        print(f"{idx:>2}. {title} | by {uploader} | {url}")
+        video_id = url.split("/watch?v=", 1)[-1].split("&", 1)[0]
+        print(f"{idx:>2}. {title} | by {uploader} | {video_id}")
 
 
 def main():

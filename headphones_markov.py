@@ -869,17 +869,13 @@ def append_download_list_entry(
     result: YouTubeResult,
     title: str,
     marker: str,
-    artist_names: Optional[List[str]] = None,
     filename: str = DOWNLOAD_LIST_FILE,
 ) -> None:
     path = download_list_path(filename)
     path.parent.mkdir(parents=True, exist_ok=True)
-    artist_prefix = ""
-    if artist_names:
-        artist_prefix = f"[{', '.join(artist_names)}] "
     line = (
         f"# {youtube_video_id_for_history(result)} "
-        f"{artist_prefix}{title} [{marker}]\n"
+        f"{title} [{marker}]\n"
     )
     prefix = ""
     if path.exists():
@@ -5361,7 +5357,7 @@ def main(
                     target_state.artists_data[output_path.stem] = artist_names
                     save_artists(target_state.artists_file, target_state.artists_data)
                 refresh_library_after_download(target_idx, output_path)
-                append_download_list_entry(result, title, marker, artist_names)
+                append_download_list_entry(result, title, marker)
                 tui.input_mode = "youtube_search"
                 tui.input_buffer = ""
                 artist_msg = (

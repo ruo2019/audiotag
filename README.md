@@ -70,6 +70,24 @@ Related players:
 - `player.py` is the older required-`--mood` looping player.
 - `play.py` is a terminal player for direct folder playback and volume analysis.
 
+Press **Ctrl+E** in `headphones_markov.py` for icon-free headphone listening
+stats; press **Ctrl+E** or **Esc** to close them. The panel shows the current
+estimated range and Mac volume, today/week duration and average, WHO weekly
+allowance used/remaining, and the margin from the cautious target.
+
+Played time, energy-averaged level, and WHO dose are checkpointed in the separate
+generated file `headphone_exposure.json`; `listen_timestamps*.json` is unchanged,
+and partial plays count. The estimate uses pygame's decoded PCM, player gain, Mac
+volume, and a broad Apple wired-earbud profile. It excludes the YouTube side
+player and other apps and does not request recording permission.
+
+The displayed target keeps the upper estimate below 70 dB(A) for cautious
+8–10-hour daily listening. That is deliberately lower than the approximately
+78 dB(A) adult exposure level corresponding to 10 hours every day under the
+[WHO 80 dB(A)/40-hour weekly model](https://www.who.int/publications/i/item/9789241515276),
+because the analog earbuds have no calibrated profile. The estimate tracks
+changes well but is not a physical measurement at the eardrum.
+
 ## Tag MP3s
 
 The Flask tagger writes mood tags to `tags.json`.

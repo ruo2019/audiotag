@@ -14,7 +14,16 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock
 from urllib.parse import parse_qs, urlparse
+
+from audio_colors import (
+    AudioColorBackgroundWorker,
+    CACHE_FILENAME as AUDIO_COLOR_CACHE_FILENAME,
+    artist_colors_from_tracks,
+    cached_audio_color_records,
+    ensure_audio_color_records,
+)
 
 try:
     from mutagen.mp3 import MP3
@@ -52,6 +61,7 @@ DEFAULT_WINDOW_MINUTES = AUTOPLAY_WINDOW_SECONDS / 60.0
 DEFAULT_FALLBACK_PROBABILITY = 0.0
 DEFAULT_OUTPUT_TEMPLATE = "autoplay_graph_{folder}.html"
 DEFAULT_PAIRING_MODE = "consecutive"
+COLOR_SEED_FILENAME = "autoplay_color_seed.json"
 TRENDING_HALF_LIFE_SECONDS = 2 * 24 * 60 * 60
 TRENDING_BASELINE_DURATION_SECONDS = 3 * 60 + 30
 NODE_MIN_SIZE = 7
@@ -871,6 +881,7 @@ def build_artist_payload(
             {
                 "id": f"song:{row['song']}",
                 "label": display_label,
+                "songName": row["song"],
                 "kind": "song",
                 "playCount": row["playCount"],
                 "historyCount": row["historyCount"],
@@ -1320,11 +1331,40 @@ def build_combined_payload_from_options(
     fallback_probability: float,
     view_key: str | None = None,
     view_label: str | None = None,
+    analyze_audio_colors: bool = True,
 ):
     if use_all_folders:
         song_counts, history_mapping, durations, song_artists, meta_path = load_all_folder_data(repo_root)
     else:
         song_counts, history_mapping, durations, song_artists, meta_path = load_folder_data(folder)
+
+    song_paths = {}
+    for song_name in song_counts:
+        if use_all_folders and "/" in song_name:
+            source_group, filename = song_name.split("/", 1)
+            song_paths[song_name] = repo_root / "static" / source_group / filename
+        else:
+            song_paths[song_name] = folder / song_name
+    audio_color_cache_path = repo_root / AUDIO_COLOR_CACHE_FILENAME
+    if analyze_audio_colors:
+        song_color_records = ensure_audio_color_records(
+            song_paths,
+            audio_color_cache_path,
+            progress=emit,
+        )
+    else:
+        song_color_records = cached_audio_color_records(
+            song_paths,
+            audio_color_cache_path,
+        )
+    song_sound_colors = {
+        song_name: record.color for song_name, record in song_color_records.items()
+    }
+    artist_sound_colors = artist_colors_from_tracks(
+        song_artists,
+        song_counts,
+        song_color_records,
+    )
 
     events = build_global_events(history_mapping)
     window_seconds = int(round(args.window_minutes * 60))
@@ -1369,6 +1409,35 @@ def build_combined_payload_from_options(
         include_self_loops=args.include_self_loops,
         generated_from=str(meta_path),
     )
+    for node in graph_payload.get("nodes", []):
+        sound_color = song_sound_colors.get(node.get("id"))
+        if sound_color:
+            node["soundColor"] = sound_color
+    for song in trending_payload.get("songs", []):
+        sound_color = song_sound_colors.get(song.get("name"))
+        if sound_color:
+            song["soundColor"] = sound_color
+    for node in artist_payload.get("artistGraph", {}).get("nodes", []):
+        sound_color = artist_sound_colors.get(node.get("label"))
+        if sound_color:
+            node["soundColor"] = sound_color
+    for node in artist_payload.get("songArtistGraph", {}).get("nodes", []):
+        if node.get("kind") == "song":
+            sound_color = song_sound_colors.get(node.get("songName"))
+            if sound_color:
+                node["soundColor"] = sound_color
+            continue
+        sound_color = artist_sound_colors.get(node.get("label"))
+        if sound_color:
+            node["soundColor"] = sound_color
+    for artist in artist_payload.get("trending", {}).get("artists", []):
+        sound_color = artist_sound_colors.get(artist.get("name"))
+        if sound_color:
+            artist["soundColor"] = sound_color
+    for artist in artist_payload.get("topArtists", []):
+        sound_color = artist_sound_colors.get(artist.get("label"))
+        if sound_color:
+            artist["soundColor"] = sound_color
     if view_key is not None:
         graph_payload["summary"]["viewKey"] = view_key
         trending_payload["summary"]["viewKey"] = view_key
@@ -1450,11 +1519,12 @@ def source_paths_for_folder(repo_root: Path, folder: Path, use_all_folders: bool
                     source_folder / ".loudness_cache.json",
                 ]
             )
+        source_paths.append(repo_root / AUDIO_COLOR_CACHE_FILENAME)
         return source_paths
 
     meta_path = folder / META_FILENAME
     if meta_path.is_file():
-        return [meta_path]
+        return [meta_path, folder, repo_root / AUDIO_COLOR_CACHE_FILENAME]
 
     return [
         folder,
@@ -1462,6 +1532,7 @@ def source_paths_for_folder(repo_root: Path, folder: Path, use_all_folders: bool
         repo_root / listen_timestamps_filename_for_folder(folder),
         repo_root / artists_filename_for_folder(folder),
         folder / ".loudness_cache.json",
+        repo_root / AUDIO_COLOR_CACHE_FILENAME,
     ]
 
 
@@ -1477,12 +1548,78 @@ def source_signature_for_paths(source_paths):
                     stat_result.st_size,
                 )
             )
+            if source_path.is_dir():
+                for child in sorted(source_path.glob("*.mp3"), key=lambda path: path.name.casefold()):
+                    try:
+                        child_stat = child.stat()
+                        signature.append(
+                            (str(child), child_stat.st_mtime_ns, child_stat.st_size)
+                        )
+                    except OSError:
+                        signature.append((str(child), None, None))
         except OSError:
             signature.append((str(source_path), None, None))
     return tuple(signature)
 
 
-def build_html(graph_payload, trending_payload=None, artist_payload=None, live_config=None):
+def valid_color_map(value):
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for key, color in value.items():
+        if not isinstance(key, str) or not isinstance(color, str):
+            continue
+        normalized = color.lower()
+        if len(normalized) == 7 and normalized.startswith("#") and all(
+            ch in "0123456789abcdef" for ch in normalized[1:]
+        ):
+            out[key] = normalized
+    return out
+
+
+def load_color_seed(repo_root: Path):
+    seed_path = repo_root / COLOR_SEED_FILENAME
+    empty_seed = {"trending": {}, "artists": {}}
+    if not seed_path.is_file():
+        return empty_seed
+    try:
+        raw = json.loads(seed_path.read_text(encoding="utf-8"))
+    except Exception:
+        return empty_seed
+    if not isinstance(raw, dict):
+        return empty_seed
+
+    return {
+        "trending": valid_color_map(raw.get("trending")),
+        "artists": valid_color_map(raw.get("artists")),
+    }
+
+
+def save_color_seed(repo_root: Path, patch):
+    if not isinstance(patch, dict):
+        raise ValueError("Color payload must be a JSON object.")
+    seed = load_color_seed(repo_root)
+    for section in ("trending", "artists"):
+        if section in patch:
+            seed[section].update(valid_color_map(patch.get(section)))
+
+    seed_path = repo_root / COLOR_SEED_FILENAME
+    temp_path = seed_path.with_name(f".{seed_path.name}.tmp")
+    temp_path.write_text(
+        json.dumps(seed, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.replace(seed_path)
+    return seed
+
+
+def build_html(
+    graph_payload,
+    trending_payload=None,
+    artist_payload=None,
+    live_config=None,
+    color_seed=None,
+):
     graph_json = json.dumps(graph_payload, ensure_ascii=False)
     trending_json = json.dumps(
         trending_payload
@@ -1513,6 +1650,10 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
         ensure_ascii=False,
     )
     live_config_json = json.dumps(live_config or {"enabled": False})
+    color_seed_json = json.dumps(
+        color_seed or {"trending": {}, "artists": {}},
+        ensure_ascii=False,
+    )
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
 <head>
@@ -3021,6 +3162,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     let trendingData = {trending_json};
     let artistData = {artist_json};
     const liveConfig = {live_config_json};
+    const colorSeed = {color_seed_json};
     let activeViewKey = liveConfig.initialViewKey || graphData.summary.viewKey || 'all';
     const graphHashesByView = new Map([[activeViewKey, liveConfig.initialHash || null]]);
     let currentGraphHash = graphHashesByView.get(activeViewKey) || null;
@@ -3036,10 +3178,11 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     let trendingIsPlaying = false;
     let trendingPlayAnimationFrame = null;
     let trendingLastPlaybackFrame = null;
-    const trendingColorStorageKey = 'audiotagTrendingSongColors:v1';
+    let songSoundColors = new Map();
     let trendingColorOverrides = loadTrendingColorOverrides();
-    const artistColorStorageKey = 'audiotagArtistColors:v1';
+    let artistSoundColors = new Map();
     let artistColorOverrides = loadArtistColorOverrides();
+    const colorSeedSaveTimers = new Map();
     let orbitSongs = [];
     let orbitSongLookup = new Map();
     let orbitSelectedSong = null;
@@ -3292,38 +3435,41 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       return hash >>> 0;
     }}
 
-    function loadTrendingColorOverrides() {{
-      try {{
-        const parsed = JSON.parse(localStorage.getItem(trendingColorStorageKey) || '{{}}');
-        return parsed && typeof parsed === 'object' ? parsed : {{}};
-      }} catch (_error) {{
-        return {{}};
+    function persistColorSeed(section, colors) {{
+      if (!liveConfig.enabled) {{
+        return;
       }}
+      if (colorSeedSaveTimers.has(section)) {{
+        window.clearTimeout(colorSeedSaveTimers.get(section));
+      }}
+      colorSeedSaveTimers.set(section, window.setTimeout(() => {{
+        colorSeedSaveTimers.delete(section);
+        fetch('/color-seed.json', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ [section]: colors }}),
+        }}).catch(() => {{}});
+      }}, 250));
+    }}
+
+    function loadTrendingColorOverrides() {{
+      return colorSeed.trending && typeof colorSeed.trending === 'object'
+        ? {{ ...colorSeed.trending }}
+        : {{}};
     }}
 
     function saveTrendingColorOverrides() {{
-      try {{
-        localStorage.setItem(trendingColorStorageKey, JSON.stringify(trendingColorOverrides));
-      }} catch (_error) {{
-        // Ignore private-mode or quota errors; the picker still works for this session.
-      }}
+      persistColorSeed('trending', trendingColorOverrides);
     }}
 
     function loadArtistColorOverrides() {{
-      try {{
-        const parsed = JSON.parse(localStorage.getItem(artistColorStorageKey) || '{{}}');
-        return parsed && typeof parsed === 'object' ? parsed : {{}};
-      }} catch (_error) {{
-        return {{}};
-      }}
+      return colorSeed.artists && typeof colorSeed.artists === 'object'
+        ? {{ ...colorSeed.artists }}
+        : {{}};
     }}
 
     function saveArtistColorOverrides() {{
-      try {{
-        localStorage.setItem(artistColorStorageKey, JSON.stringify(artistColorOverrides));
-      }} catch (_error) {{
-        // Ignore private-mode or quota errors; the picker still works for this session.
-      }}
+      persistColorSeed('artists', artistColorOverrides);
     }}
 
     function hexToRgb(hex) {{
@@ -3388,6 +3534,12 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       if (/^#[0-9a-f]{{6}}$/i.test(override || '')) {{
         return {{ a: override, b: mixHex(override, '#ffffff', 0.42) }};
       }}
+      const soundColor = fallbackColorKeys(songName)
+        .map((key) => songSoundColors.get(key))
+        .find((value) => /^#[0-9a-f]{{6}}$/i.test(value || ''));
+      if (/^#[0-9a-f]{{6}}$/i.test(soundColor || '')) {{
+        return {{ a: soundColor, b: mixHex(soundColor, '#ffffff', 0.42) }};
+      }}
       const palette = [
         ['#5f7fa3', '#92a9bd'],
         ['#6f9588', '#9db5ad'],
@@ -3417,6 +3569,15 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
           b: mixHex(override, '#ffffff', 0.42),
           border: mixHex(override, '#142130', 0.2),
           highlight: mixHex(override, '#ffffff', 0.24),
+        }};
+      }}
+      const soundColor = artistSoundColors.get(key);
+      if (/^#[0-9a-f]{{6}}$/i.test(soundColor || '')) {{
+        return {{
+          a: soundColor,
+          b: mixHex(soundColor, '#ffffff', 0.42),
+          border: mixHex(soundColor, '#142130', 0.2),
+          highlight: mixHex(soundColor, '#ffffff', 0.24),
         }};
       }}
       const colors = mutedSongColors(name);
@@ -3496,6 +3657,11 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
         ...song,
         timestamps: decodeTrendingTimestamps(song.history),
       }}));
+      songSoundColors = new Map(
+        trendingSongs
+          .filter((song) => /^#[0-9a-f]{{6}}$/i.test(song.soundColor || ''))
+          .map((song) => [song.name, song.soundColor.toLowerCase()])
+      );
       trendingFirstTimestamp = Number(summary.firstTimestamp || summary.generatedTimestamp || 0);
       trendingLastTimestamp = Math.max(
         Number(summary.lastTimestamp || 0),
@@ -3620,6 +3786,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
           const colors = mutedSongColors(row.dataset.songName);
           row.style.setProperty('--song-trend-a', colors.a);
           row.style.setProperty('--song-trend-b', colors.b);
+          renderSongOrbit();
         }}
       }});
       trendingStage.appendChild(row);
@@ -3769,15 +3936,8 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       }};
     }}
 
-    function orbitColor(song, scored, maxScore) {{
-      if (scored.score > 0) {{
-        const heat = Math.max(0, Math.min(1, scored.score / Math.max(1, maxScore)));
-        return mixHex('#56cc9d', '#eb5757', heat * 0.88);
-      }}
-      if (song.sourceGroup === 'mid-mp3s') {{
-        return '#ff9f5a';
-      }}
-      return '#5aa9ff';
+    function orbitColor(song) {{
+      return mutedSongColors(song.name).a;
     }}
 
     function orbitBasePosition(song, scored, maxScore, index) {{
@@ -3797,14 +3957,8 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
       }};
     }}
 
-    function orbitBorderColor(song, scored) {{
-      if (scored.score > 0) {{
-        return '#eb5757';
-      }}
-      if (song.sourceGroup === 'mid-mp3s') {{
-        return '#d66d1f';
-      }}
-      return '#1f6fd6';
+    function orbitBorderColor(song) {{
+      return mixHex(orbitColor(song), '#142130', 0.24);
     }}
 
     function buildOrbitPoint(song, scored, maxScore, maxPlayCount, labelIds, query, index) {{
@@ -3820,8 +3974,8 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
         x: basePosition.x + offset.x,
         y: basePosition.y + offset.y,
         size,
-        color: orbitSelectedSong === song.id ? '#ff8a65' : orbitColor(song, scored, maxScore),
-        borderColor: orbitSelectedSong === song.id ? '#eb5757' : orbitBorderColor(song, scored),
+        color: orbitColor(song),
+        borderColor: orbitSelectedSong === song.id ? '#eb5757' : orbitBorderColor(song),
         dimmed: Boolean(query && !matchesQuery),
         showLabel: labelIds.has(song.id),
         score: scored.score,
@@ -4257,10 +4411,15 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
 
     function artistColor(node) {{
       if (node.kind === 'song') {{
+        const songName = node.songName || String(node.id || '').replace(/^song:/, '') || node.label;
+        const colors = mutedSongColors(songName);
         return {{
-          background: '#a7c7e7',
-          border: '#5f8fbf',
-          highlight: {{ background: '#ffb088', border: '#eb5757' }}
+          background: colors.a,
+          border: mixHex(colors.a, '#142130', 0.2),
+          highlight: {{
+            background: mixHex(colors.a, '#ffffff', 0.24),
+            border: mixHex(colors.a, '#142130', 0.2)
+          }}
         }};
       }}
       const colors = artistColors(node.label || node.id);
@@ -4274,6 +4433,11 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
     function applyArtistData(nextArtistData) {{
       artistData = nextArtistData || artistData;
       const summary = artistData.summary || {{}};
+      artistSoundColors = new Map(
+        (((artistData.artistGraph || {{}}).nodes) || [])
+          .filter((node) => /^#[0-9a-f]{{6}}$/i.test(node.soundColor || ''))
+          .map((node) => [artistColorKey(node.label || node.id), node.soundColor.toLowerCase()])
+      );
       document.getElementById('artist-subtitle').textContent =
         `${{summary.folder || '-'}} · unassigned one-offs excluded from artist graph`;
       document.getElementById('artist-count').textContent = formatNumber(summary.artistCount);
@@ -4611,7 +4775,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
         const top = 92 - 84 * Math.log1p(Number(song.playCount || 0)) / Math.log1p(maxPlays);
         const size = 10 + 24 * Math.sqrt(Number(song.recentCount || 0) / maxRecent);
         const label = songDisplayName(song.name);
-        return `<div class=\"scatter-point\" style=\"left:${{left.toFixed(2)}}%; top:${{top.toFixed(2)}}%; width:${{size.toFixed(1)}}px; height:${{size.toFixed(1)}}px; background:${{artistMapColor(label)}};\" title=\"${{escapeHtml(label)}} · first ${{formatDateTime(song.firstListen)}} · ${{formatNumber(song.playCount)}} plays · ${{formatNumber(song.recentCount)}} recent\">${{size > 24 ? indexSafeLabel(label) : ''}}</div>`;
+        return `<div class=\"scatter-point\" style=\"left:${{left.toFixed(2)}}%; top:${{top.toFixed(2)}}%; width:${{size.toFixed(1)}}px; height:${{size.toFixed(1)}}px; background:${{mutedSongColors(song.name).a}};\" title=\"${{escapeHtml(label)}} · first ${{formatDateTime(song.firstListen)}} · ${{formatNumber(song.playCount)}} plays · ${{formatNumber(song.recentCount)}} recent\">${{size > 24 ? indexSafeLabel(label) : ''}}</div>`;
       }}).join('');
     }}
 
@@ -4786,7 +4950,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
           <div class=\"song-breakdown-row\" title=\"${{escapeHtml(song.name || '')}}\">
             <div class=\"song-breakdown-name\">${{escapeHtml(song.name || '')}}</div>
             <div class=\"song-breakdown-meta\">${{formatNumber(plays)}} · ${{share.toFixed(0)}}%</div>
-            <div class=\"song-breakdown-track\"><div class=\"song-breakdown-fill\" style=\"width:${{width.toFixed(1)}}%\"></div></div>
+            <div class=\"song-breakdown-track\"><div class=\"song-breakdown-fill\" style=\"width:${{width.toFixed(1)}}%; background:${{mutedSongColors(song.name).a}}\"></div></div>
           </div>
         `;
       }}).join('') || '<div class=\"muted\">No tagged songs for this artist.</div>';
@@ -5232,7 +5396,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
             return `<div class=\"coverage-cell is-missing\" title=\"${{escapeHtml(display)}} · ${{formatNumber(song.playCount)}} plays counted · no timestamp history\"></div>`;
           }}
           const strength = count ? Math.max(0.18, count / globalMaxBucket) : 0;
-          const color = count ? artistMapColor(display) : '#e7eef4';
+          const color = count ? mutedSongColors(song.name).a : '#e7eef4';
           return `<div class=\"coverage-cell${{count ? ' is-active' : ''}}\" style=\"background:${{color}}; opacity:${{count ? Math.min(1, 0.28 + strength * 0.72).toFixed(2) : '1'}};\" title=\"${{escapeHtml(display)}} · ${{formatNumber(count)}} plays · ${{shortDateLabel(localDayKey(bucketStart))}} to ${{shortDateLabel(localDayKey(bucketEnd))}}\"></div>`;
         }}).join('');
         return `
@@ -5274,7 +5438,7 @@ def build_html(graph_payload, trending_payload=None, artist_payload=None, live_c
         const size = 22 + 24 * Math.sqrt(Number(song.playCount || 0) / maxPlays);
         const display = songDisplayName(song.name);
         return `
-          <button class=\"moving-point\" style=\"left:${{left.toFixed(2)}}%; top:${{top.toFixed(2)}}%; width:${{size.toFixed(1)}}px; height:${{size.toFixed(1)}}px; background:${{artistMapColor(display)}};\" title=\"${{escapeHtml(display)}} · ${{formatNumber(song.recent)}} recent plays · ${{formatNumber(song.playCount)}} total\">${{indexSafeLabel(display)}}</button>
+          <button class=\"moving-point\" style=\"left:${{left.toFixed(2)}}%; top:${{top.toFixed(2)}}%; width:${{size.toFixed(1)}}px; height:${{size.toFixed(1)}}px; background:${{mutedSongColors(song.name).a}};\" title=\"${{escapeHtml(display)}} · ${{formatNumber(song.recent)}} recent plays · ${{formatNumber(song.playCount)}} total\">${{indexSafeLabel(display)}}</button>
           <div class=\"moving-label\" style=\"left:${{left.toFixed(2)}}%; top:${{top.toFixed(2)}}%;\">${{escapeHtml(display)}}</div>
         `;
       }}).join('');
@@ -6029,6 +6193,11 @@ def make_live_graph_handler(
         }
         for key in view_keys
     }
+    color_seed_lock = Lock()
+    audio_color_worker = AudioColorBackgroundWorker(
+        repo_root / AUDIO_COLOR_CACHE_FILENAME,
+        progress=emit,
+    )
 
     def get_graph_response(view_key: str):
         if view_key not in view_keys:
@@ -6056,7 +6225,19 @@ def make_live_graph_handler(
             fallback_probability=fallback_probability,
             view_key=view_definition["key"],
             view_label=view_definition["label"],
+            analyze_audio_colors=False,
         )
+        song_paths = {}
+        for node in combined_payload.get("graph", {}).get("nodes", []):
+            song_name = node.get("id")
+            if not isinstance(song_name, str):
+                continue
+            if view_definition["use_all_folders"] and "/" in song_name:
+                source_group, filename = song_name.split("/", 1)
+                song_paths[song_name] = repo_root / "static" / source_group / filename
+            else:
+                song_paths[song_name] = view_definition["folder"] / song_name
+        audio_color_worker.submit(song_paths)
         payload_hash = hash_graph_payload(combined_payload)
         cached_response.update(
             {
@@ -6102,6 +6283,7 @@ def make_live_graph_handler(
                             "initialViewKey": requested_view,
                             "views": graph_view_definitions(),
                         },
+                        color_seed=load_color_seed(repo_root),
                     )
                     self.send_bytes(
                         200,
@@ -6135,9 +6317,49 @@ def make_live_graph_handler(
 
             self.send_json(404, {"error": "Not found"})
 
+        def do_POST(self) -> None:
+            parsed_url = urlparse(self.path)
+            if parsed_url.path != "/color-seed.json":
+                self.send_json(404, {"error": "Not found"})
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                self.send_json(400, {"error": "Invalid Content-Length"})
+                return
+            if content_length <= 0:
+                self.send_json(400, {"error": "Missing JSON body"})
+                return
+            if content_length > 1_000_000:
+                self.send_json(413, {"error": "Color payload is too large"})
+                return
+
+            try:
+                raw_body = self.rfile.read(content_length).decode("utf-8")
+                payload = json.loads(raw_body)
+                with color_seed_lock:
+                    seed = save_color_seed(repo_root, payload)
+            except ValueError as exc:
+                self.send_json(400, {"error": str(exc)})
+                return
+            except Exception as exc:
+                self.send_json(500, {"error": str(exc)})
+                return
+
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "trendingCount": len(seed["trending"]),
+                    "artistCount": len(seed["artists"]),
+                },
+            )
+
         def log_message(self, _format, *args) -> None:
             return
 
+    LiveGraphHandler.audio_color_worker = audio_color_worker
     return LiveGraphHandler
 
 
@@ -6155,6 +6377,7 @@ def serve_live_graph(
             folder=folder,
             use_all_folders=use_all_folders,
             fallback_probability=fallback_probability,
+            analyze_audio_colors=False,
         )
     except (FileNotFoundError, ValueError) as exc:
         emit(f"Error: {exc}")
@@ -6193,6 +6416,7 @@ def serve_live_graph(
     except KeyboardInterrupt:
         emit("Stopped live graph server.")
     finally:
+        handler_class.audio_color_worker.close()
         server.server_close()
 
     return 0
@@ -6260,6 +6484,7 @@ def main() -> int:
         combined_payload["graph"],
         combined_payload["trending"],
         combined_payload["artists"],
+        color_seed=load_color_seed(repo_root),
     )
     output_path.write_text(html, encoding="utf-8")
 

@@ -16,6 +16,7 @@ DEFAULT_MP3_FOLDER = Path("static/mp3")
 DEFAULT_MID_MP3_FOLDER = Path("static/mid-mp3s")
 LOUD_CACHE_NAME = ".loudness_cache.json"
 EMB_CACHE_NAME = ".track_emb_cache.npz"
+AUDIO_COLOR_CACHE = Path(".autoplay_audio_colors.json")
 LEGACY_CONFIG_KEY = "__config__"
 LEGACY_PLAY_HISTORY_KEY = "play_history"
 LEGACY_PLAYLISTS_KEY = "playlists_v1"
@@ -254,6 +255,20 @@ def update_path_cache_file(path: Path, old_name: str, new_name: str, label: str)
     return JsonUpdate(path, data, f"{label}: renamed {changed} path key(s)")
 
 
+def update_nested_path_cache_file(
+    path: Path, section: str, old_name: str, new_name: str, label: str
+) -> JsonUpdate | None:
+    if not path.exists():
+        return None
+    data = load_json(path)
+    if not isinstance(data, dict) or not isinstance(data.get(section), dict):
+        return None
+    changed = rename_path_mapping_keys(data[section], old_name, new_name)
+    if not changed:
+        return None
+    return JsonUpdate(path, data, f"{label}: renamed {changed} path key(s)")
+
+
 def update_legacy_mp3meta(path: Path, old_stem: str, new_stem: str) -> JsonUpdate | None:
     if not path.exists():
         return None
@@ -359,6 +374,13 @@ def build_plan(
             new_name,
             "audio features cache",
         ),
+        update_nested_path_cache_file(
+            AUDIO_COLOR_CACHE,
+            "entries",
+            old_name,
+            new_name,
+            "audio color cache",
+        ),
         update_legacy_mp3meta(folder / ".mp3meta.json", old_stem, new_stem),
         update_mapping_file(folder / ".mp3analysis.json", old_stem, new_stem, "legacy analysis"),
     ]:
@@ -423,6 +445,7 @@ def relevant_scan_paths(folder: Path, plan: RenamePlan) -> list[Path]:
         playlists_file(folder),
         folder / LOUD_CACHE_NAME,
         Path("audio_features_cache.json"),
+        AUDIO_COLOR_CACHE,
         folder / ".mp3meta.json",
         folder / ".mp3analysis.json",
     ]

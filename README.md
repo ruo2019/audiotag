@@ -70,16 +70,21 @@ Related players:
 - `player.py` is the older required-`--mood` looping player.
 - `play.py` is a terminal player for direct folder playback and volume analysis.
 
-Press **Ctrl+E** in `headphones_markov.py` for icon-free headphone listening
-stats; press **Ctrl+E** or **Esc** to close them. The panel shows the current
-estimated range and Mac volume, today/week duration and average, WHO weekly
-allowance used/remaining, and the margin from the cautious target.
+For headphone listening statistics across all Mac apps, run
+`all_apps_volume_stats.py`. It
+uses ScreenCaptureKit, so macOS shows its capture indicator and may request
+**Screen & System Audio Recording** permission. No additional Python packages
+are required; the script compiles its embedded Swift capture helper on first run:
 
-Played time, energy-averaged level, and WHO dose are checkpointed in the separate
-generated file `headphone_exposure.json`; `listen_timestamps*.json` is unchanged,
-and partial plays count. The estimate uses pygame's decoded PCM, player gain, Mac
-volume, and a broad Apple wired-earbud profile. It excludes the YouTube side
-player and other apps and does not request recording permission.
+```bash
+python all_apps_volume_stats.py
+```
+
+Its history is stored as monthly JSONL files under `headphone_exposure/`. This is
+the sole headphone-exposure log; `headphones_markov.py` does not independently
+estimate or record volume statistics. Use `--json` for machine-readable
+measurements, `--no-log` to disable persistence, or `--list-devices` to list
+available audio outputs.
 
 The displayed target keeps the upper estimate below 70 dB(A) for cautious
 8–10-hour daily listening. That is deliberately lower than the approximately

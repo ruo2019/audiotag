@@ -27,6 +27,7 @@ mid_artists.json
 listen_counts*.json
 listen_timestamps*.json
 headphone_exposure.json
+headphone_exposure/
 artists.json.bak
 mid_artists.json.bak
 artists_reviewed.json

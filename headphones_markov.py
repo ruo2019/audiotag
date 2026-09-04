@@ -21,17 +21,16 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import numpy as np
+
+# Pygame disables the system screensaver by default.  This is a terminal audio
+# player, so let macOS turn off the displays normally while it keeps running.
+os.environ["SDL_VIDEO_ALLOW_SCREENSAVER"] = "1"
+os.environ["SDL_HINT_VIDEO_ALLOW_SCREENSAVER"] = "1"
 import pygame
 import torch
 from mutagen.mp3 import MP3
 from pydub import AudioSegment
 from pydub.exceptions import CouldntDecodeError
-from player_ear_meter import (
-    ExposureSummary,
-    ListeningEstimate,
-    PcmLevelEnvelope,
-    PlayerEarMeter,
-)
 from sentence_transformers import SentenceTransformer
 from tabulate import tabulate
 
@@ -79,7 +78,6 @@ AUTO_COMMIT_STATE_PATTERNS = (
     "artists.json",
     "mid_artists.json",
     "queue_playlists*.json",
-    "headphone_exposure.json",
     DOWNLOAD_LIST_FILE,
 )
 
@@ -1724,7 +1722,6 @@ class CursesTUI:
     KEY_TAB = 9
     KEY_BS = 127
     CTRL_G = 7
-    CTRL_E = 5   # headphone exposure overlay
     CTRL_X = 24  # queue delete
     CTRL_S = 19  # playlist save (may be blocked by terminal)
     CTRL_W = 23  # playlist save (alternate)
@@ -1769,7 +1766,6 @@ class CursesTUI:
         self.queue_filter_toggle_request = False
         self.similar_add = False
         self.show_help = False
-        self.show_ear_stats = False
         self.playlist_activate = False
         self.playlist_open_pending_idx: Optional[int] = None
         self.playlist_open_pending_ts = 0.0
@@ -2003,7 +1999,6 @@ class CursesTUI:
             "↑/↓ PgUp/PgDn: move in focused panel",
             "→: skip track",
             "Ctrl+G: stop active tab",
-            "Ctrl+E: show/hide headphone listening stats",
             "Enter: add selected (Similar)",
             "Drag in Queue: reorder",
             "Ctrl+X: delete (Queue)",
@@ -2045,120 +2040,6 @@ class CursesTUI:
             for i, line in enumerate(help_lines[: box_h - 4]):
                 help_win.addstr(content_start + i, 2, line[: box_w - 4])
             help_win.noutrefresh()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _format_duration(seconds: float) -> str:
-        total_seconds = max(0, round(seconds))
-        whole_hours, remainder = divmod(total_seconds, 3600)
-        minutes, remaining_seconds = divmod(remainder, 60)
-        if whole_hours:
-            return f"{whole_hours}h {minutes:02d}m"
-        return f"{minutes}m {remaining_seconds:02d}s"
-
-    def _render_ear_stats_overlay(
-        self,
-        h: int,
-        w: int,
-        ear_level: Optional[ListeningEstimate],
-        exposure: Optional[ExposureSummary],
-    ) -> None:
-        exposure_lines: List[str] = []
-        if exposure is not None:
-            average_text = "not enough level data yet"
-            if (
-                exposure.today_laeq_low_db is not None
-                and exposure.today_laeq_high_db is not None
-            ):
-                average_text = (
-                    f"{exposure.today_laeq_low_db:.0f}–"
-                    f"{exposure.today_laeq_high_db:.0f} dB(A)"
-                )
-            week_dose = exposure.week_dose_percent
-            week_dose_text = (
-                "<0.01%" if week_dose < 0.01 else f"{week_dose:.2f}%"
-            )
-            week_average_text = "not enough level data yet"
-            if (
-                exposure.week_laeq_low_db is not None
-                and exposure.week_laeq_high_db is not None
-            ):
-                week_average_text = (
-                    f"{exposure.week_laeq_low_db:.0f}–"
-                    f"{exposure.week_laeq_high_db:.0f} dB(A)"
-                )
-            allowance_status = (
-                f"{week_dose - 100.0:.1f}% over"
-                if week_dose > 100.0
-                else f"{100.0 - week_dose:.1f}% remaining"
-            )
-            exposure_lines = [
-                (
-                    "Today: "
-                    f"{self._format_duration(exposure.today_played_seconds)}"
-                    f" | estimated average {average_text}"
-                ),
-                (
-                    "This week (Mon–now): "
-                    f"{self._format_duration(exposure.week_played_seconds)}"
-                    f" | estimated average {week_average_text}"
-                ),
-                (
-                    "WHO weekly allowance: "
-                    f"{week_dose_text} used | {allowance_status}"
-                ),
-            ]
-
-        if ear_level is None:
-            lines = [
-                "Current: no local MP3 playing",
-                *exposure_lines,
-                "Ctrl+E or Esc: close",
-            ]
-        else:
-            mac_volume = (
-                f"{ear_level.mac_volume_percent:.0f}%"
-                if ear_level.mac_volume_percent is not None
-                else "unknown"
-            )
-            target_difference = 70.0 - ear_level.high_db_spl
-            target_text = (
-                f"{target_difference:.0f} dB below"
-                if target_difference >= 0.0
-                else f"{-target_difference:.0f} dB above"
-            )
-            lines = [
-                (
-                    f"Current: {ear_level.low_db_spl:.1f}–"
-                    f"{ear_level.high_db_spl:.1f} dB(A) estimated"
-                    f" | Mac volume {mac_volume}"
-                ),
-                *exposure_lines,
-                f"70 dB(A) target margin (upper estimate): {target_text}",
-                "Ctrl+E or Esc: close",
-            ]
-
-        title = " Headphone Listening Stats "
-        max_line = max(len(line) for line in lines) if lines else 0
-        box_w = min(w - 4, max(42, len(title) + 4, max_line + 4))
-        box_h = min(h - 4, len(lines) + 4)
-        if box_w <= 0 or box_h <= 0:
-            return
-        box_x = max(0, (w - box_w) // 2)
-        box_y = max(0, (h - box_h) // 2)
-        try:
-            stats_win = curses.newwin(box_h, box_w, box_y, box_x)
-            stats_win.erase()
-            # curses may raise when addstr writes the bottom-right cell of a
-            # window.  window.border() handles that terminal-specific corner
-            # safely, so content drawing and noutrefresh still happen.
-            stats_win.border()
-            title_x = max(2, (box_w - len(title)) // 2)
-            stats_win.addstr(1, title_x, title[: box_w - title_x - 2])
-            for row, line in enumerate(lines[: box_h - 4], start=2):
-                stats_win.addstr(row, 2, line[: box_w - 4])
-            stats_win.noutrefresh()
         except Exception:
             pass
 
@@ -2316,11 +2197,6 @@ class CursesTUI:
         if self.show_help:
             if key == 27:  # Esc
                 self.show_help = False
-            return None
-
-        if self.show_ear_stats:
-            if key in (27, self.CTRL_E):
-                self.show_ear_stats = False
             return None
 
         if key == curses.KEY_MOUSE:
@@ -2883,8 +2759,6 @@ class CursesTUI:
         elif key == self.CTRL_G:
             self.stop_requested = True
             self.status_msg = "Stop requested..."
-        elif key == self.CTRL_E:
-            self.show_ear_stats = True
         elif key == self.CTRL_X and self.focus_panel == "queue":
             self.queue_delete = True
         elif key == self.CTRL_X and self.focus_panel == "playlists" and self.playlist_editor_open:
@@ -2969,8 +2843,6 @@ class CursesTUI:
         youtube_active: bool = False,
         youtube_results: Optional[List[YouTubeResult]] = None,
         youtube_query: str = "",
-        ear_level: Optional[ListeningEstimate] = None,
-        exposure: Optional[ExposureSummary] = None,
     ) -> Optional[str]:
         if not self.enable or not self.stdscr:
             return None
@@ -3777,13 +3649,6 @@ class CursesTUI:
                     win.noutrefresh()
             if self.show_help:
                 self._render_help_overlay(h, w)
-            elif self.show_ear_stats:
-                self._render_ear_stats_overlay(
-                    h,
-                    w,
-                    ear_level,
-                    exposure,
-                )
             curses.doupdate()
         except Exception:
             pass
@@ -3840,12 +3705,14 @@ def init_pygame(device_name: Optional[str] = None) -> None:
     try:
         pygame.mixer.pre_init(44100, -16, 2, 2048, devicename=device_name)
         pygame.init()
+        pygame.display.set_allow_screensaver(True)
         pygame.mixer.init(44100, -16, 2, 2048, devicename=device_name)
         return
     except TypeError:
         # Older pygame: no devicename= support.
         pygame.mixer.pre_init(44100, -16, 2, 2048)
         pygame.init()
+        pygame.display.set_allow_screensaver(True)
         pygame.mixer.init()
         return
     except pygame.error:
@@ -3853,11 +3720,13 @@ def init_pygame(device_name: Optional[str] = None) -> None:
         try:
             pygame.mixer.pre_init(22050, -16, 2, 2048, devicename=device_name)
             pygame.init()
+            pygame.display.set_allow_screensaver(True)
             pygame.mixer.init(22050, -16, 2, 2048, devicename=device_name)
             return
         except TypeError:
             pygame.mixer.pre_init(22050, -16, 2, 2048)
             pygame.init()
+            pygame.display.set_allow_screensaver(True)
             pygame.mixer.init()
             return
 
@@ -4184,11 +4053,6 @@ def main(
         print("Initializing pygame mixer...")
     init_pygame(device_name=FORCE_DEVICE)
     start_device_presence_watchdog(device_name=FORCE_DEVICE)
-    player_ear_meter = (
-        PlayerEarMeter(FORCE_DEVICE, Path("headphone_exposure.json"))
-        if sys.platform == "darwin" and FORCE_DEVICE
-        else None
-    )
     if sys.platform == "darwin" and FORCE_DEVICE:
         mpv_path = shutil.which("mpv")
         if mpv_path:
@@ -5827,11 +5691,6 @@ def main(
                     youtube_active=(active_tab_idx == youtube_tab_idx),
                     youtube_results=youtube_results,
                     youtube_query=youtube_query,
-                    exposure=(
-                        player_ear_meter.exposure_summary()
-                        if player_ear_meter is not None and tui.show_ear_stats
-                        else None
-                    ),
                 )
                 if submitted:
                     if handle_save_playlist_input(submitted):
@@ -5914,11 +5773,6 @@ def main(
                         youtube_active=(active_tab_idx == youtube_tab_idx),
                         youtube_results=youtube_results,
                         youtube_query=youtube_query,
-                        exposure=(
-                            player_ear_meter.exposure_summary()
-                            if player_ear_meter is not None and tui.show_ear_stats
-                            else None
-                        ),
                     )
                     if submitted:
                         if submitted.strip() == "--help":
@@ -6017,15 +5871,11 @@ def main(
 
                     try:
                         sound = pygame.mixer.Sound(str(track_path))
-                        level_envelope = PcmLevelEnvelope.from_sound(sound)
                         channel = sound.play()
                         if channel is None:
                             channel = pygame.mixer.find_channel(True)
                             channel.play(sound)
                         channel.set_volume(vol_scale)
-                        if player_ear_meter is not None:
-                            player_ear_meter.begin_track()
-
                         # If locked before play
                         if mac_is_locked_poll():
                             lock_since_wall = wait_while_locked_or_exit(
@@ -6056,16 +5906,6 @@ def main(
                                 max(0.0, time.monotonic() - started_ts),
                                 total_dur if total_dur > 0 else float("inf"),
                             )
-                            ear_level = None
-                            if (
-                                player_ear_meter is not None
-                                and level_envelope is not None
-                            ):
-                                ear_level = player_ear_meter.estimate(
-                                    level_envelope.dbfs_at(elapsed),
-                                    vol_scale,
-                                )
-
                             if enable_tui:
                                 total_listens, total_hours = total_listen_stats()
                                 all_listens, all_hours, _ = combined_listen_stats()
@@ -6124,13 +5964,6 @@ def main(
                                     youtube_active=(active_tab_idx == youtube_tab_idx),
                                     youtube_results=youtube_results,
                                     youtube_query=youtube_query,
-                                    ear_level=ear_level,
-                                    exposure=(
-                                        player_ear_meter.exposure_summary()
-                                        if player_ear_meter is not None
-                                        and tui.show_ear_stats
-                                        else None
-                                    ),
                                 )
                                 if submitted:
                                     if handle_save_playlist_input(submitted):
@@ -6205,9 +6038,6 @@ def main(
                                     or elapsed_final >= max(0.0, total_dur - 0.75)
                                 )
 
-                        if player_ear_meter is not None:
-                            player_ear_meter.finish_track()
-
                         if reached_end:
                             last_completed_track_key = (
                                 track_library_idx,
@@ -6271,8 +6101,6 @@ def main(
                         break
 
                     except pygame.error as e:
-                        if player_ear_meter is not None:
-                            player_ear_meter.finish_track()
                         track_tag_session.abandon()
                         if enable_tui:
                             tui.status_msg = f"Error playing {filename_ext}: {e}"
@@ -6290,8 +6118,6 @@ def main(
                         current_playing_tag_session = None
                         break
                     except Exception as e:
-                        if player_ear_meter is not None:
-                            player_ear_meter.finish_track()
                         track_tag_session.abandon()
                         if enable_tui:
                             tui.status_msg = f"Unexpected error: {e}"
@@ -6312,8 +6138,6 @@ def main(
         except (SystemExit, KeyboardInterrupt):
             pass
         finally:
-            if player_ear_meter is not None:
-                player_ear_meter.finish_track()
             stop_youtube_side_players()
             store_active_library_state()
             try:

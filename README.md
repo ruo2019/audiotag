@@ -61,6 +61,17 @@ Useful options:
 - `--youtube-cookies-from-browser chrome` or `--youtube-cookies cookies.txt`
   configures YouTube helpers used by the Markov player.
 
+The Markov player stops playback and releases its audio device while the Mac is
+locked, then waits for unlock without a lock-duration timeout or scheduled exit.
+It keeps the seven-second gap after unlocking. The audio
+device also closes when the MP3 queue is idle. Library totals and rankings are
+cached, and the display refreshes at 10 Hz with immediate redraws for input.
+Input polling rises from 20 Hz to 60 Hz while scrolling, typing, or dragging,
+then slows down again after half a second without input. Scrolling keeps its
+original limit of one step per input pass. Lock checks normally run four times per second
+during playback, with a fresh check before each track, and once per second while
+waiting for unlock.
+
 Related players:
 
 - `gui.py` opens the queue GUI by default and has `--tui` for the legacy curses
@@ -84,7 +95,9 @@ Its history is stored as monthly JSONL files under `headphone_exposure/`. This i
 the sole headphone-exposure log; `headphones_markov.py` does not independently
 estimate or record volume statistics. Use `--json` for machine-readable
 measurements, `--no-log` to disable persistence, or `--list-devices` to list
-available audio outputs.
+available audio outputs. If macOS temporarily removes the ScreenCaptureKit
+capture source during a display or login-session change, monitoring restarts
+automatically with a short backoff.
 
 The displayed target keeps the upper estimate below 70 dB(A) for cautious
 8–10-hour daily listening. That is deliberately lower than the approximately
@@ -92,6 +105,40 @@ The displayed target keeps the upper estimate below 70 dB(A) for cautious
 [WHO 80 dB(A)/40-hour weekly model](https://www.who.int/publications/i/item/9789241515276),
 because the analog earbuds have no calibrated profile. The estimate tracks
 changes well but is not a physical measurement at the eardrum.
+
+### Plot Headphone Exposure
+
+Build an interactive dashboard from the logs collected so far:
+
+```bash
+python plot_headphone_exposure.py
+python plot_headphone_exposure.py --live
+```
+
+The first command opens `headphone_exposure_dashboard.html`, a standalone,
+offline snapshot with no extra dependencies. `--live` opens a local dashboard
+that rereads the logs every 15 seconds. Use `--no-open` to skip opening a browser,
+`--input PATH` for another log directory, or `--output PATH` for another snapshot
+location. Compressed monthly `.jsonl.gz` archives are included automatically.
+
+The dashboard includes daily/weekly comparisons, an hourly activity heatmap,
+a distribution of level estimates, and a daily timeline with level, Mac volume,
+and source-level views. Select 7 days, 30 days, or all history; click a daily bar
+or heatmap cell to inspect that date. The CSV button exports the selected daily
+statistics. Range buttons end at the latest recorded date.
+
+Drag across the daily timeline to zoom into a time range. Drag again to zoom
+further; use **Reset zoom**, double-click, or press Escape to return to the full
+day. The selected range stays in place during live refreshes and metric changes;
+choosing another day resets it.
+
+Activity is reported as **recorded minutes**, since the logs do not retain exact
+active seconds. Gaps are left unmeasured. Level averages combine sound energy
+with equal weight per recorded minute, and the highest minute is a minute
+average rather than an instantaneous peak. Dose increases use differences in
+the saved weekly counter, with the first reading of each week (and any counter
+decrease) treated as a new baseline. The displayed latest weekly dose uses the
+saved cumulative value directly. Partial weeks are labeled.
 
 ## Tag MP3s
 

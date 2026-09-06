@@ -81,10 +81,12 @@ AUTO_COMMIT_STATE_PATTERNS = (
     DOWNLOAD_LIST_FILE,
 )
 
-# Exit policy
-LOCK_EXIT_MINUTES = 30
-EXIT_AT_LOCAL_HOUR = 1
-EXIT_AT_LOCAL_MINUTE = 30
+UI_POLL_HZ = 20
+UI_INTERACTIVE_HZ = 60
+UI_INTERACTION_SECONDS = 0.5
+UI_REFRESH_HZ = 10
+LOCK_POLL_SECONDS = 0.25
+LOCKED_WAIT_SECONDS = 1.0
 
 # Mood directive clamp
 TOP_MIN, TOP_MAX = 1, 50
@@ -114,6 +116,8 @@ ChoiceKey = TypeVar("ChoiceKey")
 # Globals for exit/lock state
 EXIT_NOW = threading.Event()
 IS_SCREEN_LOCKED = threading.Event()  # non-mac fallback stub
+_lock_checked_at = -math.inf
+_lock_checked_value = False
 
 
 # ============================== DEVICE / ENV ==============================
@@ -153,16 +157,8 @@ tame_threads()
 # ============================== EXIT / LOCK HELPERS ==============================
 
 
-def next_local_time(hour: int, minute: int) -> datetime:
-    now = datetime.now()
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return target
-
-
-def maybe_exit(next_exit_dt: datetime) -> None:
-    if EXIT_NOW.is_set() or datetime.now() >= next_exit_dt:
+def maybe_exit() -> None:
+    if EXIT_NOW.is_set():
         try:
             pygame.mixer.stop()
         except Exception:
@@ -170,65 +166,46 @@ def maybe_exit(next_exit_dt: datetime) -> None:
         raise SystemExit
 
 
-def mac_is_locked_poll() -> bool:
+def mac_is_locked_poll(*, force: bool = False) -> bool:
+    """Share one macOS lock query across the UI, gap, and playback loops."""
+    global _lock_checked_at, _lock_checked_value
     if sys.platform != "darwin":
         return IS_SCREEN_LOCKED.is_set()
+    now = time.monotonic()
+    if not force and now - _lock_checked_at < LOCK_POLL_SECONDS:
+        return _lock_checked_value
     try:
         from Quartz import CGSessionCopyCurrentDictionary  # type: ignore
 
         sess = CGSessionCopyCurrentDictionary() or {}
         if "CGSSessionScreenIsLocked" in sess:
-            return bool(sess.get("CGSSessionScreenIsLocked"))
-        if "CGSSessionOnConsoleKey" in sess:
-            return not bool(sess.get("CGSSessionOnConsoleKey"))
-        return IS_SCREEN_LOCKED.is_set()
+            locked = bool(sess.get("CGSSessionScreenIsLocked"))
+        elif "CGSSessionOnConsoleKey" in sess:
+            locked = not bool(sess.get("CGSSessionOnConsoleKey"))
+        else:
+            locked = IS_SCREEN_LOCKED.is_set()
     except Exception:
-        return IS_SCREEN_LOCKED.is_set()
-
-
-def update_lock_or_exit(
-    locked: bool,
-    lock_since_wall: float | None,
-    next_exit_dt: datetime,
-    lock_exit_minutes: int = LOCK_EXIT_MINUTES,
-) -> float | None:
-    maybe_exit(next_exit_dt)
-    if not locked:
-        return None
-    now = time.time()
-    if lock_since_wall is None:
-        return now
-    if now - lock_since_wall >= lock_exit_minutes * 60:
-        EXIT_NOW.set()
-        maybe_exit(next_exit_dt)
-    return lock_since_wall
+        locked = IS_SCREEN_LOCKED.is_set()
+    _lock_checked_at = now
+    _lock_checked_value = locked
+    return locked
 
 
 def wait_while_locked_or_exit(
-    lock_since_wall: float | None,
-    next_exit_dt: datetime,
-    tick_hz: int = 10,
-) -> float | None:
-    clk = pygame.time.Clock()
+    on_lock: Callable[[], None],
+    *,
+    force_check: bool = False,
+) -> bool:
+    """Release playback once, then wait quietly; return whether we waited."""
+    maybe_exit()
+    if not mac_is_locked_poll(force=force_check):
+        return False
+    on_lock()
     while True:
-        locked = mac_is_locked_poll()
-        lock_since_wall = update_lock_or_exit(locked, lock_since_wall, next_exit_dt)
-        if not locked:
-            return None
-        clk.tick(tick_hz)
-
-
-def sleep_with_exit_checks(
-    seconds: float,
-    lock_since_wall: float | None,
-    next_exit_dt: datetime,
-) -> float | None:
-    end = time.time() + float(seconds)
-    while time.time() < end:
-        locked = mac_is_locked_poll()
-        lock_since_wall = update_lock_or_exit(locked, lock_since_wall, next_exit_dt)
-        time.sleep(0.1)
-    return lock_since_wall
+        EXIT_NOW.wait(LOCKED_WAIT_SECONDS)
+        maybe_exit()
+        if not mac_is_locked_poll():
+            return True
 
 
 # ============================== JSON UTILS ==============================
@@ -417,6 +394,16 @@ def increment_listen(track_path: Path, counts: Dict[str, int]) -> None:
 
 
 @dataclass
+class ListenStats:
+    total_listens: int
+    total_hours: float
+    hours_by_stem: Dict[str, float]
+    by_count: List[Tuple[str, int]]
+    by_time: List[Tuple[str, int]]
+    count_width: int
+
+
+@dataclass
 class LibraryState:
     label: str
     mp3_folder: Path
@@ -442,6 +429,39 @@ class LibraryState:
     duration_by_stem: Dict[str, float] = field(default_factory=dict)
     active_playlist_name: Optional[str] = None
     status_msg: str = ""
+    listen_stats_cache: Optional[ListenStats] = field(default=None, repr=False)
+
+
+def library_listen_stats(state: LibraryState) -> ListenStats:
+    """Rebuild totals and rankings only after counts or durations change."""
+    if state.listen_stats_cache is not None:
+        return state.listen_stats_cache
+    hours_by_stem: Dict[str, float] = {}
+    entries: List[Tuple[str, int]] = []
+    for stem, listens in state.counts.items():
+        try:
+            count = max(0, int(listens))
+        except (TypeError, ValueError):
+            count = 0
+        duration = float(state.duration_by_stem.get(stem, 0.0))
+        if duration <= 0:
+            path = state.mp3_folder / f"{stem}.mp3"
+            duration = get_audio_duration_seconds(path) if path.is_file() else 0.0
+            state.duration_by_stem[stem] = duration
+        hours_by_stem[stem] = count * duration / 3600.0
+        entries.append((stem, count))
+    state.listen_stats_cache = ListenStats(
+        total_listens=sum(count for _, count in entries),
+        total_hours=sum(hours_by_stem.values()),
+        hours_by_stem=hours_by_stem,
+        by_count=sorted(entries, key=lambda item: (-item[1], item[0].lower())),
+        by_time=sorted(
+            entries,
+            key=lambda item: (-hours_by_stem[item[0]], -item[1], item[0].lower()),
+        ),
+        count_width=max((len(str(count)) for _, count in entries), default=1),
+    )
+    return state.listen_stats_cache
 
 
 @dataclass
@@ -1727,7 +1747,7 @@ class CursesTUI:
     CTRL_W = 23  # playlist save (alternate)
     CTRL_D = 4   # playlist delete
     CTRL_T = 20  # Most sort toggle
-    RENDER_MIN_INTERVAL = 1.0 / 30.0
+    RENDER_MIN_INTERVAL = 1.0 / UI_REFRESH_HZ
     INPUT_DRAIN_LIMIT = 64
     MAX_WHEEL_STEPS_PER_RENDER = 1
     DOUBLE_CLICK_SECONDS = 0.35
@@ -1802,6 +1822,7 @@ class CursesTUI:
         self.most_sort_mode = "count"  # count | time
         self.most_toggle_request = False
         self._last_render_ts = 0.0
+        self._last_input_ts = -math.inf
         self._input_seen = False
         self._windows_size: Optional[Tuple[int, int]] = None
         self._header_win: Optional["curses._CursesWindow"] = None
@@ -2798,6 +2819,8 @@ class CursesTUI:
     def _handle_pending_keys(self) -> Tuple[Optional[str], bool]:
         submitted: Optional[str] = None
         saw_input = False
+        # Keep the original one-step-per-pass scrolling sensitivity while
+        # draining excess wheel events so they cannot build up a backlog.
         self._wheel_steps_this_render = 0
         for _ in range(self.INPUT_DRAIN_LIMIT):
             self._input_seen = False
@@ -2808,7 +2831,15 @@ class CursesTUI:
             if text:
                 submitted = text
                 break
+        if saw_input:
+            self._last_input_ts = time.monotonic()
         return submitted, saw_input
+
+    def input_poll_hz(self) -> int:
+        """Keep scrolling/dragging smooth, then return to the quiet poll rate."""
+        if self.enable and time.monotonic() - self._last_input_ts < UI_INTERACTION_SECONDS:
+            return UI_INTERACTIVE_HZ
+        return UI_POLL_HZ
 
     def render(
         self,
@@ -2843,6 +2874,7 @@ class CursesTUI:
         youtube_active: bool = False,
         youtube_results: Optional[List[YouTubeResult]] = None,
         youtube_query: str = "",
+        listen_stats: Optional[ListenStats] = None,
     ) -> Optional[str]:
         if not self.enable or not self.stdscr:
             return None
@@ -2857,7 +2889,6 @@ class CursesTUI:
         now = time.monotonic()
         if (
             not saw_input
-            and not self.show_help
             and (now - self._last_render_ts) < self.RENDER_MIN_INTERVAL
         ):
             return submitted
@@ -3072,7 +3103,14 @@ class CursesTUI:
 
             # Most (left)
             most_time_metric: Dict[str, float] = {}
-            if self.most_sort_mode == "time" and listen_hours_for_stem is not None:
+            if listen_stats is not None:
+                most_time_metric = listen_stats.hours_by_stem
+                most_entries = (
+                    listen_stats.by_time
+                    if self.most_sort_mode == "time"
+                    else listen_stats.by_count
+                )
+            elif self.most_sort_mode == "time" and listen_hours_for_stem is not None:
                 for name, cnt in counts.items():
                     most_time_metric[name] = float(listen_hours_for_stem(name, cnt))
                 most_entries = sorted(
@@ -3105,8 +3143,10 @@ class CursesTUI:
                         most_hours_metric[name] = float(
                             listen_hours_for_stem(name, cnt)
                         )
-            m_count_num_w = max(
-                1, max((len(str(cnt)) for _, cnt in most_entries), default=1)
+            m_count_num_w = (
+                listen_stats.count_width
+                if listen_stats is not None
+                else max(1, max((len(str(cnt)) for _, cnt in most_entries), default=1))
             )
             m_time_tok_w = max(
                 1,
@@ -3678,21 +3718,54 @@ def list_pygame_output_devices() -> List[str]:
     except Exception:
         return []
 
-def start_device_presence_watchdog(device_name: str) -> None:
-    def _run():
-        while not EXIT_NOW.is_set():
-            devs = list_pygame_output_devices()
-            # If we can enumerate and it's gone -> stop and exit
-            if devs and device_name not in devs:
-                if logging:
-                    print(f"[audio] Output device '{device_name}' disconnected. Stopping.")
-                EXIT_NOW.set()
-                try:
-                    pygame.mixer.music.stop()
-                except Exception:
-                    pass
+
+class AudioOutput:
+    """Serialize mixer shutdown/reopening with device-presence checks."""
+
+    def __init__(self, device_name: Optional[str]):
+        self.device_name = device_name
+        self._lock = threading.Lock()
+
+    def open(self) -> None:
+        with self._lock:
+            if pygame.mixer.get_init():
                 return
-            time.sleep(0.5)
+            init_pygame(device_name=self.device_name)
+            if self._device_missing():
+                pygame.mixer.quit()
+                EXIT_NOW.set()
+                raise SystemExit
+
+    def close(self) -> None:
+        with self._lock:
+            if pygame.mixer.get_init():
+                # stop()/pause() leave the audio device open and can keep the
+                # Mac awake. Sounds must be loaded again after the next open().
+                pygame.mixer.quit()
+
+    def _device_missing(self) -> bool:
+        if not self.device_name:
+            return False
+        devices = list_pygame_output_devices()
+        return bool(devices and self.device_name not in devices)
+
+    def stop_if_disconnected(self) -> bool:
+        with self._lock:
+            # Do not enumerate devices while intentionally closed/locked.
+            if not pygame.mixer.get_init() or not self._device_missing():
+                return False
+            EXIT_NOW.set()
+            pygame.mixer.stop()
+            return True
+
+
+def start_device_presence_watchdog(output: AudioOutput, logging: bool = False) -> None:
+    def _run():
+        while not EXIT_NOW.wait(0.5):
+            if output.stop_if_disconnected():
+                if logging:
+                    print(f"[audio] Output device '{output.device_name}' disconnected. Stopping.")
+                return
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -4051,8 +4124,9 @@ def main(
 
     if logging:
         print("Initializing pygame mixer...")
-    init_pygame(device_name=FORCE_DEVICE)
-    start_device_presence_watchdog(device_name=FORCE_DEVICE)
+    audio_output = AudioOutput(FORCE_DEVICE)
+    audio_output.open()
+    start_device_presence_watchdog(audio_output, logging=logging)
     if sys.platform == "darwin" and FORCE_DEVICE:
         mpv_path = shutil.which("mpv")
         if mpv_path:
@@ -4065,12 +4139,8 @@ def main(
                     print(f"[youtube] mpv device lookup failed: {e}")
 
 
-    next_exit_dt = next_local_time(EXIT_AT_LOCAL_HOUR, EXIT_AT_LOCAL_MINUTE)
-    lock_since_wall: float | None = None
     if logging:
-        print(
-            f"Exit policy: lock>{LOCK_EXIT_MINUTES}m or at {next_exit_dt:%Y-%m-%d %H:%M} local."
-        )
+        print("Playback pauses while locked; no scheduled exit.")
 
     queue: List[Dict[str, object]] = []
     current_playing_item: Optional[Dict[str, object]] = None
@@ -4458,6 +4528,7 @@ def main(
         duration = get_audio_duration_seconds(track_path)
         state.history_duration_by_track_name[track_path.name] = duration
         state.duration_by_stem[track_path.stem] = duration
+        state.listen_stats_cache = None
         try:
             effective_target = (
                 runtime_target_lufs
@@ -4736,6 +4807,7 @@ def main(
         state.audio_data.update(data)
         for p, d in data.items():
             state.duration_by_stem[p.stem] = float(d.get("duration") or 0.0)
+        state.listen_stats_cache = None
         if state.resolved_target_loudness is None:
             state.resolved_target_loudness = resolved
         if state is active_state:
@@ -4784,50 +4856,22 @@ def main(
                 tui.status_msg = "Manual mode active."
 
     def listen_hours_for_stem(stem: str, listens: int) -> float:
-        dur = float(duration_by_stem.get(stem, 0.0))
-        if dur <= 0.0:
-            track_path = mp3_folder / f"{stem}.mp3"
-            if track_path.exists():
-                dur = get_audio_duration_seconds(track_path)
-                duration_by_stem[stem] = dur
-        return (max(0, int(listens)) * dur) / 3600.0
+        return listen_hours_for_state(active_state, stem, listens)
 
     def listen_hours_for_state(
         state: LibraryState, stem: str, listens: int
     ) -> float:
+        library_listen_stats(state)
         dur = float(state.duration_by_stem.get(stem, 0.0))
-        if dur <= 0.0:
-            track_path = state.mp3_folder / f"{stem}.mp3"
-            if track_path.exists():
-                dur = get_audio_duration_seconds(track_path)
-                state.duration_by_stem[stem] = dur
         return (max(0, int(listens)) * dur) / 3600.0
 
     def total_listen_stats() -> Tuple[int, float]:
-        total_listens = 0
-        total_hours = 0.0
-        for stem, listens in counts.items():
-            try:
-                listen_count = max(0, int(listens))
-            except Exception:
-                listen_count = 0
-            total_listens += listen_count
-            total_hours += listen_hours_for_stem(stem, listen_count)
-        return total_listens, total_hours
+        stats = library_listen_stats(active_state)
+        return stats.total_listens, stats.total_hours
 
     def listen_stats_for_state(state: LibraryState) -> Tuple[int, float, int]:
-        total_listens = 0
-        total_hours = 0.0
-        track_count = 0
-        for stem, listens in state.counts.items():
-            try:
-                listen_count = max(0, int(listens))
-            except Exception:
-                listen_count = 0
-            track_count += 1
-            total_listens += listen_count
-            total_hours += listen_hours_for_state(state, stem, listen_count)
-        return total_listens, total_hours, track_count
+        stats = library_listen_stats(state)
+        return stats.total_listens, stats.total_hours, len(stats.by_count)
 
     def combined_listen_stats() -> Tuple[int, float, int]:
         total_listens = 0
@@ -4840,7 +4884,14 @@ def main(
             track_count += state_tracks
         return total_listens, total_hours, track_count
 
+    stats_rows_key = None
+    stats_rows_cache: List[str] = []
+
     def build_stats_rows() -> List[str]:
+        nonlocal stats_rows_key, stats_rows_cache
+        key = (active_library_idx, tuple(library_listen_stats(s) for s in library_states))
+        if key == stats_rows_key:
+            return stats_rows_cache
         all_listens, all_hours, all_tracks = combined_listen_stats()
         rows = [
             "Library       Tracks      Listens      Hours",
@@ -4861,6 +4912,7 @@ def main(
                 "Queries: count>200, listens>=50, hours>10",
             ]
         )
+        stats_rows_key, stats_rows_cache = key, rows
         return rows
 
     def matches_comparison(value: float, op: str, threshold: float) -> bool:
@@ -5124,16 +5176,8 @@ def main(
         # Audio already initialized before TUI
 
         def get_most_entries() -> List[Tuple[str, int]]:
-            if tui.most_sort_mode == "time":
-                return sorted(
-                    counts.items(),
-                    key=lambda kv: (
-                        -listen_hours_for_stem(kv[0], kv[1]),
-                        -kv[1],
-                        kv[0].lower(),
-                    ),
-                )
-            return sorted_counts(counts)
+            stats = library_listen_stats(active_state)
+            return stats.by_time if tui.most_sort_mode == "time" else stats.by_count
 
         def visible_queue_indices() -> List[int]:
             if tui.queue_filter_mode == "all":
@@ -5618,30 +5662,34 @@ def main(
             apply_tag_actions()
             handle_playlist_requests()
 
-        def pause_silence(seconds: float) -> tuple[bool, float | None]:
-            """Responsive gap pause. Returns (stopped, updated_lock_since_wall)."""
-            nonlocal lock_since_wall
-            if seconds <= 0:
-                return False, lock_since_wall
+        def suspend_playback() -> None:
+            audio_output.close()
+            stop_youtube_side_players()
 
-            if not enable_tui:
-                lock_since_wall = sleep_with_exit_checks(
-                    seconds, lock_since_wall, next_exit_dt
-                )
-                return False, lock_since_wall
+        def wait_for_unlock(*, force_check: bool = False) -> bool:
+            return wait_while_locked_or_exit(
+                suspend_playback, force_check=force_check
+            )
+
+        def pause_silence(seconds: float) -> bool:
+            """Responsive gap; restart the gap after unlocking. Return stopped."""
+            if seconds <= 0:
+                return False
 
             start = time.monotonic()
             end = start + float(seconds)
             clock = pygame.time.Clock()
 
             while True:
-                maybe_exit(next_exit_dt)
+                maybe_exit()
+                if wait_for_unlock():
+                    end = time.monotonic() + float(seconds)
                 if time.monotonic() >= end:
                     break
 
-                lock_since_wall = update_lock_or_exit(
-                    mac_is_locked_poll(), lock_since_wall, next_exit_dt
-                )
+                if not enable_tui:
+                    EXIT_NOW.wait(min(LOCK_POLL_SECONDS, max(0.0, end - time.monotonic())))
+                    continue
 
                 total_listens, total_hours = total_listen_stats()
                 all_listens, all_hours, _ = combined_listen_stats()
@@ -5669,6 +5717,7 @@ def main(
                     else None,
                     counts=counts,
                     listen_hours_for_stem=listen_hours_for_stem,
+                    listen_stats=library_listen_stats(active_state),
                     total_listens=total_listens,
                     total_listen_hours=total_hours,
                     similar_entries=current_similar_entries,
@@ -5686,7 +5735,7 @@ def main(
                     active_library_idx=active_tab_idx,
                     combined_total_listens=all_listens,
                     combined_total_listen_hours=all_hours,
-                    stats_rows=build_stats_rows(),
+                    stats_rows=build_stats_rows() if tui.stats_panel_open else None,
                     stats_query_result=stats_query_result,
                     youtube_active=(active_tab_idx == youtube_tab_idx),
                     youtube_results=youtube_results,
@@ -5711,25 +5760,26 @@ def main(
                 if tui.stop_requested:
                     tui.stop_requested = False
                     if stop_active_tab_playback(tui):
-                        return True, lock_since_wall
+                        return True
 
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
-                        pygame.mixer.stop()
+                        audio_output.close()
                         raise SystemExit
-                clock.tick(60)
+                clock.tick(tui.input_poll_hz())
 
-            return False, lock_since_wall
+            return False
 
         try:
             while True:
-                maybe_exit(next_exit_dt)
-                lock_since_wall = update_lock_or_exit(
-                    mac_is_locked_poll(), lock_since_wall, next_exit_dt
-                )
+                maybe_exit()
+                if wait_for_unlock():
+                    if pause_silence(GAP_SECONDS):
+                        continue
 
                 # Idle (only interactive in TUI mode)
                 if not queue:
+                    audio_output.close()
                     if playback_mode == "auto":
                         if enqueue_auto_track(tui):
                             continue
@@ -5751,6 +5801,7 @@ def main(
                         current_play_once=None,
                         counts=counts,
                         listen_hours_for_stem=listen_hours_for_stem,
+                        listen_stats=library_listen_stats(active_state),
                         total_listens=total_listens,
                         total_listen_hours=total_hours,
                         similar_entries=current_similar_entries,
@@ -5768,7 +5819,7 @@ def main(
                         active_library_idx=active_tab_idx,
                         combined_total_listens=all_listens,
                         combined_total_listen_hours=all_hours,
-                        stats_rows=build_stats_rows(),
+                        stats_rows=build_stats_rows() if tui.stats_panel_open else None,
                         stats_query_result=stats_query_result,
                         youtube_active=(active_tab_idx == youtube_tab_idx),
                         youtube_results=youtube_results,
@@ -5777,22 +5828,22 @@ def main(
                     if submitted:
                         if submitted.strip() == "--help":
                             tui.show_help = True
-                            time.sleep(0.01)
+                            EXIT_NOW.wait(1.0 / tui.input_poll_hz())
                             continue
                         if handle_save_playlist_input(submitted):
-                            time.sleep(0.01)
+                            EXIT_NOW.wait(1.0 / tui.input_poll_hz())
                             continue
                         if handle_youtube_download_input(submitted):
-                            time.sleep(0.01)
+                            EXIT_NOW.wait(1.0 / tui.input_poll_hz())
                             continue
                         if handle_youtube_search_input(submitted):
-                            time.sleep(0.01)
+                            EXIT_NOW.wait(1.0 / tui.input_poll_hz())
                             continue
                         if handle_tag_submission(submitted, tui):
-                            time.sleep(0.01)
+                            EXIT_NOW.wait(1.0 / tui.input_poll_hz())
                             continue
                         if handle_stats_query(submitted, tui):
-                            time.sleep(0.01)
+                            EXIT_NOW.wait(1.0 / tui.input_poll_hz())
                             continue
                         mood_text, new_top, new_vol = parse_mood_and_directives(
                             submitted
@@ -5818,7 +5869,7 @@ def main(
                     if tui.stop_requested:
                         tui.stop_requested = False
                         stop_active_tab_playback(tui)
-                    time.sleep(0.01)
+                    EXIT_NOW.wait(1.0 / tui.input_poll_hz())
                     continue
 
                 # Queue loop
@@ -5851,7 +5902,7 @@ def main(
 
                 # Play single item
                 while True:
-                    maybe_exit(next_exit_dt)
+                    maybe_exit()
 
                     if track_path not in track_state.audio_data:
                         track_tag_session.abandon()
@@ -5870,21 +5921,21 @@ def main(
                     )
 
                     try:
+                        # Check before loading and again before playing: decoding
+                        # a long track can take long enough for the Mac to lock.
+                        if wait_for_unlock(force_check=True):
+                            if pause_silence(GAP_SECONDS):
+                                break
+                        audio_output.open()
                         sound = pygame.mixer.Sound(str(track_path))
+                        if mac_is_locked_poll(force=True):
+                            sound = None
+                            continue
                         channel = sound.play()
                         if channel is None:
                             channel = pygame.mixer.find_channel(True)
                             channel.play(sound)
                         channel.set_volume(vol_scale)
-                        # If locked before play
-                        if mac_is_locked_poll():
-                            lock_since_wall = wait_while_locked_or_exit(
-                                lock_since_wall, next_exit_dt
-                            )
-                            stopped, lock_since_wall = pause_silence(GAP_SECONDS)
-                            if stopped:
-                                break
-
                         started_ts = time.monotonic()
                         try:
                             total_dur = float(sound.get_length())
@@ -5900,7 +5951,7 @@ def main(
                         clock = pygame.time.Clock()
 
                         while channel.get_busy():
-                            maybe_exit(next_exit_dt)
+                            maybe_exit()
 
                             elapsed = min(
                                 max(0.0, time.monotonic() - started_ts),
@@ -5936,6 +5987,7 @@ def main(
                                     else None,
                                     counts=counts,
                                     listen_hours_for_stem=listen_hours_for_stem,
+                                    listen_stats=library_listen_stats(active_state),
                                     total_listens=total_listens,
                                     total_listen_hours=total_hours,
                                     similar_entries=current_similar_entries,
@@ -5959,7 +6011,7 @@ def main(
                                     active_library_idx=active_tab_idx,
                                     combined_total_listens=all_listens,
                                     combined_total_listen_hours=all_hours,
-                                    stats_rows=build_stats_rows(),
+                                    stats_rows=build_stats_rows() if tui.stats_panel_open else None,
                                     stats_query_result=stats_query_result,
                                     youtube_active=(active_tab_idx == youtube_tab_idx),
                                     youtube_results=youtube_results,
@@ -6010,11 +6062,11 @@ def main(
                             # Lock mid-track?
                             if mac_is_locked_poll():
                                 interrupted_by_lock = True
-                                pygame.mixer.stop()
-                                lock_since_wall = wait_while_locked_or_exit(
-                                    lock_since_wall, next_exit_dt
-                                )
-                                stopped, lock_since_wall = pause_silence(GAP_SECONDS)
+                                # No Sound/Channel survives closing the mixer.
+                                sound = None
+                                channel = None
+                                wait_for_unlock()
+                                stopped = pause_silence(GAP_SECONDS)
                                 if stopped:
                                     user_stop = True
                                 break
@@ -6024,7 +6076,7 @@ def main(
                                     pygame.mixer.stop()
                                     raise SystemExit
 
-                            clock.tick(60)
+                            clock.tick(tui.input_poll_hz())
 
                         if not interrupted_by_lock and not user_skip and not user_stop:
                             # The loop above exits normally when pygame reports the
@@ -6052,6 +6104,7 @@ def main(
                             if trailing_tag and enable_tui and tui.input_mode in ("tag_add", "tag_edit"):
                                 tui.input_buffer = ""
                             increment_listen(track_path, track_state.counts)
+                            track_state.listen_stats_cache = None
                             save_listen_counts(
                                 track_state.counts, track_state.listen_db_filename
                             )
@@ -6074,17 +6127,17 @@ def main(
                         else:
                             track_tag_session.abandon()
 
+                        sound = None
+                        channel = None
                         if user_stop:
-                            lock_since_wall = sleep_with_exit_checks(
-                                0.2, lock_since_wall, next_exit_dt
-                            )
+                            audio_output.close()
                             current_playing_item = None
                             current_playing_tag_session = None
                             break
 
                         # Between tracks
-                        if user_skip or not mac_is_locked_poll():
-                            stopped, lock_since_wall = pause_silence(GAP_SECONDS)
+                        if not interrupted_by_lock:
+                            stopped = pause_silence(GAP_SECONDS)
                             if stopped:
                                 break
 
@@ -6138,6 +6191,8 @@ def main(
         except (SystemExit, KeyboardInterrupt):
             pass
         finally:
+            EXIT_NOW.set()
+            audio_output.close()
             stop_youtube_side_players()
             store_active_library_state()
             try:

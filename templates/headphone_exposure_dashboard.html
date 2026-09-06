@@ -1,0 +1,1335 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Headphone exposure</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #fafbf9;
+        --panel: #ffffff;
+        --line: #e3e7e1;
+        --text: #303a33;
+        --muted: #626d64;
+        --mint: #597765;
+        --blue: #60848c;
+        --gold: #927449;
+        --track: #f0f2ef;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          13px/1.5 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+      }
+      main {
+        max-width: 1280px;
+        margin: auto;
+        padding: 24px 32px;
+      }
+      button,
+      select {
+        font: inherit;
+        color: var(--text);
+        background: transparent;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 5px 8px;
+        font-size: 12px;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:hover,
+      select:hover {
+        border-color: #b9c5ba;
+      }
+      button:focus-visible,
+      select:focus-visible,
+      summary:focus-visible {
+        outline: 2px solid var(--mint);
+        outline-offset: 4px;
+      }
+      button[aria-pressed="true"] {
+        background: #e9eee8;
+        color: var(--text);
+        border-color: transparent;
+      }
+      #ranges button {
+        border-color: transparent;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 20px;
+      }
+      h1 {
+        font-size: 16px;
+        line-height: 1.4;
+        font-weight: 550;
+        letter-spacing: -0.015em;
+        margin: 0;
+      }
+      #subtitle {
+        font-size: 12px;
+        margin: 3px 0 0;
+      }
+      h2 {
+        font-size: 13px;
+        font-weight: 550;
+        letter-spacing: 0;
+        margin: 0;
+      }
+      p {
+        margin: 6px 0;
+        color: var(--muted);
+      }
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .status {
+        font-size: 11px;
+        color: var(--muted);
+        margin: 0;
+        text-align: right;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 20px;
+        padding: 8px 0 20px;
+      }
+      .card {
+        min-width: 0;
+      }
+      .label {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .value {
+        font-size: 24px;
+        line-height: 1.25;
+        letter-spacing: -0.04em;
+        margin: 5px 0 2px;
+        font-variant-numeric: tabular-nums;
+      }
+      .value small {
+        font-size: 12px;
+        letter-spacing: 0;
+        color: var(--muted);
+        margin-left: 4px;
+      }
+      .detail {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .panel {
+        border-top: 1px solid var(--line);
+        padding: 16px 0 0;
+        margin-bottom: 18px;
+        min-width: 0;
+      }
+      .panel-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+      .chart-scroll {
+        overflow-x: auto;
+      }
+      svg {
+        display: block;
+        width: 100%;
+        overflow: visible;
+      }
+      svg text {
+        font-family: inherit;
+        fill: var(--muted);
+        font-size: 11px;
+      }
+      svg .axis {
+        stroke: var(--line);
+        stroke-width: 1;
+      }
+      svg .clickable {
+        cursor: pointer;
+      }
+      svg .clickable:hover {
+        filter: brightness(0.9);
+      }
+      #timeline svg {
+        cursor: crosshair;
+        touch-action: none;
+        user-select: none;
+      }
+      #timeline svg:focus-visible {
+        outline: 2px solid var(--mint);
+        outline-offset: 2px;
+      }
+      .zoom-selection {
+        fill: var(--mint);
+        fill-opacity: 0.14;
+        stroke: var(--mint);
+        pointer-events: none;
+      }
+      .two-col {
+        display: grid;
+        grid-template-columns: 1.4fr 1fr;
+        gap: 32px;
+      }
+      .legend {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        align-items: center;
+        color: var(--muted);
+        font-size: 11px;
+        margin-top: 12px;
+      }
+      .legend .swatch {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+        margin-right: 5px;
+      }
+      .day-stats {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin: 0 0 8px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .day-stats b {
+        color: var(--text);
+        font-weight: 550;
+      }
+      .empty {
+        padding: 60px 20px;
+        text-align: center;
+        color: var(--muted);
+      }
+      .footer {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        color: var(--muted);
+        font-size: 11px;
+        border-top: 1px solid var(--line);
+        padding-top: 12px;
+      }
+      .footer-actions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      #download {
+        border-color: transparent;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      details {
+        max-width: 950px;
+      }
+      summary {
+        cursor: pointer;
+        color: var(--muted);
+      }
+      details p {
+        margin-top: 10px;
+      }
+      #tooltip {
+        position: fixed;
+        z-index: 10;
+        pointer-events: none;
+        max-width: 300px;
+        padding: 8px 10px;
+        border: 1px solid #bfcec1;
+        border-radius: 5px;
+        background: var(--panel);
+        box-shadow: 0 8px 24px #20382a18;
+        font-size: 12px;
+        white-space: pre-line;
+        display: none;
+      }
+      a {
+        color: var(--mint);
+      }
+      @media (max-width: 900px) {
+        main {
+          padding: 20px;
+        }
+        .cards {
+          grid-template-columns: repeat(2, 1fr);
+        }
+        .status {
+          text-align: left;
+        }
+        .two-col {
+          grid-template-columns: 1fr;
+        }
+        .panel-head {
+          flex-wrap: wrap;
+        }
+      }
+      @media (max-width: 500px) {
+        main {
+          padding: 20px 12px;
+        }
+        header {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 10px;
+        }
+        .cards {
+          gap: 16px;
+        }
+        .footer {
+          flex-direction: column;
+        }
+        .controls {
+          gap: 6px;
+        }
+      }
+      @media print {
+        body {
+          background: white;
+          color: #17201e;
+        }
+        main {
+          max-width: none;
+          padding: 0;
+        }
+        .panel,
+        .card {
+          break-inside: avoid;
+          background: white;
+          border-color: #ddd;
+        }
+        .controls,
+        .status,
+        button,
+        #tooltip {
+          display: none;
+        }
+        .value,
+        .day-stats b,
+        h1,
+        h2,
+        summary {
+          color: #17201e;
+        }
+        :root {
+          --text: #17201e;
+          --muted: #526359;
+          --line: #ddd;
+        }
+        .chart-scroll {
+          overflow: visible;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Headphone exposure</h1>
+          <p id="subtitle"></p>
+        </div>
+        <div>
+          <div class="controls" id="ranges" aria-label="Date range">
+            <button data-range="7" aria-pressed="false">7 days</button
+            ><button data-range="30" aria-pressed="false">30 days</button
+            ><button data-range="all" aria-pressed="true">All time</button>
+          </div>
+        </div>
+      </header>
+      <section
+        class="cards"
+        aria-label="Summary statistics"
+        id="cards"
+      ></section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="comparison-title">Daily</h2>
+          <div class="controls">
+            <select id="group" aria-label="Group by">
+              <option value="day">Daily</option>
+              <option value="week">Weekly · Mon–Sun</option></select
+            ><select id="metric" aria-label="Comparison metric">
+              <option value="count">Recorded minutes</option>
+              <option value="level">Average estimate · dB(A)</option>
+              <option value="dose">Recorded dose increase · %</option>
+            </select>
+          </div>
+        </div>
+        <div class="chart-scroll">
+          <div id="comparison" class="chart"></div>
+        </div>
+      </section>
+      <div class="two-col">
+        <section class="panel">
+          <div class="panel-head">
+            <h2
+              title="Recorded minutes by hour. Select a cell to inspect that day."
+            >
+              By hour
+            </h2>
+          </div>
+          <div class="chart-scroll"><div id="heatmap"></div></div>
+          <div class="legend">
+            <span
+              ><i class="swatch" style="background: var(--track)"></i>No
+              records</span
+            ><span
+              >Fewer
+              <i
+                class="swatch"
+                style="background: #d0ddce; margin-left: 8px"
+              ></i
+              ><i class="swatch" style="background: #98b09b"></i
+              ><i class="swatch" style="background: var(--mint)"></i> More
+              minutes</span
+            >
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <h2 title="Distribution of the logged upper level estimate.">
+              Level distribution
+            </h2>
+          </div>
+          <div id="distribution" class="chart"></div>
+        </section>
+      </div>
+      <section class="panel" id="detail-panel">
+        <div class="panel-head">
+          <h2
+            title="Drag across a time range to zoom. Double-click or press Escape to reset. Hover for minute values."
+          >
+            Daily timeline
+          </h2>
+          <div class="controls">
+            <span
+              id="timeline-window"
+              class="status"
+              aria-live="polite"
+              hidden
+            ></span>
+            <button id="reset-zoom" hidden>Reset zoom</button>
+            <select id="day" aria-label="Inspect day"></select
+            ><select id="detail-metric" aria-label="Timeline metric">
+              <option value="level">Level estimate · dB(A)</option>
+              <option value="volume">Mac volume · %</option>
+              <option value="source">Source level · dBFS(A)</option>
+            </select>
+          </div>
+        </div>
+        <div class="day-stats" id="day-stats"></div>
+        <div class="chart-scroll"><div id="timeline" class="chart"></div></div>
+      </section>
+      <div class="footer">
+        <details>
+          <summary>About the data</summary>
+          <p>
+            Recorded minutes count distinct clock minutes with at least one log
+            entry. Exact active seconds are not stored, so this is an activity
+            footprint, not precise listening duration. Missing records can mean
+            silence, capture downtime, or that monitoring was off.
+          </p>
+          <p>
+            The level is the recorder’s uncalibrated upper estimate, not a
+            measurement at the eardrum. Average estimates combine sound energy,
+            with equal weight per recorded minute. If a minute has multiple
+            entries, their energies receive equal weight within that minute
+            because durations are unavailable. “Highest minute” is the highest
+            combined minute average, not an instantaneous peak.
+          </p>
+          <p>
+            Weekly dose is the latest cumulative percentage saved by the
+            recorder for the displayed week. Dose increases are positive
+            differences between consecutive readings within the same
+            Monday–Sunday week. The first reading is a baseline; a decrease
+            starts a new baseline. Differences across gaps are assigned to the
+            later reading, so daily attribution can be approximate. No missing
+            time is inferred.
+          </p>
+          <p>
+            Dates and hours use each record’s saved time zone. Range buttons end
+            at the latest recorded date. Weekly bars show only available days in
+            the selected range. Missing days are excluded from averages. Today
+            and weeks with fewer than seven recorded dates are marked as
+            partial.
+          </p>
+          <p id="quality"></p>
+        </details>
+        <div class="footer-actions">
+          <div class="status" id="status"></div>
+          <button id="download">Export CSV</button>
+        </div>
+      </div>
+    </main>
+    <div id="tooltip" role="tooltip"></div>
+    <!-- prettier-ignore -->
+    <script id="report-data" type="application/json">__REPORT_JSON__</script>
+    <script>
+      "use strict";
+      let report = JSON.parse(
+        document.getElementById("report-data").textContent,
+      );
+      const LIVE = __LIVE_MODE__,
+        $ = (id) => document.getElementById(id),
+        NS = "http://www.w3.org/2000/svg";
+      const state = { range: "all", day: null, zoom: null, dragging: false },
+        colors = {
+          mint: "var(--mint)",
+          blue: "var(--blue)",
+          gold: "var(--gold)",
+        };
+      const fmt = (n, d = 1) =>
+        n == null
+          ? "—"
+          : Number(n).toLocaleString(undefined, {
+              maximumFractionDigits: d,
+              minimumFractionDigits: d,
+            });
+      const pct = (n) =>
+        n == null
+          ? "—"
+          : (n === 0
+              ? "0"
+              : n < 0.0001
+                ? "<0.0001"
+                : n.toFixed(4).replace(/0+$/, "").replace(/\.$/, "")) + "%";
+      const dateObj = (s) => new Date(s + "T12:00:00Z");
+      const dateLabel = (s) =>
+        dateObj(s).toLocaleDateString(undefined, {
+          month: "short",
+          day: "numeric",
+          timeZone: "UTC",
+        });
+      const fullDate = (s) =>
+        dateObj(s).toLocaleDateString(undefined, {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+          timeZone: "UTC",
+        });
+      const addDays = (s, n) => {
+        const d = dateObj(s);
+        d.setUTCDate(d.getUTCDate() + n);
+        return d.toISOString().slice(0, 10);
+      };
+      const clock = (m) =>
+        `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+      function selectedDays() {
+        const last = report.days.at(-1)?.date;
+        if (!last) return [];
+        const first =
+          state.range === "all"
+            ? report.days[0].date
+            : addDays(last, 1 - Number(state.range));
+        return report.days.filter((d) => d.date >= first && d.date <= last);
+      }
+      function calendarDays(days) {
+        if (!days.length) return [];
+        const lookup = new Map(days.map((d) => [d.date, d]));
+        let rows = [];
+        for (
+          let date = days[0].date;
+          date <= days.at(-1).date;
+          date = addDays(date, 1)
+        )
+          rows.push(
+            lookup.get(date) || {
+              date,
+              count: null,
+              minutes: [],
+              hours: Array(24).fill(0),
+            },
+          );
+        return rows;
+      }
+      function energyMean(items) {
+        if (!items.length) return null;
+        const high = Math.max(...items.map((i) => i.level));
+        let weight = 0,
+          total = 0;
+        for (const i of items) {
+          weight += i.count;
+          total += i.count * 10 ** ((i.level - high) / 10);
+        }
+        return high + 10 * Math.log10(total / weight);
+      }
+      function s(tag, attrs = {}, parent) {
+        const el = document.createElementNS(NS, tag);
+        for (const [key, value] of Object.entries(attrs))
+          el.setAttribute(key, value);
+        if (parent) parent.appendChild(el);
+        return el;
+      }
+      function text(svg, x, y, value, attrs = {}) {
+        const el = s("text", { x, y, ...attrs }, svg);
+        el.textContent = value;
+        return el;
+      }
+      function chart(id, width, height, label) {
+        const root = $(id);
+        root.replaceChildren();
+        const svg = s(
+          "svg",
+          {
+            viewBox: `0 0 ${width} ${height}`,
+            role: "img",
+            "aria-label": label,
+          },
+          root,
+        );
+        const title = s("title", {}, svg);
+        title.textContent = label;
+        return svg;
+      }
+      function empty(id, message = "No records in this range.") {
+        $(id).replaceChildren();
+        const p = document.createElement("div");
+        p.className = "empty";
+        p.textContent = message;
+        $(id).appendChild(p);
+      }
+      const tip = $("tooltip");
+      function hover(el, message) {
+        el.addEventListener("pointermove", (e) => {
+          if (state.dragging) return;
+          tip.textContent = message;
+          tip.style.display = "block";
+          tip.style.left =
+            Math.max(
+              8,
+              Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 12),
+            ) + "px";
+          tip.style.top =
+            Math.max(
+              8,
+              Math.min(e.clientY + 14, innerHeight - tip.offsetHeight - 12),
+            ) + "px";
+        });
+        el.addEventListener("pointerleave", () => (tip.style.display = "none"));
+        const title = s("title", {}, el);
+        title.textContent = message;
+      }
+      function inspect(el, date) {
+        el.classList.add("clickable");
+        el.setAttribute("tabindex", "0");
+        el.setAttribute("role", "button");
+        el.setAttribute("aria-label", `Inspect ${fullDate(date)}`);
+        const choose = () => {
+          state.day = date;
+          $("day").value = date;
+          renderTimeline();
+          $("detail-panel").scrollIntoView({
+            behavior: "smooth",
+            block: "center",
+          });
+          tip.style.display = "none";
+        };
+        el.addEventListener("click", choose);
+        el.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            choose();
+          }
+        });
+      }
+      function card(label, value, unit, detail) {
+        const el = document.createElement("article");
+        el.className = "card";
+        for (const [cls, content] of [
+          ["label", label],
+          ["value", value],
+          ["detail", detail],
+        ]) {
+          const child = document.createElement("div");
+          child.className = cls;
+          child.textContent = content;
+          if (cls === "value" && unit) {
+            const small = document.createElement("small");
+            small.textContent = unit;
+            child.appendChild(small);
+          }
+          el.appendChild(child);
+        }
+        $("cards").appendChild(el);
+      }
+      function renderCards(days) {
+        $("cards").replaceChildren();
+        const count = days.reduce((n, d) => n + d.count, 0),
+          last = days.at(-1),
+          maximum = days.length
+            ? Math.max(...days.map((d) => d.maximum))
+            : null;
+        card(
+          "Recorded minutes",
+          fmt(count, 0),
+          "min",
+          `${days.length} days with records`,
+        );
+        card(
+          "Average estimate",
+          fmt(energyMean(days)),
+          "dB(A)",
+          "Energy average",
+        );
+        card("Highest minute", fmt(maximum), "dB(A)", "Minute average");
+        card(
+          "Latest weekly dose",
+          last ? pct(report.weekly_dose[last.week]) : "—",
+          "",
+          last ? `Week of ${dateLabel(last.week)}` : "No dose readings",
+        );
+      }
+      function groups(days) {
+        if ($("group").value === "day")
+          return calendarDays(days).map((d) => ({
+            ...d,
+            key: d.date,
+            label: dateLabel(d.date),
+            n: d.count == null ? 0 : 1,
+          }));
+        const map = new Map();
+        for (const d of calendarDays(days)) {
+          const dt = dateObj(d.date),
+            week = addDays(d.date, -((dt.getUTCDay() + 6) % 7));
+          if (!map.has(week)) map.set(week, []);
+          if (d.count != null) map.get(week).push(d);
+        }
+        return [...map].map(([key, rows]) => ({
+          key,
+          label: dateLabel(key),
+          n: rows.length,
+          count: rows.length ? rows.reduce((n, d) => n + d.count, 0) : null,
+          level: energyMean(rows),
+          dose: rows.some((d) => d.dose != null)
+            ? rows.reduce((n, d) => n + (d.dose || 0), 0)
+            : null,
+        }));
+      }
+      function renderComparison(days) {
+        const weekly = $("group").value === "week",
+          metric = $("metric").value;
+        $("comparison-title").textContent = weekly ? "Weekly" : "Daily";
+        $("comparison-title").title =
+          metric === "count"
+            ? "Your activity footprint. Each recorded minute counts once; gaps remain unmeasured."
+            : metric === "level"
+              ? "Sound energy averaged across recorded minutes. Higher bars mean a higher estimated level."
+              : "Changes in the recorder’s cumulative weekly dose, in percentage points. Each week’s first reading is a baseline.";
+        if (!days.length) {
+          empty("comparison");
+          return;
+        }
+        const rows = groups(days),
+          w = Math.max(740, $("comparison").clientWidth, rows.length * 42 + 80),
+          h = 230,
+          left = 60,
+          right = 15,
+          top = 22,
+          bottom = 48,
+          ph = h - top - bottom,
+          pw = w - left - right;
+        const svg = chart(
+          "comparison",
+          w,
+          h,
+          weekly ? "Weekly comparison" : "Daily comparison",
+        );
+        svg.style.minWidth = w + "px";
+        const values = rows.map((d) => d[metric]).filter((v) => v != null),
+          max =
+            Math.max(
+              metric === "count" ? 60 : metric === "level" ? 10 : 0.0001,
+              ...values,
+            ) * 1.13,
+          min = metric === "level" ? Math.min(0, ...values) : 0,
+          span = max - min,
+          y = (v) => top + ph - ((v - min) / span) * ph;
+        for (let i = 0; i <= 4; i++) {
+          const val = min + (span * i) / 4,
+            yy = y(val);
+          s(
+            "line",
+            { x1: left, y1: yy, x2: w - right, y2: yy, class: "axis" },
+            svg,
+          );
+          text(
+            svg,
+            left - 10,
+            yy + 4,
+            metric === "dose" ? pct(val) : fmt(val, 0),
+            { "text-anchor": "end" },
+          );
+        }
+        const step = pw / rows.length,
+          bar = Math.min(74, step * 0.6);
+        rows.forEach((row, i) => {
+          const x = left + step * (i + 0.5),
+            value = row[metric],
+            partial = weekly
+              ? row.n < 7 ||
+                addDays(row.key, 6) >= report.generated.slice(0, 10)
+              : row.key === report.generated.slice(0, 10);
+          if (value != null) {
+            const y0 = y(Math.max(0, min)),
+              yv = y(value),
+              r = s(
+                "rect",
+                {
+                  x: x - bar / 2,
+                  y: Math.min(y0, yv),
+                  width: bar,
+                  height: Math.max(2, Math.abs(y0 - yv)),
+                  rx: 4,
+                  fill:
+                    metric === "dose"
+                      ? colors.gold
+                      : metric === "level"
+                        ? colors.blue
+                        : colors.mint,
+                  opacity: partial ? 0.65 : 1,
+                },
+                svg,
+              );
+            const label =
+              metric === "dose"
+                ? pct(value)
+                : fmt(value, metric === "level" ? 1 : 0) +
+                  (metric === "level" ? " dB(A)" : " recorded min");
+            hover(
+              r,
+              `${weekly ? "Week of " : ""}${fullDate(row.key)}\n${label}\n${weekly ? row.n + " of 7 days have records" : partial ? "Today · partial day" : "Recorded portion of this day"}`,
+            );
+            if (!weekly) inspect(r, row.key);
+            if (rows.length < 15)
+              text(
+                svg,
+                x,
+                Math.min(y0, yv) - 9,
+                metric === "dose"
+                  ? pct(value)
+                  : fmt(value, metric === "level" ? 1 : 0),
+                { "text-anchor": "middle", style: "fill:var(--text)" },
+              );
+          } else {
+            hover(
+              s(
+                "circle",
+                { cx: x, cy: y(0) - 5, r: 3, fill: "var(--muted)" },
+                svg,
+              ),
+              "No records / no dose difference available",
+            );
+          }
+          text(svg, x, h - bottom + 22, row.label, { "text-anchor": "middle" });
+          if (partial)
+            text(svg, x, h - 7, weekly ? "partial week" : "today", {
+              "text-anchor": "middle",
+              style: "font-size:9px",
+            });
+        });
+      }
+      function heatColor(n, max) {
+        if (!n) return "var(--track)";
+        const t = Math.sqrt(n / Math.max(1, max)),
+          a = [226, 234, 224],
+          b = [89, 119, 101];
+        return `rgb(${a.map((v, i) => Math.round(v + (b[i] - v) * t)).join(",")})`;
+      }
+      function renderHeatmap(days) {
+        if (!days.length) {
+          empty("heatmap");
+          return;
+        }
+        const rows = calendarDays(days),
+          w = 700,
+          left = 72,
+          top = 28,
+          cw = (w - left) / 24,
+          rh = 27,
+          h = top + rows.length * rh + 8,
+          max = Math.max(...days.flatMap((d) => d.hours));
+        const svg = chart("heatmap", w, h, "Recorded minutes by day and hour");
+        svg.style.minWidth = "600px";
+        for (let hour = 0; hour < 24; hour += 3)
+          text(
+            svg,
+            left + (hour + 0.5) * cw,
+            14,
+            String(hour).padStart(2, "0"),
+            { "text-anchor": "middle" },
+          );
+        rows.forEach((day, i) => {
+          text(svg, left - 10, top + i * rh + 17, dateLabel(day.date), {
+            "text-anchor": "end",
+          });
+          day.hours.forEach((n, hour) => {
+            const r = s(
+              "rect",
+              {
+                x: left + hour * cw + 2,
+                y: top + i * rh,
+                width: cw - 4,
+                height: rh - 5,
+                rx: 3,
+                fill: heatColor(n, max),
+              },
+              svg,
+            );
+            hover(
+              r,
+              `${fullDate(day.date)} · ${clock(hour * 60)}–${clock((hour + 1) * 60)}\n${n ? n + " recorded minutes" : "No records"}`,
+            );
+            if (day.count != null) inspect(r, day.date);
+          });
+        });
+      }
+      function renderDistribution(days) {
+        const minutes = days.flatMap((d) => d.minutes);
+        if (!minutes.length) {
+          empty("distribution");
+          return;
+        }
+        const bands = [
+          { label: "< 40", test: (v) => v < 40 },
+          { label: "40–50", test: (v) => v >= 40 && v < 50 },
+          { label: "50–60", test: (v) => v >= 50 && v < 60 },
+          { label: "60–70", test: (v) => v >= 60 && v < 70 },
+          { label: "≥ 70", test: (v) => v >= 70 },
+        ].map((b) => ({
+          ...b,
+          count: minutes.filter((m) => b.test(m.level)).length,
+        }));
+        const w = 490,
+          h = 225,
+          left = 70,
+          right = 120,
+          top = 22,
+          row = 39,
+          pw = w - left - right,
+          max = Math.max(1, ...bands.map((b) => b.count));
+        const svg = chart(
+          "distribution",
+          w,
+          h,
+          "Distribution of recorded minute estimates",
+        );
+        bands.forEach((b, i) => {
+          const y = top + i * row;
+          text(svg, left - 12, y + 13, b.label, { "text-anchor": "end" });
+          s(
+            "rect",
+            { x: left, y, width: pw, height: 20, rx: 4, fill: "var(--track)" },
+            svg,
+          );
+          const bar = s(
+            "rect",
+            {
+              x: left,
+              y,
+              width: (pw * b.count) / max,
+              height: 20,
+              rx: 4,
+              fill: colors.blue,
+              opacity: 0.85,
+            },
+            svg,
+          );
+          hover(
+            bar,
+            `${b.label} dB(A)\n${b.count} recorded minutes · ${fmt((b.count / minutes.length) * 100)}%`,
+          );
+          text(
+            svg,
+            left + pw + 12,
+            y + 14,
+            `${b.count} · ${fmt((b.count / minutes.length) * 100, 0)}%`,
+          );
+        });
+        text(svg, left - 12, h - 2, "dB(A)", { "text-anchor": "end" });
+      }
+      function renderTimeline() {
+        const day = selectedDays().find((d) => d.date === state.day);
+        state.dragging = false;
+        tip.style.display = "none";
+        if (!day || state.zoom?.day !== day.date) state.zoom = null;
+        $("reset-zoom").hidden = !state.zoom;
+        $("timeline-window").hidden = !state.zoom;
+        $("timeline-window").textContent = state.zoom
+          ? `${clock(state.zoom.low)}–${clock(state.zoom.high)}`
+          : "";
+        $("day-stats").replaceChildren();
+        if (!day) {
+          empty("timeline", "Choose a day with records.");
+          return;
+        }
+        for (const [label, value] of [
+          ["Recorded", day.count + " min"],
+          ["Average estimate", fmt(day.level) + " dB(A)"],
+          ["Highest minute", fmt(day.maximum) + " dB(A)"],
+          [
+            "Average Mac volume",
+            day.volume == null ? "—" : fmt(day.volume) + "%",
+          ],
+        ]) {
+          const span = document.createElement("span");
+          span.textContent = label + " ";
+          const b = document.createElement("b");
+          b.textContent = value;
+          span.appendChild(b);
+          $("day-stats").appendChild(span);
+        }
+        const metric = $("detail-metric").value,
+          unit =
+            metric === "volume"
+              ? "%"
+              : metric === "source"
+                ? "dBFS(A)"
+                : "dB(A)",
+          points = day.minutes,
+          values = points
+            .filter((m) => m[metric] != null)
+            .map((m) => m[metric]);
+        if (!values.length) {
+          empty("timeline", "This metric was not recorded for this day.");
+          return;
+        }
+        const w = 1100,
+          h = 250,
+          left = 55,
+          right = 20,
+          top = 20,
+          bottom = 38,
+          pw = w - left - right,
+          ph = h - top - bottom,
+          min =
+            metric === "volume"
+              ? 0
+              : Math.min(
+                  metric === "level" ? 60 : Infinity,
+                  Math.floor((Math.min(...values) - 5) / 10) * 10,
+                ),
+          max =
+            metric === "volume"
+              ? 100
+              : metric === "level"
+                ? 70
+                : Math.ceil((Math.max(...values) + 5) / 10) * 10,
+          fullLow = Math.max(
+            0,
+            Math.floor(Math.min(...points.map((m) => m.minute)) / 60) * 60,
+          ),
+          fullHigh = Math.min(
+            1440,
+            Math.ceil((Math.max(...points.map((m) => m.minute)) + 1) / 60) * 60,
+          ),
+          low = state.zoom?.low ?? fullLow,
+          high = state.zoom?.high ?? fullHigh,
+          x = (m) => left + ((m - low) / (high - low)) * pw,
+          y = (v) => top + ((max - v) / (max - min)) * ph;
+        const svg = chart(
+          "timeline",
+          w,
+          h,
+          `${fullDate(day.date)} · ${unit} timeline`,
+        );
+        svg.style.minWidth = "700px";
+        svg.setAttribute("tabindex", "0");
+        svg.setAttribute(
+          "aria-label",
+          `${fullDate(day.date)} · ${unit}. Drag to zoom; Escape resets.`,
+        );
+        // A background hit area lets a drag start between the plotted points.
+        s(
+          "rect",
+          { x: left, y: top, width: pw, height: ph, fill: "transparent" },
+          svg,
+        );
+        const levelStep = metric === "volume" ? 25 : 10;
+        for (let v = min; v <= max; v += levelStep) {
+          const yy = y(v);
+          s(
+            "line",
+            { x1: left, y1: yy, x2: w - right, y2: yy, class: "axis" },
+            svg,
+          );
+          text(svg, left - 10, yy + 4, fmt(v, 0), { "text-anchor": "end" });
+        }
+        const tick = [1, 2, 5, 10, 15, 30, 60, 120, 180, 240, 720, 1440].find(
+          (step) => (high - low) / step <= 10,
+        );
+        for (let m = Math.ceil(low / tick) * tick; m <= high; m += tick)
+          text(svg, x(m), h - 10, clock(m), { "text-anchor": "middle" });
+        const clip = s("clipPath", { id: "timeline-clip" }, s("defs", {}, svg));
+        s("rect", { x: left - 4, y: top, width: pw + 8, height: ph + 4 }, clip);
+        const series = s("g", { "clip-path": "url(#timeline-clip)" }, svg);
+        let path = "",
+          previous = null;
+        for (const p of points) {
+          if (p[metric] == null) {
+            previous = null;
+            continue;
+          }
+          const continuous =
+            previous &&
+            p.epoch - previous.epoch === 1 &&
+            p.minute - previous.minute === 1;
+          path += `${continuous ? "L" : "M"}${x(p.minute)},${y(p[metric])} `;
+          previous = p;
+        }
+        s(
+          "path",
+          {
+            d: path,
+            fill: "none",
+            stroke: metric === "volume" ? colors.gold : colors.blue,
+            "stroke-width": 2,
+            "stroke-linejoin": "round",
+          },
+          series,
+        );
+        for (const p of points) {
+          if (p[metric] == null || p.minute < low || p.minute > high) continue;
+          const dot = s(
+            "circle",
+            {
+              cx: x(p.minute),
+              cy: y(p[metric]),
+              r: 2.6,
+              fill: metric === "volume" ? colors.gold : colors.blue,
+            },
+            series,
+          );
+          hover(
+            dot,
+            `${p.time}\n${fmt(p[metric])} ${unit}\nLevel estimate: ${fmt(p.level)} dB(A)\nMac volume: ${p.volume == null ? "—" : fmt(p.volume) + "%"}`,
+          );
+        }
+        const selection = s(
+          "rect",
+          {
+            x: left,
+            y: top,
+            width: 0,
+            height: ph,
+            class: "zoom-selection",
+            visibility: "hidden",
+          },
+          svg,
+        );
+        let drag = null;
+        const position = (event) => {
+          const point = svg.createSVGPoint();
+          point.x = event.clientX;
+          point.y = event.clientY;
+          return point.matrixTransform(svg.getScreenCTM().inverse());
+        };
+        const clampX = (value) => Math.max(left, Math.min(w - right, value));
+        const finishDrag = () => {
+          const pointerId = drag?.pointerId;
+          drag = null;
+          state.dragging = false;
+          selection.setAttribute("visibility", "hidden");
+          if (pointerId != null && svg.hasPointerCapture(pointerId)) {
+            svg.releasePointerCapture(pointerId);
+          }
+        };
+        svg.addEventListener("pointerdown", (event) => {
+          if (drag || event.button !== 0) return;
+          const point = position(event);
+          if (
+            point.x < left ||
+            point.x > w - right ||
+            point.y < top ||
+            point.y > top + ph
+          )
+            return;
+          event.preventDefault();
+          drag = {
+            pointerId: event.pointerId,
+            x: point.x,
+            clientX: event.clientX,
+          };
+          state.dragging = true;
+          tip.style.display = "none";
+          svg.focus({ preventScroll: true });
+          svg.setPointerCapture(event.pointerId);
+          selection.setAttribute("x", point.x);
+          selection.setAttribute("width", 0);
+        });
+        svg.addEventListener("pointermove", (event) => {
+          if (!drag || event.pointerId !== drag.pointerId) return;
+          const end = clampX(position(event).x);
+          selection.setAttribute("x", Math.min(drag.x, end));
+          selection.setAttribute("width", Math.abs(end - drag.x));
+          selection.setAttribute("visibility", "visible");
+        });
+        svg.addEventListener("pointerup", (event) => {
+          if (!drag || event.pointerId !== drag.pointerId) return;
+          const end = clampX(position(event).x);
+          const moved = Math.abs(event.clientX - drag.clientX) >= 6;
+          const startMinute = Math.max(
+            low,
+            Math.floor(
+              low + ((Math.min(drag.x, end) - left) / pw) * (high - low),
+            ),
+          );
+          const endMinute = Math.min(
+            high,
+            Math.ceil(
+              low + ((Math.max(drag.x, end) - left) / pw) * (high - low),
+            ),
+          );
+          finishDrag();
+          if (!moved || endMinute <= startMinute) return;
+          state.zoom =
+            startMinute === fullLow && endMinute === fullHigh
+              ? null
+              : { day: day.date, low: startMinute, high: endMinute };
+          renderTimeline();
+          $("timeline").querySelector("svg").focus({ preventScroll: true });
+        });
+        svg.addEventListener("pointercancel", finishDrag);
+        svg.addEventListener("lostpointercapture", finishDrag);
+        svg.addEventListener("dblclick", resetTimelineZoom);
+        svg.addEventListener("keydown", (event) => {
+          if (event.key !== "Escape") return;
+          event.preventDefault();
+          finishDrag();
+          resetTimelineZoom();
+        });
+      }
+      function resetTimelineZoom() {
+        state.zoom = null;
+        renderTimeline();
+        $("timeline").querySelector("svg")?.focus({ preventScroll: true });
+      }
+      function render() {
+        const days = selectedDays(),
+          first = days[0],
+          last = days.at(-1);
+        $("subtitle").textContent = first
+          ? `${dateLabel(first.date)} – ${dateLabel(last.date)} · ${days.length} days`
+          : "No records yet";
+        $("subtitle").title = first
+          ? `${fullDate(first.date)} — ${fullDate(last.date)}`
+          : "History appears once the recorder saves data.";
+        renderCards(days);
+        renderComparison(days);
+        renderHeatmap(days);
+        renderDistribution(days);
+        if (!days.some((d) => d.date === state.day))
+          state.day = last?.date || null;
+        $("day").replaceChildren();
+        for (const d of [...days].reverse()) {
+          const option = document.createElement("option");
+          option.value = d.date;
+          option.textContent = fullDate(d.date);
+          $("day").appendChild(option);
+        }
+        $("day").value = state.day || "";
+        renderTimeline();
+        const q = report.quality;
+        $("quality").textContent =
+          `${report.records.toLocaleString()} source records from ${q.files} files. ${q.invalid_rows} invalid/incomplete rows skipped; ${q.duplicate_rows} exact duplicate rows ignored; ${q.dose_resets} within-week dose decreases treated as new baselines. Snapshot generated ${report.generated}.`;
+        $("status").textContent =
+          `${LIVE ? "Live" : "Snapshot"} · ${new Date(report.generated).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+      }
+      $("ranges").addEventListener("click", (e) => {
+        const button = e.target.closest("button[data-range]");
+        if (!button) return;
+        state.range = button.dataset.range;
+        for (const b of $("ranges").querySelectorAll("button"))
+          b.setAttribute("aria-pressed", String(b === button));
+        render();
+      });
+      $("group").addEventListener("change", () =>
+        renderComparison(selectedDays()),
+      );
+      $("metric").addEventListener("change", () =>
+        renderComparison(selectedDays()),
+      );
+      $("day").addEventListener("change", () => {
+        state.day = $("day").value;
+        renderTimeline();
+      });
+      $("detail-metric").addEventListener("change", renderTimeline);
+      $("reset-zoom").addEventListener("click", resetTimelineZoom);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && state.zoom) {
+          event.preventDefault();
+          resetTimelineZoom();
+        }
+      });
+      $("download").addEventListener("click", () => {
+        const keys = [
+          "date",
+          "week",
+          "recorded_minutes",
+          "average_estimate_db_a",
+          "highest_minute_db_a",
+          "average_mac_volume_percent",
+          "recorded_dose_increase_percent",
+        ];
+        const rows = selectedDays().map((d) =>
+          [d.date, d.week, d.count, d.level, d.maximum, d.volume, d.dose].map(
+            (v) => (v == null ? "" : v),
+          ),
+        );
+        const csv = [keys, ...rows].map((row) => row.join(",")).join("\r\n");
+        const url = URL.createObjectURL(
+          new Blob([csv], { type: "text/csv;charset=utf-8" }),
+        );
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "headphone_exposure_daily.csv";
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      });
+      render();
+      if (LIVE)
+        setInterval(async () => {
+          if (state.dragging) return;
+          try {
+            const response = await fetch("/data", { cache: "no-store" });
+            if (!response.ok) throw new Error("refresh failed");
+            const fresh = await response.json();
+            if (state.dragging) return;
+            report = fresh;
+            render();
+          } catch (error) {
+            $("status").textContent =
+              "Refresh unavailable · showing the last snapshot";
+          }
+        }, 15000);
+    </script>
+  </body>
+</html>

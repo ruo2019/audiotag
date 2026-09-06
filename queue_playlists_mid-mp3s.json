@@ -279,5 +279,37 @@
       "play_once": false,
       "library": "mid-mp3s"
     }
+  ],
+  "p": [
+    {
+      "base": "7 Years",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Have It All",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "always, i'll care",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Perfect Symphony",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "golden hour",
+      "play_once": false,
+      "library": "mp3"
+    },
+    {
+      "base": "honeybee (Instrumental)",
+      "play_once": false,
+      "library": "mp3"
+    }
   ]
 }

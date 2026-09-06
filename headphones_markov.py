@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -102,6 +103,8 @@ EMB_CACHE_NAME = ".track_emb_cache.npz"
 
 LOUD_CACHE_VERSION = 2
 LOUD_CACHE_NAME = ".loudness_cache.json"
+AUDIO_COLOR_CACHE_NAME = ".autoplay_audio_colors.json"
+AUDIO_FEATURES_CACHE_FILE = Path("audio_features_cache.json")
 BASE_VOLUME_SCALE = 0.5
 TRUE_PEAK_LIMIT_DBTP = -1.0
 
@@ -843,31 +846,45 @@ def run_youtube_download(
     if not yt_dlp:
         raise RuntimeError("yt-dlp command not found.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_output = output_path.with_name(
+        f".{output_path.stem}.download-{uuid.uuid4().hex}.mp3"
+    )
     cmd = [
         yt_dlp,
         "--quiet",
         "--no-warnings",
         "--no-progress",
+        "--force-overwrites",
         "-x",
         url,
         "--audio-format",
         "mp3",
         "-o",
-        str(output_path),
+        str(temp_output),
     ]
     if cookie_config:
-        cmd[5:5] = cookie_config.cli_args()
-    result = subprocess.run(
-        cmd,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        error_text = result.stderr.strip() or result.stdout.strip()
-        if not error_text:
-            error_text = f"yt-dlp exited {result.returncode}"
-        raise RuntimeError(error_text)
+        cmd[6:6] = cookie_config.cli_args()
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            error_text = result.stderr.strip() or result.stdout.strip()
+            if not error_text:
+                error_text = f"yt-dlp exited {result.returncode}"
+            raise RuntimeError(error_text)
+        if not temp_output.is_file():
+            raise RuntimeError("yt-dlp finished without producing an MP3 file.")
+        os.replace(temp_output, output_path)
+    finally:
+        for path in (temp_output, Path(f"{temp_output}.part")):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def download_list_path(filename: str = DOWNLOAD_LIST_FILE) -> Path:
@@ -1230,6 +1247,64 @@ def save_loudness_cache(cache: Dict[str, dict], mp3_folder: Path) -> None:
     atomic_write_json(loud_cache_path(mp3_folder), cache)
 
 
+def _cache_key_matches_track(key: object, track_path: Path) -> bool:
+    if not isinstance(key, str):
+        return False
+    try:
+        candidate = Path(key)
+        if not candidate.is_absolute():
+            candidate = Path(__file__).resolve().parent / candidate
+        return candidate.resolve() == track_path.resolve()
+    except OSError:
+        return False
+
+
+def remove_track_path_cache_entries(
+    cache_path: Path, track_path: Path, section: Optional[str] = None
+) -> bool:
+    """Remove entries for one track from a path-keyed JSON cache."""
+    if not cache_path.is_file():
+        return False
+    data = safe_read_json(cache_path, None)
+    entries: object = data.get(section) if section and isinstance(data, dict) else data
+    if not isinstance(entries, dict):
+        return False
+    keys = [key for key in entries if _cache_key_matches_track(key, track_path)]
+    if not keys:
+        return False
+    for key in keys:
+        del entries[key]
+    atomic_write_json(cache_path, data)
+    return True
+
+
+def remove_track_stem_cache_entry(cache_path: Path, stem: str) -> bool:
+    """Remove one track from an old stem-keyed analysis cache, if it exists."""
+    if not cache_path.is_file():
+        return False
+    data = safe_read_json(cache_path, None)
+    if not isinstance(data, dict) or stem not in data:
+        return False
+    del data[stem]
+    atomic_write_json(cache_path, data)
+    return True
+
+
+def clear_replaced_track_caches(mp3_folder: Path, track_path: Path) -> None:
+    """Discard derived data for a track while leaving user metadata and listens intact."""
+    remove_track_path_cache_entries(loud_cache_path(mp3_folder), track_path)
+    remove_track_path_cache_entries(
+        Path(__file__).resolve().parent / AUDIO_FEATURES_CACHE_FILE, track_path
+    )
+    remove_track_path_cache_entries(
+        Path(__file__).resolve().parent / AUDIO_COLOR_CACHE_NAME,
+        track_path,
+        section="entries",
+    )
+    remove_track_stem_cache_entry(mp3_folder / ".mp3analysis.json", track_path.stem)
+    emb_cache_path(mp3_folder).unlink(missing_ok=True)
+
+
 def calculate_volume_scale(
     target_lufs: float | None,
     current_lufs: float | None,
@@ -1523,6 +1598,11 @@ class EmbeddingCache:
         self.names: List[str] = []
         self.matrix: Optional[np.ndarray] = None  # L2-normalized rows
         self.fingerprint: Optional[str] = None
+
+    def invalidate(self) -> None:
+        self.names = []
+        self.matrix = None
+        self.fingerprint = None
 
     def ensure(
         self,
@@ -5404,8 +5484,22 @@ def main(
                 target_idx = library_index_for_marker(marker)
                 target_state = library_states[target_idx]
                 output_path = target_state.mp3_folder / f"{title}.mp3"
-                tui.status_msg = f"Downloading to {target_state.label}: {title}"
+                replacing = output_path.is_file()
+                action = "Replacing" if replacing else "Downloading to"
+                tui.status_msg = f"{action} {target_state.label}: {title}"
                 run_youtube_download(result.url, output_path, youtube_cookie_config)
+                if replacing:
+                    clear_replaced_track_caches(target_state.mp3_folder, output_path)
+                    for key in list(target_state.loud_cache):
+                        if _cache_key_matches_track(key, output_path):
+                            del target_state.loud_cache[key]
+                    target_state.audio_data[output_path] = {
+                        "loudness_lufs": None,
+                        "true_peak_dbtp": None,
+                        "scale": BASE_VOLUME_SCALE,
+                        "duration": 0.0,
+                    }
+                    EMB_CACHE.invalidate()
                 if artist_names:
                     target_state.artists_data[output_path.stem] = artist_names
                     save_artists(target_state.artists_file, target_state.artists_data)
@@ -5417,7 +5511,8 @@ def main(
                     f"; artist: {', '.join(artist_names)}" if artist_names else ""
                 )
                 tui.status_msg = (
-                    f"Downloaded: {output_path.name} -> {target_state.label}"
+                    f"{'Replaced' if replacing else 'Downloaded'}: "
+                    f"{output_path.name} -> {target_state.label}"
                     f"{artist_msg}"
                 )
             except subprocess.CalledProcessError as e:

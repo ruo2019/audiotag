@@ -44,6 +44,9 @@ players use `sentence-transformers/all-MiniLM-L6-v2`; the older `player.py` uses
 `headphones_markov.py` is the most current player. By default it opens both
 `static/mp3` and `static/mid-mp3s` as TUI library tabs, supports manual mood
 search, listen tracking, and an auto mode backed by play-history transitions.
+Downloading a YouTube result with a title that already exists replaces that
+MP3 after the new download succeeds. The replacement keeps its listen count and
+timestamps, while rebuilding its audio-derived caches.
 
 ```bash
 python headphones_markov.py

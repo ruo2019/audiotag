@@ -39,7 +39,9 @@ out.json
 download_list.txt
 audio_features_cache.json
 .autoplay_audio_colors.json
+autoplay_color_seed.json
 
 # Local/generated artifacts
 static/
 !templates/trimmer.html
+!templates/headphone_exposure_dashboard.html

@@ -21,6 +21,7 @@ import json
 import math
 import os
 import platform
+import re
 import selectors
 import shutil
 import signal
@@ -38,6 +39,12 @@ SILENCE_DB = -120.0
 DEFAULT_OFFSET_LOW_DB = 121.0
 DEFAULT_OFFSET_HIGH_DB = 132.0
 DEFAULT_LOG = Path(__file__).with_name("headphone_exposure")
+CAPTURE_RETRY_MAX_DELAY_SECONDS = 30.0
+# ScreenCaptureKit reports these when its shareable display/window list
+# temporarily disappears (for example while displays or the login session are
+# being reconfigured).  They are source-availability failures, not permission
+# failures, so restarting the helper is safe.
+RETRYABLE_CAPTURE_ERROR_CODES = frozenset((-3813, -3814, -3815))
 
 
 # ScreenCaptureKit produces the mixed app audio.  The helper deliberately emits
@@ -467,6 +474,20 @@ def screen_capture_authorized(request_if_needed: bool = True) -> bool:
         return True
 
 
+def is_retryable_capture_error(message: str) -> bool:
+    """Return whether ScreenCaptureKit temporarily lost its capture source."""
+    if "com.apple.ScreenCaptureKit.SCStreamErrorDomain" not in message:
+        return False
+    match = re.search(r"\bCode=(-?\d+)\b", message)
+    return bool(match and int(match.group(1)) in RETRYABLE_CAPTURE_ERROR_CODES)
+
+
+def capture_retry_delay(failure_count: int) -> float:
+    """Use a short exponential backoff while macOS rebuilds capture sources."""
+    exponent = max(0, failure_count - 1)
+    return min(CAPTURE_RETRY_MAX_DELAY_SECONDS, float(2 ** min(exponent, 10)))
+
+
 class MacSessionLock:
     """Read the current macOS GUI session's screen-lock state."""
 
@@ -820,7 +841,7 @@ class ExposureRecorder:
             self._archive_completed_months()
         if self._current is None:
             self._current = {
-                "timestamp": now.isoformat(timespec="seconds"),
+                "timestamp": minute_key,
                 "minute": minute_key,
                 "seconds": 0.0,
                 "high_energy_seconds": 0.0,
@@ -1120,10 +1141,12 @@ def main() -> int:
     last_measurement_at: float | None = None
     ready = False
     helper_messages: list[str] = []
+    capture_retry_at: float | None = None
+    capture_failures = 0
     interactive = sys.stdout.isatty() and not args.json
 
     def start_capture() -> None:
-        nonlocal process, ready, helper_messages, last_measurement_at
+        nonlocal process, ready, helper_messages, last_measurement_at, capture_retry_at
         process = subprocess.Popen(
             [str(helper)],
             stdout=subprocess.PIPE,
@@ -1137,6 +1160,7 @@ def main() -> int:
         ready = False
         helper_messages = []
         last_measurement_at = None
+        capture_retry_at = None
 
     def stop_capture() -> None:
         nonlocal process, ready
@@ -1195,6 +1219,8 @@ def main() -> int:
                 estimate = None
                 last_active_at = None
                 last_measurement_at = None
+                capture_retry_at = None
+                capture_failures = 0
                 if screen_locked:
                     recorder.finish("screen_locked")
                     stop_capture()
@@ -1204,6 +1230,14 @@ def main() -> int:
                     show("resuming capture…")
             if screen_locked:
                 continue
+
+            if (
+                process is None
+                and capture_retry_at is not None
+                and now >= capture_retry_at
+            ):
+                start_capture()
+                show("restarting capture…")
 
             for key, _ in events:
                 line = key.fileobj.readline()
@@ -1224,6 +1258,7 @@ def main() -> int:
                     pcm_dbfs = float(line)
                 except ValueError:
                     continue
+                capture_failures = 0
                 percent, attenuation = core_audio.volume(device)
                 elapsed = (
                     min(1.0, max(0.0, now - last_measurement_at))
@@ -1277,8 +1312,21 @@ def main() -> int:
                 message = (
                     "\n".join(helper_messages)
                     if helper_messages
-                    else f"the capture helper exited unexpectedly (status {return_code})"
+                    else (
+                        "the capture helper exited unexpectedly "
+                        f"(status {return_code})"
+                    )
                 )
+                if is_retryable_capture_error(message):
+                    estimate = None
+                    last_active_at = None
+                    last_measurement_at = None
+                    stop_capture()
+                    capture_failures += 1
+                    delay = capture_retry_delay(capture_failures)
+                    capture_retry_at = now + delay
+                    show(f"capture source unavailable; retrying in {delay:.0f}s…")
+                    continue
                 print(
                     "\nerror from the macOS capture helper:\n" + message + "\n\n"
                     "If the error says permission was denied, fully quit and reopen the app "

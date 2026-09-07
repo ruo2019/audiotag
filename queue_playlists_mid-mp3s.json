@@ -310,6 +310,11 @@
       "base": "honeybee (Instrumental)",
       "play_once": false,
       "library": "mp3"
+    },
+    {
+      "base": "The Nights",
+      "play_once": false,
+      "library": "mid-mp3s"
     }
   ]
 }

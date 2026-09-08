@@ -88,6 +88,7 @@ UI_INTERACTION_SECONDS = 0.5
 UI_REFRESH_HZ = 10
 LOCK_POLL_SECONDS = 0.25
 LOCKED_WAIT_SECONDS = 1.0
+LOCK_AUDIO_RELEASE_SECONDS = 30 * 60
 
 # Mood directive clamp
 TOP_MIN, TOP_MAX = 1, 50
@@ -196,19 +197,31 @@ def mac_is_locked_poll(*, force: bool = False) -> bool:
 
 def wait_while_locked_or_exit(
     on_lock: Callable[[], None],
+    on_lock_timeout: Callable[[], None],
     *,
     force_check: bool = False,
 ) -> bool:
-    """Release playback once, then wait quietly; return whether we waited."""
+    """Suspend playback while locked and release audio after a long lock."""
     maybe_exit()
     if not mac_is_locked_poll(force=force_check):
         return False
     on_lock()
+    locked_at = time.monotonic()
+    audio_released = False
     while True:
-        EXIT_NOW.wait(LOCKED_WAIT_SECONDS)
+        remaining_until_release = max(
+            0.0, LOCK_AUDIO_RELEASE_SECONDS - (time.monotonic() - locked_at)
+        )
+        EXIT_NOW.wait(min(LOCKED_WAIT_SECONDS, remaining_until_release))
         maybe_exit()
         if not mac_is_locked_poll():
             return True
+        if (
+            not audio_released
+            and time.monotonic() - locked_at >= LOCK_AUDIO_RELEASE_SECONDS
+        ):
+            on_lock_timeout()
+            audio_released = True
 
 
 # ============================== JSON UTILS ==============================
@@ -4220,7 +4233,7 @@ def main(
 
 
     if logging:
-        print("Playback pauses while locked; no scheduled exit.")
+        print("Playback pauses while locked; audio releases after 30 locked minutes.")
 
     queue: List[Dict[str, object]] = []
     current_playing_item: Optional[Dict[str, object]] = None
@@ -4237,6 +4250,7 @@ def main(
     youtube_side_generation = 0
     youtube_side_lock = threading.Lock()
     youtube_status_msg = ""
+    lock_timeout_stop_requested = False
     playback_mode = str(playback_mode)
     last_auto_commit_state_check = 0.0
 
@@ -5758,12 +5772,34 @@ def main(
             handle_playlist_requests()
 
         def suspend_playback() -> None:
-            audio_output.close()
+            try:
+                pygame.mixer.stop()
+            except Exception:
+                pass
             stop_youtube_side_players()
+
+        def stop_after_locked_timeout() -> None:
+            nonlocal lock_timeout_stop_requested
+            stop_active_tab_playback(tui)
+            lock_timeout_stop_requested = True
+            try:
+                pygame.mixer.stop()
+            except Exception:
+                pass
+            audio_output.close()
+
+        def consume_lock_timeout_stop() -> bool:
+            nonlocal lock_timeout_stop_requested
+            if not lock_timeout_stop_requested:
+                return False
+            lock_timeout_stop_requested = False
+            return True
 
         def wait_for_unlock(*, force_check: bool = False) -> bool:
             return wait_while_locked_or_exit(
-                suspend_playback, force_check=force_check
+                suspend_playback,
+                stop_after_locked_timeout,
+                force_check=force_check,
             )
 
         def pause_silence(seconds: float) -> bool:
@@ -5778,6 +5814,8 @@ def main(
             while True:
                 maybe_exit()
                 if wait_for_unlock():
+                    if consume_lock_timeout_stop():
+                        return True
                     end = time.monotonic() + float(seconds)
                 if time.monotonic() >= end:
                     break
@@ -5869,12 +5907,13 @@ def main(
             while True:
                 maybe_exit()
                 if wait_for_unlock():
+                    if consume_lock_timeout_stop():
+                        continue
                     if pause_silence(GAP_SECONDS):
                         continue
 
                 # Idle (only interactive in TUI mode)
                 if not queue:
-                    audio_output.close()
                     if playback_mode == "auto":
                         if enqueue_auto_track(tui):
                             continue
@@ -6019,6 +6058,11 @@ def main(
                         # Check before loading and again before playing: decoding
                         # a long track can take long enough for the Mac to lock.
                         if wait_for_unlock(force_check=True):
+                            if consume_lock_timeout_stop():
+                                track_tag_session.abandon()
+                                current_playing_item = None
+                                current_playing_tag_session = None
+                                break
                             if pause_silence(GAP_SECONDS):
                                 break
                         audio_output.open()
@@ -6161,6 +6205,9 @@ def main(
                                 sound = None
                                 channel = None
                                 wait_for_unlock()
+                                if consume_lock_timeout_stop():
+                                    user_stop = True
+                                    break
                                 stopped = pause_silence(GAP_SECONDS)
                                 if stopped:
                                     user_stop = True

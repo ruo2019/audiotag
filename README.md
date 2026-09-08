@@ -64,10 +64,12 @@ Useful options:
 - `--youtube-cookies-from-browser chrome` or `--youtube-cookies cookies.txt`
   configures YouTube helpers used by the Markov player.
 
-The Markov player stops playback and releases its audio device while the Mac is
-locked, then waits for unlock without a lock-duration timeout or scheduled exit.
-It keeps the seven-second gap after unlocking. The audio
-device also closes when the MP3 queue is idle. Library totals and rankings are
+The Markov player stops playback while the Mac is locked. If the lock reaches
+30 minutes, it performs the same stop-and-clear action as Ctrl+G, including
+releasing the audio device for local MP3 playback. It waits for unlock without
+a scheduled exit and keeps the seven-second gap after unlocking. Leaving the
+MP3 queue idle while the Mac is unlocked does not close the audio device.
+Library totals and rankings are
 cached, and the display refreshes at 10 Hz with immediate redraws for input.
 Input polling rises from 20 Hz to 60 Hz while scrolling, typing, or dragging,
 then slows down again after half a second without input. Scrolling keeps its

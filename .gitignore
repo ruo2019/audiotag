@@ -36,6 +36,7 @@ artists_reviewed.json.bak
 mid_artists_reviewed.json.bak
 queue_playlists*.json
 out.json
+mp3s_by_listen_count.json
 download_list.txt
 audio_features_cache.json
 .autoplay_audio_colors.json

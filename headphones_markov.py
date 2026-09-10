@@ -711,7 +711,10 @@ def search_youtube(
     return results
 
 
-def resolve_youtube_audio(video_url: str) -> Tuple[str, str, Dict[str, str], float]:
+def resolve_youtube_audio(
+    video_url: str,
+    cookie_config: Optional[YouTubeCookieConfig] = None,
+) -> Tuple[str, str, Dict[str, str], float]:
     if YoutubeDL is None:
         raise RuntimeError("yt-dlp Python package is not installed.")
 
@@ -722,6 +725,8 @@ def resolve_youtube_audio(video_url: str) -> Tuple[str, str, Dict[str, str], flo
         "skip_download": True,
         "format": "bestaudio/best",
     }
+    if cookie_config:
+        ydl_opts.update(cookie_config.ydl_options())
     with suppress_terminal_output():
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
@@ -4411,7 +4416,10 @@ def main(
             nonlocal youtube_side_duration
             set_youtube_status(f"Resolving YouTube: {result.title}", tui)
             try:
-                direct_url, title, headers, duration = resolve_youtube_audio(result.url)
+                direct_url, title, headers, duration = resolve_youtube_audio(
+                    result.url,
+                    youtube_cookie_config,
+                )
                 with youtube_side_lock:
                     if generation != youtube_side_generation:
                         return

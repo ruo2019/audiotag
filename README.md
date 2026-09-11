@@ -48,6 +48,20 @@ Downloading a YouTube result with a title that already exists replaces that
 MP3 after the new download succeeds. The replacement keeps its listen count and
 timestamps, while rebuilding its audio-derived caches.
 
+YouTube downloads also look up lyrics on LRCLIB and save a successful result as
+a same-name `.lrc` file beside the new MP3. Enter an optional artist in the
+download prompt (`[artist] title [m]`) for the most reliable match; otherwise,
+the YouTube uploader is used as the artist.
+
+The YouTube tab keeps a lyrics pane beside its search results. Lyrics appear
+there automatically while a YouTube result plays; use Tab to focus the pane and
+the arrow keys, Page Up/Down, or mouse wheel to scroll. Lookup runs in the
+background and does not interrupt playback. The player first requests the Genius version so
+its authored Verse, Chorus, Bridge, and other section headings appear exactly.
+If a Genius page cannot be resolved, LRCLIB supplies unlabelled lyrics without
+guessed section names. Set `GENIUS_ACCESS_TOKEN` to improve Genius matching for
+videos whose artist and title do not map cleanly to a standard Genius URL.
+
 ```bash
 python headphones_markov.py
 python headphones_markov.py --mood "calm ambient study" --top 5

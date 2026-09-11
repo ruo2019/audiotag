@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import curses
+from html.parser import HTMLParser
 import json
 import locale
 import math
@@ -12,14 +13,19 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 import numpy as np
 
@@ -63,6 +69,16 @@ DEFAULT_ARTISTS_FILE = Path("artists.json")
 DEFAULT_MID_ARTISTS_FILE = Path("mid_artists.json")
 DEFAULT_SAMPLE_MP3 = "Deep Stone Crypt Theme.mp3"
 DEFAULT_YOUTUBE_COOKIES_FILE = Path("/Volumes/Calc 2/yt-dlp/cookies.txt")
+LRCLIB_GET_URL = "https://lrclib.net/api/get"
+LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
+LRCLIB_USER_AGENT = "audiotag/1.0 (local lyrics viewer)"
+GENIUS_API_SEARCH_URL = "https://api.genius.com/search"
+GENIUS_TRANSLATE_BASE_URL = "https://genius-com.translate.goog"
+GENIUS_WEB_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+)
+LYRICS_FETCH_TIMEOUT_SECONDS = 10
 PLAYLISTS_FILE = "queue_playlists.json"
 DOWNLOAD_LIST_FILE = "download_list.txt"
 DOWNLOAD_LIST_BLANK_AFTER_DAYS = 3
@@ -746,6 +762,28 @@ def resolve_youtube_audio(
     return direct_url, title, headers, duration
 
 
+def resolve_youtube_audio_for_playback(
+    video_url: str,
+    cookie_config: Optional[YouTubeCookieConfig] = None,
+) -> Tuple[str, str, Dict[str, str], float]:
+    """Prefer public media URLs; account cookies can produce unusable GVS URLs."""
+    try:
+        return resolve_youtube_audio(video_url)
+    except Exception as public_error:
+        configured = bool(
+            cookie_config
+            and (cookie_config.cookies_from_browser or cookie_config.cookies_file)
+        )
+        if not configured:
+            raise
+        try:
+            return resolve_youtube_audio(video_url, cookie_config)
+        except Exception as cookie_error:
+            raise RuntimeError(
+                f"{cookie_error} (without cookies: {public_error})"
+            ) from cookie_error
+
+
 def headers_to_mpv_args(headers: Dict[str, str]) -> List[str]:
     return [f"--http-header-fields={k}: {v}" for k, v in (headers or {}).items()]
 
@@ -795,10 +833,15 @@ def spawn_youtube_player(
         raise RuntimeError("mpv is required for YouTube playback. Install with: brew install mpv")
     cmd = [
         mpv,
+        "--no-config",
         "--no-video",
-        "--quiet",
+        "--msg-level=all=warn",
         "--force-window=no",
         "--no-input-terminal",
+        "--no-resume-playback",
+        "--start=0",
+        "--pause=no",
+        "--mute=no",
         "--volume=75",
     ]
     if forced_audio_device:
@@ -808,9 +851,15 @@ def spawn_youtube_player(
     return subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
+
+
+def youtube_player_error(output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
 
 
 def stop_process(proc: subprocess.Popen) -> None:
@@ -1824,6 +1873,338 @@ def compute_top_for_mood(
 # ============================== CURSES TUI ==============================
 
 
+def id3_text(tags: object, frame_id: str) -> str:
+    """Return the first value of an ID3 text frame, if present."""
+    try:
+        frame = tags.get(frame_id)  # type: ignore[union-attr]
+        values = getattr(frame, "text", []) or []
+        return str(values[0]).strip() if values else ""
+    except Exception:
+        return ""
+
+
+def lyrics_lookup_query(track_path: Path, artist_names: Iterable[str]) -> Tuple[str, str]:
+    """Build the most reliable title/artist query available for a local MP3."""
+    artist = ", ".join(normalize_artist_names(artist_names))
+    title = ""
+    try:
+        tags = MP3(str(track_path)).tags
+    except Exception:
+        tags = None
+    if tags:
+        title = id3_text(tags, "TIT2")
+        artist = artist or id3_text(tags, "TPE1")
+
+    stem = track_path.stem.strip()
+    if not title:
+        title = stem
+    if not artist and " - " in stem:
+        possible_artist, possible_title = stem.split(" - ", 1)
+        if possible_artist.strip() and possible_title.strip():
+            artist, title = possible_artist.strip(), possible_title.strip()
+    return title, artist
+
+
+def lyrics_from_lrclib_record(record: object, prefer_plain: bool = False) -> str:
+    if not isinstance(record, dict):
+        return ""
+    fields = (
+        ("plainLyrics", "syncedLyrics")
+        if prefer_plain
+        else ("syncedLyrics", "plainLyrics")
+    )
+    return str(next((record.get(field) for field in fields if record.get(field)), "")).strip()
+
+
+LYRICS_SECTION_HEADER_RE = re.compile(r"^\s*\[[^\]\r\n]{1,80}\]\s*$")
+LRC_TIMESTAMP_RE = re.compile(r"^(?:\[\d{1,3}:\d{2}(?:\.\d{1,3})?\])+\s*")
+
+
+def prepare_lyrics_for_display(lyrics: str) -> str:
+    """Remove timestamps and normalize spacing without inventing sections."""
+    output: List[str] = []
+    for raw_line in lyrics.splitlines():
+        line = LRC_TIMESTAMP_RE.sub("", raw_line).strip()
+        if not line:
+            if output and output[-1]:
+                output.append("")
+            continue
+        if LYRICS_SECTION_HEADER_RE.match(line) and output and output[-1]:
+            output.append("")
+        output.append(line)
+    while output and not output[-1]:
+        output.pop()
+    return "\n".join(output)
+
+
+class GeniusLyricsParser(HTMLParser):
+    """Extract only Genius's authored lyric containers from a song page."""
+
+    VOID_TAGS = {"br", "img", "meta", "link", "input", "hr", "source", "wbr"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stack: List[str] = []
+        self.container_depth: Optional[int] = None
+        self.excluded_depth: Optional[int] = None
+        self.parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attributes = dict(attrs)
+        if tag not in self.VOID_TAGS:
+            self.stack.append(tag)
+        if self.container_depth is None:
+            if tag == "div" and attributes.get("data-lyrics-container") == "true":
+                self.container_depth = len(self.stack)
+            return
+        if tag == "br" and self.excluded_depth is None:
+            self.parts.append("\n")
+            return
+        classes = attributes.get("class") or ""
+        if (
+            attributes.get("data-exclude-from-selection") == "true"
+            or "LyricsHeader" in classes
+        ):
+            self.excluded_depth = len(self.stack)
+
+    def handle_endtag(self, tag: str) -> None:
+        depth = len(self.stack)
+        if self.excluded_depth == depth:
+            self.excluded_depth = None
+        if self.container_depth == depth and tag == "div":
+            self.parts.append("\n")
+            self.container_depth = None
+        if tag in self.stack:
+            while self.stack:
+                open_tag = self.stack.pop()
+                if open_tag == tag:
+                    break
+
+    def handle_data(self, data: str) -> None:
+        if self.container_depth is not None and self.excluded_depth is None:
+            text = re.sub(r"\s*[\r\n]+\s*", "", data)
+            if text:
+                self.parts.append(text)
+
+    def lyrics(self) -> str:
+        return prepare_lyrics_for_display("".join(self.parts))
+
+
+def genius_slug(value: str) -> str:
+    """Convert an artist or title into Genius's common URL form."""
+    value = value.replace("&", " and ")
+    value = re.sub(r"['’]", "", value)
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    return re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-")
+
+
+def genius_song_path_from_api(title: str, artist: str) -> str:
+    """Resolve a canonical Genius path when a developer token is configured."""
+    token = os.environ.get("GENIUS_ACCESS_TOKEN", "").strip()
+    if not token:
+        return ""
+    request = Request(
+        f"{GENIUS_API_SEARCH_URL}?{urlencode({'q': f'{artist} {title}'})}",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urlopen(request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        hits = payload.get("response", {}).get("hits", [])
+    except (HTTPError, URLError, OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    wanted_title = normalize_track_name_for_search(title)
+    wanted_artist = normalize_track_name_for_search(artist)
+    candidates: List[Tuple[int, str]] = []
+    for hit in hits:
+        result = hit.get("result", {}) if isinstance(hit, dict) else {}
+        url = str(result.get("url", ""))
+        result_title = normalize_track_name_for_search(result.get("title", ""))
+        primary_artist = result.get("primary_artist", {})
+        result_artist = normalize_track_name_for_search(
+            primary_artist.get("name", "") if isinstance(primary_artist, dict) else ""
+        )
+        score = 100 * int(result_title == wanted_title)
+        score += 30 * int(result_artist == wanted_artist)
+        score += 10 * len(set(result_title.split()) & set(wanted_title.split()))
+        score += 3 * len(set(result_artist.split()) & set(wanted_artist.split()))
+        path = urlparse(url).path
+        if path:
+            candidates.append((score, path))
+    return max(candidates, default=(0, ""))[1]
+
+
+def fetch_genius_lyrics(title: str, artist: str) -> Tuple[str, str]:
+    """Fetch Genius-authored lyrics and section labels from the song page."""
+    title = title.strip()
+    artist = artist.strip()
+    if not title or not artist:
+        return "", "Missing artist or title for Genius lookup."
+    path = genius_song_path_from_api(title, artist)
+    if not path:
+        artist_slug = genius_slug(artist)
+        title_slug = genius_slug(title)
+        if not artist_slug or not title_slug:
+            return "", "Could not build a Genius song URL."
+        path = f"/{artist_slug}-{title_slug}-lyrics"
+    translate_query = urlencode(
+        {"_x_tr_sl": "auto", "_x_tr_tl": "en", "_x_tr_hl": "en"}
+    )
+    request = Request(
+        f"{GENIUS_TRANSLATE_BASE_URL}{quote(path, safe='/')}?{translate_query}",
+        headers={"Accept": "text/html", "User-Agent": GENIUS_WEB_USER_AGENT},
+    )
+    try:
+        with urlopen(request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS) as response:
+            page = response.read().decode("utf-8")
+    except HTTPError as exc:
+        return "", f"Genius returned HTTP {exc.code}."
+    except (URLError, OSError, UnicodeError):
+        return "", "Could not reach Genius."
+    parser = GeniusLyricsParser()
+    parser.feed(page)
+    lyrics = parser.lyrics()
+    if not lyrics or not any(
+        LYRICS_SECTION_HEADER_RE.match(line) for line in lyrics.splitlines()
+    ):
+        return "", "Sectioned lyrics not found on Genius."
+    return lyrics, "Genius"
+
+
+def clean_youtube_lyrics_text(value: str) -> str:
+    """Remove common video-only decorations before searching a song title."""
+    text = str(value).strip()
+    text = re.sub(
+        r"\s*[\[(][^\])]*(?:official|video|audio|lyrics?|visuali[sz]er|music video|4k|hd)[^\])]*[\])]",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s+-\s+(?:topic|official)$", "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def search_lrclib_lyrics(
+    title: str, artist: str, prefer_plain: bool = False
+) -> Tuple[str, str]:
+    """Find a close LRCLIB result when exact track metadata does not match."""
+    request = Request(
+        f"{LRCLIB_SEARCH_URL}?{urlencode({'q': f'{artist} {title}'})}",
+        headers={"Accept": "application/json", "User-Agent": LRCLIB_USER_AGENT},
+    )
+    try:
+        with urlopen(request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS) as response:
+            records = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        return "", f"LRCLIB returned HTTP {exc.code}."
+    except (URLError, OSError, UnicodeError, json.JSONDecodeError):
+        return "", "Could not reach LRCLIB."
+    if not isinstance(records, list):
+        return "", "Lyrics not found on LRCLIB."
+
+    wanted_title = normalize_track_name_for_search(title)
+    wanted_artist = normalize_track_name_for_search(artist)
+    candidates: List[Tuple[int, str]] = []
+    for record in records:
+        lyrics = lyrics_from_lrclib_record(record, prefer_plain=prefer_plain)
+        if not lyrics:
+            continue
+        record_title = normalize_track_name_for_search(record.get("trackName", ""))
+        record_artist = normalize_track_name_for_search(record.get("artistName", ""))
+        title_words = set(wanted_title.split())
+        artist_words = set(wanted_artist.split())
+        score = 10 * len(title_words & set(record_title.split()))
+        score += 3 * len(artist_words & set(record_artist.split()))
+        if record_title == wanted_title:
+            score += 100
+        if record_artist == wanted_artist:
+            score += 30
+        candidates.append((score, lyrics))
+    if not candidates:
+        return "", "Lyrics not found on LRCLIB."
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1], "LRCLIB search"
+
+
+def fetch_lrclib_lyrics(
+    title: str, artist: str, prefer_plain: bool = False
+) -> Tuple[str, str]:
+    """Fetch lyrics from LRCLIB, then fall back to a close search match."""
+    title = str(title).strip()
+    artist = str(artist).strip()
+    if not title or not artist:
+        return "", "Missing artist or title for LRCLIB lookup."
+
+    query = urlencode({"track_name": title, "artist_name": artist})
+    request = Request(
+        f"{LRCLIB_GET_URL}?{query}",
+        headers={"Accept": "application/json", "User-Agent": LRCLIB_USER_AGENT},
+    )
+    exact_error = "Lyrics not found on LRCLIB."
+    try:
+        with urlopen(request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        exact_error = (
+            "Lyrics not found on LRCLIB."
+            if exc.code == 404
+            else f"LRCLIB returned HTTP {exc.code}."
+        )
+    except (URLError, OSError, UnicodeError, json.JSONDecodeError):
+        exact_error = "Could not reach LRCLIB."
+    else:
+        lyrics = lyrics_from_lrclib_record(payload, prefer_plain=prefer_plain)
+        if lyrics:
+            return lyrics, "LRCLIB"
+    lyrics, source = search_lrclib_lyrics(title, artist, prefer_plain=prefer_plain)
+    return (lyrics, source) if lyrics else ("", exact_error if source.startswith("Lyrics") else source)
+
+
+def fetch_lyrics_from_lrclib(
+    track_path: Path, artist_names: Iterable[str]
+) -> Tuple[str, str]:
+    """Fetch lyrics by track metadata and cache a successful result as .lrc."""
+    title, artist = lyrics_lookup_query(track_path, artist_names)
+    lyrics, source = fetch_lrclib_lyrics(title, artist)
+    if not lyrics:
+        return "", source
+
+    sidecar = track_path.with_suffix(".lrc")
+    try:
+        sidecar.write_text(lyrics + "\n", encoding="utf-8")
+        return lyrics, f"LRCLIB (saved as {sidecar.name})"
+    except OSError:
+        return lyrics, source
+
+
+def fetch_youtube_lyrics(result: YouTubeResult) -> Tuple[str, str]:
+    """Look up a YouTube result despite common title/channel decorations."""
+    title = clean_youtube_lyrics_text(result.title)
+    artist = clean_youtube_lyrics_text(result.uploader)
+    attempts = [(title, artist)]
+    if " - " in title:
+        video_artist, video_title = title.split(" - ", 1)
+        attempts.insert(0, (video_title.strip(), video_artist.strip()))
+    for candidate_title, candidate_artist in attempts:
+        if not candidate_title or not candidate_artist:
+            continue
+        lyrics, _ = fetch_genius_lyrics(candidate_title, candidate_artist)
+        if lyrics:
+            return lyrics, "Genius"
+
+    last_source = "Lyrics not found on Genius or LRCLIB."
+    for candidate_title, candidate_artist in attempts:
+        if not candidate_title or not candidate_artist:
+            continue
+        lyrics, source = fetch_lrclib_lyrics(
+            candidate_title, candidate_artist, prefer_plain=True
+        )
+        if lyrics:
+            return prepare_lyrics_for_display(lyrics), f"{source} • unlabelled"
+        last_source = source
+    return "", last_source
+
+
 class CursesTUI:
     """
     Minimal curses UI:
@@ -1992,6 +2373,32 @@ class CursesTUI:
         self.youtube_download_request = False
         self.youtube_download_col_start = 0
         self.youtube_download_col_end = 0
+        self.youtube_lyrics_text = ""
+        self.youtube_lyrics_source = ""
+        self.youtube_lyrics_key = ""
+        self.youtube_lyrics_loading = False
+        self.youtube_lyrics_scroll = 0
+        self.youtube_lyrics_bounds = (0, 0, 0, 0)  # x, y, w, h
+
+    def load_youtube_lyrics(self, result: YouTubeResult) -> None:
+        """Look up lyrics for a playing YouTube result without blocking audio."""
+        key = result.video_id or result.url or f"{result.uploader}\n{result.title}"
+        if key == self.youtube_lyrics_key:
+            return
+        self.youtube_lyrics_key = key
+        self.youtube_lyrics_text = ""
+        self.youtube_lyrics_source = "Looking up lyrics on Genius…"
+        self.youtube_lyrics_loading = True
+        self.youtube_lyrics_scroll = 0
+
+        def fetch() -> None:
+            lyrics, source = fetch_youtube_lyrics(result)
+            if self.youtube_lyrics_key == key:
+                self.youtube_lyrics_text = lyrics
+                self.youtube_lyrics_source = source
+                self.youtube_lyrics_loading = False
+
+        threading.Thread(target=fetch, name="youtube-lyrics-fetch", daemon=True).start()
 
     def __enter__(self):
         if not self.enable:
@@ -2114,7 +2521,7 @@ class CursesTUI:
             "Shortcuts",
             "",
             "Enter: submit search (mood/tag/title/artist)",
-            "TAB: focus visible panes (YouTube/Queue/Similar/Playlists/Most)",
+            "TAB: focus visible panes (YouTube/Lyrics/Queue/Similar/Playlists/Most)",
             "↑/↓ PgUp/PgDn: move in focused panel",
             "→: skip track",
             "Ctrl+G: stop active tab",
@@ -2129,8 +2536,9 @@ class CursesTUI:
             "Tags: click row, [edit], [delete], [close]",
             "Most: click [by:count/time] or Ctrl+T",
             "Stats: click [Most]/[Stats], or type stats/count>200/hours>10",
-            "YouTube: search at bottom; use top=10 for more results; [download] saves",
-            "YouTube download: title [m], or [artist] title [m]",
+            "YouTube: search at bottom; use top=10 for more results; [download] saves MP3 + lyrics",
+            "YouTube lyrics: persistent pane; TAB focuses it; arrows or wheel scroll",
+            "YouTube download: title [m], or [artist] title [m] for a better lyric match",
             "Playlists: click to edit, double-click to load; [add] adds tracks",
             "Playlist edit: click loop/once, drag reorder, double-click remove",
             "Ctrl+W: save queue (Playlists)",
@@ -2343,55 +2751,70 @@ class CursesTUI:
                     return None
                 self._wheel_steps_this_render += 1
                 # determine which panel is under the cursor
-                x, y, w, h = self.queue_bounds
-                if x <= mx < x + w and y + 1 <= my < y + h:
-                    self.focus_panel = "queue"
-                    self.queue_selected = max(0, min(self.queue_len - 1, self.queue_selected + direction))
+                lx, ly, lw, lh = self.youtube_lyrics_bounds
+                if lx <= mx < lx + lw and ly <= my < ly + lh:
+                    self.focus_panel = "lyrics"
+                    self.youtube_lyrics_scroll = max(
+                        0, self.youtube_lyrics_scroll + direction
+                    )
                 else:
-                    sx, sy, sw, sh = self.similar_bounds
-                    if sx <= mx < sx + sw and sy + 1 <= my < sy + sh:
-                        self.focus_panel = "similar"
-                        self.similar_selected = max(0, min(self.similar_len - 1, self.similar_selected + direction))
+                    x, y, w, h = self.queue_bounds
+                    if x <= mx < x + w and y + 1 <= my < y + h:
+                        self.focus_panel = "queue"
+                        self.queue_selected = max(0, min(self.queue_len - 1, self.queue_selected + direction))
                     else:
-                        px, py, pw, ph = self.playlist_bounds
-                        if px <= mx < px + pw and py + 1 <= my < py + ph:
-                            self.focus_panel = "playlists"
-                            if self.playlist_editor_open:
-                                self.playlist_track_selected = max(
-                                    0,
-                                    min(
-                                        self.playlist_track_len - 1,
-                                        self.playlist_track_selected + direction,
-                                    ),
-                                )
-                            else:
-                                self.playlist_selected = max(0, min(self.playlist_len - 1, self.playlist_selected + direction))
+                        sx, sy, sw, sh = self.similar_bounds
+                        if sx <= mx < sx + sw and sy + 1 <= my < sy + sh:
+                            self.focus_panel = "similar"
+                            self.similar_selected = max(0, min(self.similar_len - 1, self.similar_selected + direction))
                         else:
-                            tx, ty, tw, th = self.tag_bounds
-                            if self.tag_panel_open and tx <= mx < tx + tw and ty + 2 <= my < ty + th:
-                                self.focus_panel = "tags"
-                                self.tag_selected = max(0, min(self.tag_len - 1, self.tag_selected + direction))
+                            px, py, pw, ph = self.playlist_bounds
+                            if px <= mx < px + pw and py + 1 <= my < py + ph:
+                                self.focus_panel = "playlists"
+                                if self.playlist_editor_open:
+                                    self.playlist_track_selected = max(
+                                        0,
+                                        min(
+                                            self.playlist_track_len - 1,
+                                            self.playlist_track_selected + direction,
+                                        ),
+                                    )
+                                else:
+                                    self.playlist_selected = max(0, min(self.playlist_len - 1, self.playlist_selected + direction))
                             else:
-                                mx0, my0, mw, mh = self.most_bounds
-                                if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
-                                    if self.youtube_active:
-                                        self.focus_panel = "youtube"
-                                        if self.youtube_len:
-                                            self.youtube_selected = max(
-                                                0,
-                                                min(
-                                                    self.youtube_len - 1,
-                                                    self.youtube_selected + direction,
-                                                ),
-                                            )
-                                    else:
-                                        self.focus_panel = "stats" if self.stats_panel_open else "most"
-                                    if (
-                                        not self.youtube_active
-                                        and not self.stats_panel_open
-                                        and self.most_len
-                                    ):
-                                        self.most_selected = max(0, min(self.most_len - 1, self.most_selected + direction))
+                                tx, ty, tw, th = self.tag_bounds
+                                if self.tag_panel_open and tx <= mx < tx + tw and ty + 2 <= my < ty + th:
+                                    self.focus_panel = "tags"
+                                    self.tag_selected = max(0, min(self.tag_len - 1, self.tag_selected + direction))
+                                else:
+                                    mx0, my0, mw, mh = self.most_bounds
+                                    if mx0 <= mx < mx0 + mw and my0 <= my < my0 + mh:
+                                        if self.youtube_active:
+                                            self.focus_panel = "youtube"
+                                            if self.youtube_len:
+                                                self.youtube_selected = max(
+                                                    0,
+                                                    min(
+                                                        self.youtube_len - 1,
+                                                        self.youtube_selected + direction,
+                                                    ),
+                                                )
+                                        else:
+                                            self.focus_panel = "stats" if self.stats_panel_open else "most"
+                                        if (
+                                            not self.youtube_active
+                                            and not self.stats_panel_open
+                                            and self.most_len
+                                        ):
+                                            self.most_selected = max(0, min(self.most_len - 1, self.most_selected + direction))
+                return None
+            lyrics_x, lyrics_y, lyrics_w, lyrics_h = self.youtube_lyrics_bounds
+            if (
+                bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED)
+                and lyrics_x <= mx < lyrics_x + lyrics_w
+                and lyrics_y <= my < lyrics_y + lyrics_h
+            ):
+                self.focus_panel = "lyrics"
                 return None
             # Live drag tracking (when terminal reports motion)
             if self.queue_drag_start is not None:
@@ -2754,7 +3177,9 @@ class CursesTUI:
         KEY_BTAB = getattr(curses, "KEY_BTAB", 353)
 
         if key == curses.KEY_UP:
-            if self.focus_panel == "queue":
+            if self.focus_panel == "lyrics":
+                self.youtube_lyrics_scroll = max(0, self.youtube_lyrics_scroll - 1)
+            elif self.focus_panel == "queue":
                 self.queue_selected = max(0, self.queue_selected - 1)
             elif self.focus_panel == "similar":
                 self.similar_selected = max(0, self.similar_selected - 1)
@@ -2772,7 +3197,9 @@ class CursesTUI:
                 if self.most_len:
                     self.most_selected = min(self.most_selected, self.most_len - 1)
         elif key == curses.KEY_DOWN:
-            if self.focus_panel == "queue":
+            if self.focus_panel == "lyrics":
+                self.youtube_lyrics_scroll += 1
+            elif self.focus_panel == "queue":
                 self.queue_selected = min(
                     max(0, self.queue_len - 1), self.queue_selected + 1
                 )
@@ -2804,7 +3231,11 @@ class CursesTUI:
                     self.most_selected = min(self.most_selected, self.most_len - 1)
         elif key == KEY_PGUP:
             page = max(1, self.last_h - 12)
-            if self.focus_panel == "queue":
+            if self.focus_panel == "lyrics":
+                self.youtube_lyrics_scroll = max(
+                    0, self.youtube_lyrics_scroll - page
+                )
+            elif self.focus_panel == "queue":
                 self.queue_selected = max(0, self.queue_selected - page)
             elif self.focus_panel == "similar":
                 self.similar_selected = max(0, self.similar_selected - page)
@@ -2823,7 +3254,9 @@ class CursesTUI:
                     self.most_selected = min(self.most_selected, self.most_len - 1)
         elif key == KEY_PGDN:
             page = max(1, self.last_h - 12)
-            if self.focus_panel == "queue":
+            if self.focus_panel == "lyrics":
+                self.youtube_lyrics_scroll += page
+            elif self.focus_panel == "queue":
                 self.queue_selected = min(
                     max(0, self.queue_len - 1),
                     self.queue_selected + page,
@@ -2859,9 +3292,11 @@ class CursesTUI:
                 if self.most_len:
                     self.most_selected = min(self.most_selected, self.most_len - 1)
         elif key in (self.KEY_TAB, KEY_BTAB):
-            order = ["youtube", "queue"] if self.youtube_active else ["queue", "similar"]
-            order.append("tags" if self.tag_panel_open else "playlists")
-            if not self.youtube_active:
+            if self.youtube_active:
+                order = ["youtube", "lyrics"]
+            else:
+                order = ["queue", "similar"]
+                order.append("tags" if self.tag_panel_open else "playlists")
                 order.append("stats" if self.stats_panel_open else "most")
             try:
                 idx = order.index(self.focus_panel)
@@ -3666,7 +4101,34 @@ class CursesTUI:
                 full_w = max(1, w)
                 yt_results = youtube_results or []
                 self.youtube_len = len(yt_results)
-                y_content_h = max(0, table_height - 1)
+                if full_w >= 72 or table_height < 8:
+                    yt_x = 0
+                    yt_y = table_top
+                    yt_w = max(
+                        1,
+                        min(
+                            max(1, full_w - 2),
+                            max(30, int(full_w * 0.52)),
+                        ),
+                    )
+                    yt_h = table_height
+                    lyrics_x = yt_w + 1
+                    lyrics_y = table_top
+                    lyrics_w = max(0, full_w - lyrics_x)
+                    lyrics_h = table_height
+                    split_vertical = True
+                else:
+                    yt_x = 0
+                    yt_y = table_top
+                    yt_w = full_w
+                    yt_h = max(3, min(table_height - 3, table_height // 3))
+                    lyrics_x = 0
+                    lyrics_y = yt_y + yt_h + 1
+                    lyrics_w = full_w
+                    lyrics_h = max(0, table_height - yt_h - 1)
+                    split_vertical = False
+
+                y_content_h = max(0, yt_h - 1)
                 y_max_scroll = max(0, self.youtube_len - y_content_h)
                 self.youtube_selected = max(
                     0, min(self.youtube_selected, max(0, self.youtube_len - 1))
@@ -3677,7 +4139,13 @@ class CursesTUI:
                     self.youtube_scroll = self.youtube_selected - y_content_h + 1
                 self.youtube_scroll = min(max(0, self.youtube_scroll), y_max_scroll)
 
-                self.most_bounds = (0, table_top, full_w, table_height)
+                self.most_bounds = (yt_x, yt_y, yt_w, yt_h)
+                self.youtube_lyrics_bounds = (
+                    lyrics_x,
+                    lyrics_y,
+                    lyrics_w,
+                    lyrics_h,
+                )
                 self.queue_bounds = (0, 0, 0, 0)
                 self.similar_bounds = (0, 0, 0, 0)
                 self.playlist_bounds = (0, 0, 0, 0)
@@ -3690,14 +4158,14 @@ class CursesTUI:
                 self.stats_toggle_col_end = 0
 
                 dl_chip = "[download]"
-                self.youtube_download_col_start = full_w - len(dl_chip) - 1
+                self.youtube_download_col_start = yt_x + yt_w - len(dl_chip) - 1
                 self.youtube_download_col_end = (
                     self.youtube_download_col_start + len(dl_chip)
                 )
-                uploader_w = min(18, max(8, full_w // 5))
+                uploader_w = min(18, max(8, yt_w // 5))
                 title_w = max(
                     1,
-                    full_w
+                    yt_w
                     - (2 + 3 + 3 + uploader_w + 4 + len(dl_chip) + 2),
                 )
                 y_rows: List[str] = []
@@ -3716,8 +4184,8 @@ class CursesTUI:
                     uploader = result.uploader[:uploader_w].ljust(uploader_w)
                     row = f"{sel} {i+1:>3} | {title_text}| {uploader}"
                     if i == self.youtube_selected:
-                        row = row[: max(0, full_w - len(dl_chip) - 1)].ljust(
-                            max(0, full_w - len(dl_chip) - 1)
+                        row = row[: max(0, yt_w - len(dl_chip) - 1)].ljust(
+                            max(0, yt_w - len(dl_chip) - 1)
                         ) + dl_chip
                     y_rows.append(row)
                 if not yt_results:
@@ -3729,8 +4197,69 @@ class CursesTUI:
                         y_rows.append("  yt-dlp Python package is not installed.")
                 title = "[YouTube]"
                 if youtube_query:
-                    title = f"{title} {youtube_query}"[:full_w]
-                render_pane(title.ljust(full_w), y_rows, 0, table_top, full_w, table_height)
+                    title = f"{title} {youtube_query}"[:yt_w]
+                render_pane(title.ljust(yt_w), y_rows, yt_x, yt_y, yt_w, yt_h)
+
+                if not now_playing:
+                    lyrics_lines = ["Play a YouTube result to load its lyrics."]
+                    lyrics_source = ""
+                elif self.youtube_lyrics_loading:
+                    lyrics_lines = ["Lyrics are loading…"]
+                    lyrics_source = ""
+                elif self.youtube_lyrics_text:
+                    lyrics_lines = self.youtube_lyrics_text.splitlines()
+                    lyrics_source = self.youtube_lyrics_source
+                else:
+                    lyrics_lines = ["No lyrics were found for this YouTube track."]
+                    lyrics_source = self.youtube_lyrics_source
+
+                wrapped_lyrics: List[str] = []
+                lyric_line_w = max(1, lyrics_w - 2)
+                for lyric_line in lyrics_lines:
+                    if not lyric_line:
+                        wrapped_lyrics.append("")
+                        continue
+                    wrapped_lyrics.extend(
+                        textwrap.wrap(
+                            lyric_line,
+                            width=lyric_line_w,
+                            replace_whitespace=False,
+                            drop_whitespace=True,
+                        )
+                        or [""]
+                    )
+                lyrics_content_h = max(0, lyrics_h - 1)
+                lyrics_max_scroll = max(
+                    0, len(wrapped_lyrics) - lyrics_content_h
+                )
+                self.youtube_lyrics_scroll = min(
+                    max(0, self.youtube_lyrics_scroll), lyrics_max_scroll
+                )
+                visible_lyrics = wrapped_lyrics[
+                    self.youtube_lyrics_scroll :
+                    self.youtube_lyrics_scroll + lyrics_content_h
+                ]
+                lyrics_focus = (
+                    "[Lyrics]" if self.focus_panel == "lyrics" else " Lyrics "
+                )
+                lyrics_title = (
+                    f"{lyrics_focus} {lyrics_source}" if lyrics_source else lyrics_focus
+                )
+                render_pane(
+                    lyrics_title.ljust(lyrics_w),
+                    visible_lyrics,
+                    lyrics_x,
+                    lyrics_y,
+                    lyrics_w,
+                    lyrics_h,
+                )
+                if split_vertical:
+                    for row in range(table_height):
+                        self._draw(table_top + row, yt_w, "│")
+                elif lyrics_h > 0:
+                    self._draw(lyrics_y - 1, 0, "─" * full_w)
+            else:
+                self.youtube_lyrics_bounds = (0, 0, 0, 0)
 
         # Input bar + footer
         self._set_draw_target(self._input_win, input_y - 1)
@@ -3773,7 +4302,7 @@ class CursesTUI:
         self._draw(
             h - 1,
             2,
-            "Tabs switch libraries/YouTube • [download] saves selected YouTube result • [add] adds to playlist • Ctrl+G stops active tab • --help",
+            "Tabs switch libraries/YouTube • [download] saves MP3 + lyrics • [add] adds to playlist • Ctrl+G stops active tab • --help",
         )
 
         try:
@@ -4404,6 +4933,8 @@ def main(
         nonlocal youtube_side_generation, youtube_side_player, youtube_side_title
         nonlocal youtube_side_started_at, youtube_side_duration
         stop_youtube_side_players()
+        if tui and tui.enable:
+            tui.load_youtube_lyrics(result)
         with youtube_side_lock:
             youtube_side_generation += 1
             generation = youtube_side_generation
@@ -4416,9 +4947,8 @@ def main(
             nonlocal youtube_side_duration
             set_youtube_status(f"Resolving YouTube: {result.title}", tui)
             try:
-                direct_url, title, headers, duration = resolve_youtube_audio(
-                    result.url,
-                    youtube_cookie_config,
+                direct_url, title, headers, duration = resolve_youtube_audio_for_playback(
+                    result.url, youtube_cookie_config
                 )
                 with youtube_side_lock:
                     if generation != youtube_side_generation:
@@ -4450,15 +4980,34 @@ def main(
                 stop_process(proc)
                 return
             set_youtube_status(f"Playing YouTube alongside queue: {title}", tui)
+            player_output = ""
             try:
-                proc.wait()
+                player_stdout, player_stderr = proc.communicate()
+                player_output = "\n".join(
+                    part for part in (player_stdout, player_stderr) if part
+                )
             finally:
+                player_error = youtube_player_error(player_output)
+                player_returncode = proc.returncode
                 with youtube_side_lock:
-                    if generation == youtube_side_generation and youtube_side_player is proc:
+                    is_current_player = (
+                        generation == youtube_side_generation
+                        and youtube_side_player is proc
+                    )
+                    if is_current_player:
                         youtube_side_player = None
                         youtube_side_title = None
                         youtube_side_started_at = None
                         youtube_side_duration = 0.0
+                if is_current_player:
+                    if player_returncode:
+                        detail = player_error or f"mpv exited {player_returncode}"
+                        set_youtube_status(
+                            f"YouTube playback failed: {detail}",
+                            tui,
+                        )
+                    else:
+                        set_youtube_status("YouTube playback finished.", tui)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -5525,6 +6074,11 @@ def main(
                 if artist_names:
                     target_state.artists_data[output_path.stem] = artist_names
                     save_artists(target_state.artists_file, target_state.artists_data)
+                lyrics_artists = artist_names or normalize_artist_names([result.uploader])
+                tui.status_msg = f"Fetching lyrics for {output_path.name}…"
+                lyrics, lyrics_source = fetch_lyrics_from_lrclib(
+                    output_path, lyrics_artists
+                )
                 refresh_library_after_download(target_idx, output_path)
                 append_download_list_entry(result, title, marker)
                 tui.input_mode = "youtube_search"
@@ -5532,10 +6086,11 @@ def main(
                 artist_msg = (
                     f"; artist: {', '.join(artist_names)}" if artist_names else ""
                 )
+                lyrics_msg = "; lyrics saved" if lyrics else f"; lyrics: {lyrics_source}"
                 tui.status_msg = (
                     f"{'Replaced' if replacing else 'Downloaded'}: "
                     f"{output_path.name} -> {target_state.label}"
-                    f"{artist_msg}"
+                    f"{artist_msg}{lyrics_msg}"
                 )
             except subprocess.CalledProcessError as e:
                 tui.status_msg = f"Download failed: yt-dlp exited {e.returncode}"

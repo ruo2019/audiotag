@@ -40,6 +40,7 @@ mp3s_by_listen_count.json
 download_list.txt
 audio_features_cache.json
 .autoplay_audio_colors.json
+.lyrics_cache.json
 autoplay_color_seed.json
 
 # Local/generated artifacts

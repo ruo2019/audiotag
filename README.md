@@ -48,19 +48,29 @@ Downloading a YouTube result with a title that already exists replaces that
 MP3 after the new download succeeds. The replacement keeps its listen count and
 timestamps, while rebuilding its audio-derived caches.
 
-YouTube downloads also look up lyrics on LRCLIB and save a successful result as
-a same-name `.lrc` file beside the new MP3. Enter an optional artist in the
-download prompt (`[artist] title [m]`) for the most reliable match; otherwise,
-the YouTube uploader is used as the artist.
+Lyrics fetched while downloading through the YouTube tab or
+`bulk_download_mp3s.py` are saved in one hidden `.lyrics_cache.json` file beside
+the app. Playing a YouTube result may fetch lyrics for its pane, but does not add
+them to the cache. A library track can fetch and cache lyrics only when its MP3
+name and library match an entry in `download_list.txt`; the cache is keyed only
+by that entry's YouTube ID. Tracks with no matching entry never request lyrics.
+Instrumental downloads skip lyric lookup. An artist is saved to the library only
+when the download prompt includes it explicitly (`[artist] title [m]`).
 
 The YouTube tab keeps a lyrics pane beside its search results. Lyrics appear
 there automatically while a YouTube result plays; use Tab to focus the pane and
 the arrow keys, Page Up/Down, or mouse wheel to scroll. Lookup runs in the
-background and does not interrupt playback. The player first requests the Genius version so
-its authored Verse, Chorus, Bridge, and other section headings appear exactly.
-If a Genius page cannot be resolved, LRCLIB supplies unlabelled lyrics without
-guessed section names. Set `GENIUS_ACCESS_TOKEN` to improve Genius matching for
-videos whose artist and title do not map cleanly to a standard Genius URL.
+background and does not interrupt playback. The player first requests the
+Genius version so its authored Verse, Chorus, Bridge, and other section headings
+appear exactly. If a Genius page cannot be resolved, LRCLIB supplies accurate
+unlabelled lyrics without guessed section names. `GENIUS_ACCESS_TOKEN` is
+optional; when set, the official Genius API is used for song matching.
+
+In a library tab, click the Similar pane's header to replace the three right-side
+panes with a full-height lyrics view; click the Lyrics header to restore Similar,
+Queue, and Playlists. Library lyrics use the YouTube ID recovered from the
+matching download-list entry, whether they were cached during download or later
+fetched when the library track played.
 
 ```bash
 python headphones_markov.py
@@ -252,6 +262,9 @@ Bulk-download audio from a line-based input file:
 python bulk_download_mp3s.py download_list.txt --dry-run
 python bulk_download_mp3s.py download_list.txt
 ```
+
+After each successful bulk download, the script fetches Genius-first/LRCLIB-
+fallback lyrics and writes them to the shared cache under the YouTube ID.
 
 Each non-empty line should be:
 

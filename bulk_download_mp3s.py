@@ -97,6 +97,38 @@ def run_download(
         raise RuntimeError(error_text)
 
 
+def cache_downloaded_lyrics(
+    video_id: str,
+    output_path: Path,
+    cookies_file: Path | None,
+) -> None:
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    from headphones_markov import (
+        YouTubeCookieConfig,
+        fetch_youtube_lyrics,
+        is_instrumental_track,
+        write_cached_lyrics,
+        youtube_lyrics_cache_key,
+        youtube_result_from_video_id,
+    )
+
+    cookie_config = YouTubeCookieConfig(cookies_file=cookies_file)
+    result = youtube_result_from_video_id(video_id, cookie_config)
+    if result is None:
+        print(f"Lyrics not cached for {output_path.name}: video metadata unavailable")
+        return
+    if is_instrumental_track(output_path.stem, result.title):
+        print(f"Lyrics skipped for instrumental track: {output_path.name}")
+        return
+
+    lyrics, source = fetch_youtube_lyrics(result)
+    if not lyrics:
+        print(f"Lyrics not cached for {output_path.name}: {source}")
+        return
+    write_cached_lyrics(youtube_lyrics_cache_key(result), lyrics, source)
+    print(f"Lyrics cached for {output_path.name}: {source}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Download YouTube audio listed in a line-based input file."
@@ -137,6 +169,8 @@ def main() -> int:
         output_path = folder / f"{title}.mp3"
         url = build_url(video_id)
         run_download(url, output_path, args.dry_run, cookies_file)
+        if not args.dry_run:
+            cache_downloaded_lyrics(video_id, output_path, cookies_file)
 
     return 0
 

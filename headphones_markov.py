@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import curses
 from html.parser import HTMLParser
@@ -24,7 +25,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -82,12 +83,19 @@ YOUTUBE_VISITOR_COOKIE_NAMES = {
     "__Secure-ROLLOUT_TOKEN",
 }
 GENIUS_API_SEARCH_URL = "https://api.genius.com/search"
+GENIUS_WEB_BASE_URL = "https://genius.com"
 GENIUS_TRANSLATE_BASE_URL = "https://genius-com.translate.goog"
+GENIUS_LUCKY_SEARCH_URL = "https://www.google.com/search"
+GENIUS_SEARCH_ENGINE_URLS = (
+    "https://www.bing.com/search",
+    "https://html.duckduckgo.com/html/",
+)
 GENIUS_WEB_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
 )
 LYRICS_FETCH_TIMEOUT_SECONDS = 10
+GENIUS_REQUEST_RETRIES = 2
 LRCLIB_REQUEST_RETRIES = 3
 LRCLIB_REQUEST_INTERVAL_SECONDS = 0.3
 LRCLIB_REQUEST_LOCK = threading.Lock()
@@ -2133,6 +2141,22 @@ def clean_lyrics_search_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def simplify_lyrics_title(value: str) -> str:
+    """Remove search-hostile credits while retaining the original as a first try."""
+    text = clean_lyrics_search_text(value)
+    text = re.sub(
+        r"\s*[\[(][^\])]*(?:\bfrom\b|soundtracks?|motion picture|"
+        r"feat(?:uring)?\.?|\bft\.)[^\])]*[\])]",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\s+(?:feat(?:uring)?|ft)\.?\s+.+$", "", text, flags=re.IGNORECASE
+    )
+    return re.sub(r"\s+", " ", text).strip(" -–—|")
+
+
 def is_instrumental_track(*labels: str) -> bool:
     return any(
         re.search(r"\binstrumental\b", str(label), flags=re.IGNORECASE)
@@ -2236,6 +2260,79 @@ class GeniusLyricsParser(HTMLParser):
         return prepare_lyrics_for_display("".join(self.parts))
 
 
+class GeniusSearchResultParser(HTMLParser):
+    """Collect canonical Genius song paths from search-engine result links."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.paths: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag != "a":
+            return
+        href = str(dict(attrs).get("href") or "")
+        if href.startswith("//"):
+            href = f"https:{href}"
+        parsed = urlparse(href)
+        if parsed.netloc.endswith("duckduckgo.com"):
+            href = parse_qs(parsed.query).get("uddg", [""])[0]
+            parsed = urlparse(href)
+        elif parsed.netloc.endswith("bing.com") and parsed.path.startswith("/ck/a"):
+            encoded = parse_qs(parsed.query).get("u", [""])[0]
+            if encoded.startswith("a1"):
+                try:
+                    payload = encoded[2:] + ("=" * (-len(encoded[2:]) % 4))
+                    href = base64.urlsafe_b64decode(payload).decode("utf-8")
+                    parsed = urlparse(href)
+                except (ValueError, UnicodeError):
+                    return
+        if parsed.netloc.lower() not in ("genius.com", "www.genius.com"):
+            return
+        path = parsed.path.rstrip("/")
+        if path.lower().endswith("-lyrics") and path not in self.paths:
+            self.paths.append(path)
+
+
+def genius_search_path_score(
+    path: str,
+    wanted_title_words: set,
+    wanted_artist_words: set,
+    result_index: int = 0,
+) -> float:
+    """Score a Genius result path while rejecting translations and wrong versions."""
+    path_words = set(normalize_track_name_for_search(path[:-7]).split())
+    if not path_words or not wanted_title_words:
+        return -math.inf
+    title_coverage = len(path_words & wanted_title_words) / len(wanted_title_words)
+    artist_coverage = (
+        len(path_words & wanted_artist_words) / len(wanted_artist_words)
+        if wanted_artist_words
+        else 0.0
+    )
+    score = 200.0 * title_coverage + 80.0 * artist_coverage - result_index
+    if re.search(
+        r"(?:translation|translations|tradu|ubersetz|perevod|"
+        r"turkce-ceviri|tlumaczenia|romanization)",
+        path,
+        flags=re.IGNORECASE,
+    ):
+        score -= 250.0
+    if "live" in path_words and "live" not in wanted_title_words:
+        score -= 40.0
+    return score
+
+
+def genius_path_from_url(url: str) -> str:
+    """Extract a Genius song path from a direct or Google redirect URL."""
+    parsed = urlparse(url)
+    if parsed.netloc.endswith("google.com") and parsed.path == "/url":
+        parsed = urlparse(parse_qs(parsed.query).get("q", [""])[0])
+    if parsed.netloc.lower() not in ("genius.com", "www.genius.com"):
+        return ""
+    path = parsed.path.rstrip("/")
+    return path if path.lower().endswith("-lyrics") else ""
+
+
 def genius_slug(value: str) -> str:
     """Convert an artist or title into Genius's common URL form."""
     value = value.replace("&", " and ")
@@ -2244,11 +2341,144 @@ def genius_slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-")
 
 
-def genius_song_path_from_search(title: str, artist: str) -> str:
-    """Resolve the best matching canonical Genius song path."""
+def read_genius_url(url: str, accept: str) -> Tuple[str, str]:
+    """Read Genius with one brief retry for transient network failures."""
+    request = Request(
+        url,
+        headers={"Accept": accept, "User-Agent": GENIUS_WEB_USER_AGENT},
+    )
+    last_error = "Could not reach Genius."
+    for attempt in range(GENIUS_REQUEST_RETRIES):
+        try:
+            with urlopen(request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS) as response:
+                return response.read().decode("utf-8"), ""
+        except HTTPError as exc:
+            last_error = f"Genius returned HTTP {exc.code}."
+            if exc.code not in (429, 502, 503, 504):
+                break
+        except (URLError, OSError, UnicodeError):
+            last_error = "Could not reach Genius."
+        if attempt + 1 < GENIUS_REQUEST_RETRIES:
+            time.sleep(0.4 * (2**attempt))
+    return "", last_error
+
+
+def genius_song_path_from_web_search(title: str, artist: str) -> str:
+    """Find a Genius song as a user would: `artist title lyrics` on the web."""
+    query = " ".join(part for part in (artist.strip(), title.strip(), "lyrics") if part)
+    if not title.strip():
+        return ""
+    wanted_title_words = set(normalize_track_name_for_search(title).split())
+    wanted_artist_words = set(normalize_track_name_for_search(artist).split())
+
+    lucky_url = f"{GENIUS_LUCKY_SEARCH_URL}?" + urlencode(
+        {"q": f"site:genius.com {query}", "btnI": "1"}
+    )
+    lucky_request = Request(
+        lucky_url,
+        headers={"Accept": "text/html", "User-Agent": GENIUS_WEB_USER_AGENT},
+    )
+    for attempt in range(GENIUS_REQUEST_RETRIES):
+        try:
+            with urlopen(
+                lucky_request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS
+            ) as response:
+                path = genius_path_from_url(response.geturl())
+            if genius_search_path_score(
+                path, wanted_title_words, wanted_artist_words
+            ) >= 120.0:
+                return path
+            break
+        except HTTPError as exc:
+            if exc.code not in (429, 502, 503, 504):
+                break
+        except (URLError, OSError, UnicodeError):
+            pass
+        if attempt + 1 < GENIUS_REQUEST_RETRIES:
+            time.sleep(0.4 * (2**attempt))
+
+    for search_url in GENIUS_SEARCH_ENGINE_URLS:
+        url = f"{search_url}?{urlencode({'q': f'site:genius.com {query}'})}"
+        request = Request(
+            url,
+            headers={"Accept": "text/html", "User-Agent": GENIUS_WEB_USER_AGENT},
+        )
+        page = ""
+        for attempt in range(GENIUS_REQUEST_RETRIES):
+            try:
+                with urlopen(request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS) as response:
+                    page = response.read().decode("utf-8")
+                break
+            except HTTPError as exc:
+                if exc.code not in (429, 502, 503, 504):
+                    break
+            except (URLError, OSError, UnicodeError):
+                pass
+            if attempt + 1 < GENIUS_REQUEST_RETRIES:
+                time.sleep(0.4 * (2**attempt))
+        if not page:
+            continue
+
+        parser = GeniusSearchResultParser()
+        parser.feed(page)
+        candidates: List[Tuple[float, str]] = []
+        for index, path in enumerate(parser.paths):
+            candidates.append(
+                (
+                    genius_search_path_score(
+                        path, wanted_title_words, wanted_artist_words, index
+                    ),
+                    path,
+                )
+            )
+        score, path = max(candidates, default=(0.0, ""))
+        if score >= 120.0:
+            return path
+    return ""
+
+
+def genius_web_search_hits(query: str) -> List[object]:
+    """Search Genius directly, with the translation proxy as a fallback."""
+    endpoints = [
+        f"{GENIUS_WEB_BASE_URL}/api/search/multi?{urlencode({'q': query})}",
+        f"{GENIUS_TRANSLATE_BASE_URL}/api/search/multi?"
+        + urlencode(
+            {
+                "q": query,
+                "_x_tr_sl": "auto",
+                "_x_tr_tl": "en",
+                "_x_tr_hl": "en",
+            }
+        ),
+    ]
+    for url in endpoints:
+        raw, _ = read_genius_url(url, "application/json")
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        sections = payload.get("response", {}).get("sections", [])
+        hits = [
+            hit
+            for section in sections
+            if isinstance(section, dict)
+            for hit in section.get("hits", [])
+            if isinstance(hit, dict)
+            and (
+                hit.get("type") == "song"
+                or hit.get("result", {}).get("_type") == "song"
+            )
+        ]
+        if hits:
+            return hits
+    return []
+
+
+def genius_search_hits(query: str) -> List[object]:
+    """Use the configured Genius API when available, then the web search."""
     token = os.environ.get("GENIUS_ACCESS_TOKEN", "").strip()
-    query = " ".join(part for part in (artist.strip(), title.strip()) if part)
-    hits: List[object] = []
     if token:
         request = Request(
             f"{GENIUS_API_SEARCH_URL}?{urlencode({'q': query})}",
@@ -2261,39 +2491,20 @@ def genius_song_path_from_search(title: str, artist: str) -> str:
             with urlopen(request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             hits = payload.get("response", {}).get("hits", [])
+            if isinstance(hits, list) and hits:
+                return hits
         except (HTTPError, URLError, OSError, UnicodeError, json.JSONDecodeError):
-            hits = []
+            pass
+    return genius_web_search_hits(query)
 
-    if not hits:
-        translate_query = urlencode(
-            {
-                "q": query,
-                "_x_tr_sl": "auto",
-                "_x_tr_tl": "en",
-                "_x_tr_hl": "en",
-            }
-        )
-        request = Request(
-            f"{GENIUS_TRANSLATE_BASE_URL}/api/search/multi?{translate_query}",
-            headers={"Accept": "application/json", "User-Agent": GENIUS_WEB_USER_AGENT},
-        )
-        try:
-            with urlopen(request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            sections = payload.get("response", {}).get("sections", [])
-            hits = [
-                hit
-                for section in sections
-                if isinstance(section, dict)
-                for hit in section.get("hits", [])
-                if isinstance(hit, dict)
-                and (
-                    hit.get("type") == "song"
-                    or hit.get("result", {}).get("_type") == "song"
-                )
-            ]
-        except (HTTPError, URLError, OSError, UnicodeError, json.JSONDecodeError):
-            hits = []
+
+def genius_song_path_from_search(title: str, artist: str) -> str:
+    """Resolve the best matching canonical Genius song path."""
+    web_path = genius_song_path_from_web_search(title, artist)
+    if web_path:
+        return web_path
+    query = " ".join(part for part in (artist.strip(), title.strip()) if part)
+    hits = genius_search_hits(query)
 
     wanted_title = normalize_track_name_for_search(title)
     wanted_artist = normalize_track_name_for_search(artist)
@@ -2330,6 +2541,34 @@ def genius_song_path_from_search(title: str, artist: str) -> str:
     return max(candidates, key=lambda item: item[0], default=(0, ""))[1]
 
 
+def fetch_genius_path_lyrics(path: str) -> Tuple[str, str]:
+    """Fetch and parse an already resolved Genius song path."""
+    if not path:
+        return "", "Could not match this title on Genius."
+    translate_query = urlencode(
+        {"_x_tr_sl": "auto", "_x_tr_tl": "en", "_x_tr_hl": "en"}
+    )
+    urls = [
+        f"{GENIUS_WEB_BASE_URL}{quote(path, safe='/')}",
+        f"{GENIUS_TRANSLATE_BASE_URL}{quote(path, safe='/')}?{translate_query}",
+    ]
+    last_error = "Sectioned lyrics not found on Genius."
+    for url in urls:
+        page, error = read_genius_url(url, "text/html")
+        if not page:
+            last_error = error
+            continue
+        parser = GeniusLyricsParser()
+        parser.feed(page)
+        lyrics = parser.lyrics()
+        if lyrics and any(
+            LYRICS_SECTION_HEADER_RE.match(line) for line in lyrics.splitlines()
+        ):
+            return lyrics, "Genius"
+        last_error = "Sectioned lyrics not found on Genius."
+    return "", last_error
+
+
 def fetch_genius_lyrics(title: str, artist: str) -> Tuple[str, str]:
     """Fetch Genius-authored lyrics and section labels from the song page."""
     title = title.strip()
@@ -2345,28 +2584,7 @@ def fetch_genius_lyrics(title: str, artist: str) -> Tuple[str, str]:
         path = f"/{artist_slug}-{title_slug}-lyrics"
     if not path:
         return "", "Could not match this title on Genius."
-    translate_query = urlencode(
-        {"_x_tr_sl": "auto", "_x_tr_tl": "en", "_x_tr_hl": "en"}
-    )
-    request = Request(
-        f"{GENIUS_TRANSLATE_BASE_URL}{quote(path, safe='/')}?{translate_query}",
-        headers={"Accept": "text/html", "User-Agent": GENIUS_WEB_USER_AGENT},
-    )
-    try:
-        with urlopen(request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS) as response:
-            page = response.read().decode("utf-8")
-    except HTTPError as exc:
-        return "", f"Genius returned HTTP {exc.code}."
-    except (URLError, OSError, UnicodeError):
-        return "", "Could not reach Genius."
-    parser = GeniusLyricsParser()
-    parser.feed(page)
-    lyrics = parser.lyrics()
-    if not lyrics or not any(
-        LYRICS_SECTION_HEADER_RE.match(line) for line in lyrics.splitlines()
-    ):
-        return "", "Sectioned lyrics not found on Genius."
-    return lyrics, "Genius"
+    return fetch_genius_path_lyrics(path)
 
 
 def lyrics_from_lrclib_record(record: object, prefer_plain: bool = False) -> str:
@@ -2533,11 +2751,31 @@ def youtube_lyrics_attempts(result: YouTubeResult) -> List[Tuple[str, str]]:
     """Build ordered song title and artist pairs from YouTube metadata."""
     title = clean_lyrics_search_text(result.title)
     artist = clean_lyrics_search_text(result.uploader)
-    attempts = [(title, artist)]
-    if " - " in title:
-        video_artist, video_title = title.split(" - ", 1)
-        attempts.insert(0, (video_title.strip(), video_artist.strip()))
-    return [pair for pair in attempts if pair[0] and pair[1]]
+    candidates: List[Tuple[str, str]] = []
+    title_parts = re.split(r"\s+(?:-|–|—|\|)\s+", title, maxsplit=1)
+    if len(title_parts) == 2:
+        video_artist, video_title = (part.strip() for part in title_parts)
+        candidates.append((video_title, video_artist))
+        if normalize_track_name_for_search(video_artist) != normalize_track_name_for_search(
+            artist
+        ):
+            candidates.append((video_title, artist))
+    else:
+        candidates.append((title, artist))
+
+    attempts: List[Tuple[str, str]] = []
+    seen = set()
+    for candidate_title, candidate_artist in candidates:
+        for title_variant in (
+            candidate_title,
+            simplify_lyrics_title(candidate_title),
+        ):
+            pair = (title_variant.strip(), candidate_artist.strip())
+            key = tuple(normalize_track_name_for_search(value) for value in pair)
+            if pair[0] and pair[1] and key not in seen:
+                attempts.append(pair)
+                seen.add(key)
+    return attempts
 
 
 def fetch_youtube_lyrics(result: YouTubeResult) -> Tuple[str, str]:

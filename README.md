@@ -64,7 +64,11 @@ background and does not interrupt playback. The player first requests the
 Genius version so its authored Verse, Chorus, Bridge, and other section headings
 appear exactly. If a Genius page cannot be resolved, LRCLIB supplies accurate
 unlabelled lyrics without guessed section names. `GENIUS_ACCESS_TOKEN` is
-optional; when set, the official Genius API is used for song matching.
+optional; when set, the official Genius API is used for song matching. Genius
+lookups first search the web for `artist title lyrics`, then fall back to the
+Genius search service and direct URL matching. They try both the original result
+title and a cleaned variant without video, soundtrack, or featured-artist
+credits.
 
 In a library tab, click the Similar pane's header to replace the three right-side
 panes with a full-height lyrics view; click the Lyrics header to restore Similar,

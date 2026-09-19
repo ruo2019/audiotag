@@ -148,5 +148,112 @@
       "base": "[AG] oh well",
       "play_once": false
     }
+  ],
+  "chills": [
+    {
+      "base": "Routines In The Night",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Vem Kan Segla Förutan Vind",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Canto",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Winter Melody",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "The Lonely Ballerina",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Maison",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Across the Stars",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "6 Pills",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Undertow",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Lux Aeterna",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Time",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Nocturne No20 in C Sharp Minor",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Experience",
+      "play_once": false,
+      "library": "mp3"
+    },
+    {
+      "base": "Human Legacy",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Schindler's List",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "The Tip",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Dystopia",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Immaterial",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "TENET",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Misery",
+      "play_once": true,
+      "library": "mp3"
+    },
+    {
+      "base": "Snowing",
+      "play_once": true,
+      "library": "mp3"
+    }
   ]
 }

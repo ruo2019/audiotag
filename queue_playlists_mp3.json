@@ -254,6 +254,11 @@
       "base": "Snowing",
       "play_once": true,
       "library": "mp3"
+    },
+    {
+      "base": "Courtyard Statues",
+      "play_once": true,
+      "library": "mp3"
     }
   ]
 }

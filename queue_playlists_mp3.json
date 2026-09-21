@@ -259,6 +259,21 @@
       "base": "Courtyard Statues",
       "play_once": true,
       "library": "mp3"
+    },
+    {
+      "base": "ilomilo",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Maison",
+      "play_once": false,
+      "library": "mid-mp3s"
+    },
+    {
+      "base": "Ovunque Sarai",
+      "play_once": false,
+      "library": "mid-mp3s"
     }
   ]
 }

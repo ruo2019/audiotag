@@ -57,10 +57,11 @@ by that entry's YouTube ID. Tracks with no matching entry never request lyrics.
 Instrumental downloads skip lyric lookup. An artist is saved to the library only
 when the download prompt includes it explicitly (`[artist] title [m]`).
 
-The YouTube tab keeps a lyrics pane beside its search results. Lyrics appear
-there automatically while a YouTube result plays; use Tab to focus the pane and
-the arrow keys, Page Up/Down, or mouse wheel to scroll. Lookup runs in the
-background and does not interrupt playback. The player first requests the
+The YouTube tab has a collapsible lyrics drawer. Click the `[lyrics ◀]` control
+at the far right to slide it open and click `[lyrics ▶]` to close it again.
+Lyrics appear there automatically while a YouTube result plays; use Tab to focus
+the pane and the arrow keys, Page Up/Down, or mouse wheel to scroll. Lookup runs
+in the background and does not interrupt playback. The player first requests the
 Genius version so its authored Verse, Chorus, Bridge, and other section headings
 appear exactly. If a Genius page cannot be resolved, LRCLIB supplies accurate
 unlabelled lyrics without guessed section names. `GENIUS_ACCESS_TOKEN` is

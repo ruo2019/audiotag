@@ -2822,6 +2822,7 @@ class CursesTUI:
     INPUT_DRAIN_LIMIT = 64
     MAX_WHEEL_STEPS_PER_RENDER = 1
     DOUBLE_CLICK_SECONDS = 0.35
+    YOUTUBE_LYRICS_SLIDE_SECONDS = 0.25
 
     def __init__(self, enable: bool = True):
         self.enable = enable
@@ -2970,7 +2971,11 @@ class CursesTUI:
         self.youtube_lyrics_key = ""
         self.youtube_lyrics_loading = False
         self.youtube_lyrics_scroll = 0
+        self.youtube_lyrics_open = False
+        self.youtube_lyrics_reveal = 0.0
+        self.youtube_lyrics_animation_ts = time.monotonic()
         self.youtube_lyrics_bounds = (0, 0, 0, 0)  # x, y, w, h
+        self.youtube_lyrics_toggle_bounds = (0, 0, 0, 0)  # x, y, w, h
         self.library_lyrics_text = ""
         self.library_lyrics_source = ""
         self.library_lyrics_key = ""
@@ -3078,6 +3083,30 @@ class CursesTUI:
             self.youtube_lyrics_scroll = max(0, self.youtube_lyrics_scroll + amount)
         else:
             self.library_lyrics_scroll = max(0, self.library_lyrics_scroll + amount)
+
+    def toggle_youtube_lyrics(self) -> None:
+        """Open or close the YouTube lyrics drawer."""
+        self.youtube_lyrics_open = not self.youtube_lyrics_open
+        self.youtube_lyrics_animation_ts = time.monotonic()
+        if self.youtube_lyrics_open:
+            self.focus_panel = "lyrics"
+            self.status_msg = "Lyrics opened."
+        else:
+            if self.focus_panel == "lyrics":
+                self.focus_panel = "youtube"
+            self.status_msg = "Lyrics closed."
+
+    def _advance_youtube_lyrics_reveal(self, now: float) -> float:
+        """Move the lyrics drawer toward its open or closed position."""
+        elapsed = max(0.0, now - self.youtube_lyrics_animation_ts)
+        self.youtube_lyrics_animation_ts = now
+        step = elapsed / self.YOUTUBE_LYRICS_SLIDE_SECONDS
+        target = 1.0 if self.youtube_lyrics_open else 0.0
+        if self.youtube_lyrics_reveal < target:
+            self.youtube_lyrics_reveal = min(target, self.youtube_lyrics_reveal + step)
+        elif self.youtube_lyrics_reveal > target:
+            self.youtube_lyrics_reveal = max(target, self.youtube_lyrics_reveal - step)
+        return self.youtube_lyrics_reveal
 
     def __enter__(self):
         if not self.enable:
@@ -3429,6 +3458,14 @@ class CursesTUI:
                     if sx <= mx < sx + sw and my == sy:
                         self.library_lyrics_toggle_request = True
                         return None
+            if (
+                self.youtube_active
+                and bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED)
+            ):
+                tx, ty, tw, th = self.youtube_lyrics_toggle_bounds
+                if tx <= mx < tx + tw and ty <= my < ty + th:
+                    self.toggle_youtube_lyrics()
+                    return None
             # Mouse wheel scrolling
             wheel_up = 0
             for name in ("BUTTON4_PRESSED", "BUTTON4_CLICKED", "BUTTON4_RELEASED"):
@@ -3993,7 +4030,11 @@ class CursesTUI:
                     self.most_selected = min(self.most_selected, self.most_len - 1)
         elif key in (self.KEY_TAB, KEY_BTAB):
             if self.youtube_active:
-                order = ["youtube", "lyrics"]
+                order = (
+                    ["youtube", "lyrics"]
+                    if self.youtube_lyrics_open
+                    else ["youtube"]
+                )
             elif self.library_lyrics_view:
                 order = [
                     "lyrics",
@@ -4871,31 +4912,44 @@ class CursesTUI:
                 full_w = max(1, w)
                 yt_results = youtube_results or []
                 self.youtube_len = len(yt_results)
+                lyrics_reveal = self._advance_youtube_lyrics_reveal(now)
                 if full_w >= 72 or table_height < 8:
-                    yt_x = 0
-                    yt_y = table_top
-                    yt_w = max(
+                    expanded_yt_w = max(
                         1,
                         min(
                             max(1, full_w - 2),
                             max(30, int(full_w * 0.52)),
                         ),
                     )
+                    expanded_lyrics_w = max(0, full_w - expanded_yt_w - 1)
+                    lyrics_w = min(
+                        expanded_lyrics_w,
+                        max(0, round(expanded_lyrics_w * lyrics_reveal)),
+                    )
+                    yt_x = 0
+                    yt_y = table_top
+                    yt_w = max(1, full_w - lyrics_w - (1 if lyrics_w else 0))
                     yt_h = table_height
-                    lyrics_x = yt_w + 1
+                    lyrics_x = full_w - lyrics_w
                     lyrics_y = table_top
-                    lyrics_w = max(0, full_w - lyrics_x)
                     lyrics_h = table_height
                     split_vertical = True
                 else:
+                    expanded_yt_h = max(
+                        3, min(table_height - 3, table_height // 3)
+                    )
+                    expanded_lyrics_h = max(0, table_height - expanded_yt_h - 1)
+                    lyrics_h = min(
+                        expanded_lyrics_h,
+                        max(0, round(expanded_lyrics_h * lyrics_reveal)),
+                    )
                     yt_x = 0
                     yt_y = table_top
                     yt_w = full_w
-                    yt_h = max(3, min(table_height - 3, table_height // 3))
+                    yt_h = max(1, table_height - lyrics_h - (1 if lyrics_h else 0))
                     lyrics_x = 0
                     lyrics_y = yt_y + yt_h + 1
                     lyrics_w = full_w
-                    lyrics_h = max(0, table_height - yt_h - 1)
                     split_vertical = False
 
                 y_content_h = max(0, yt_h - 1)
@@ -4982,53 +5036,72 @@ class CursesTUI:
                     lyrics_lines = ["No lyrics were found for this YouTube track."]
                     lyrics_source = self.youtube_lyrics_source
 
-                wrapped_lyrics: List[str] = []
-                lyric_line_w = max(1, lyrics_w - 2)
-                for lyric_line in lyrics_lines:
-                    if not lyric_line:
-                        wrapped_lyrics.append("")
-                        continue
-                    wrapped_lyrics.extend(
-                        textwrap.wrap(
-                            lyric_line,
-                            width=lyric_line_w,
-                            replace_whitespace=False,
-                            drop_whitespace=True,
+                if lyrics_w > 0 and lyrics_h > 0:
+                    wrapped_lyrics: List[str] = []
+                    lyric_line_w = max(1, lyrics_w - 2)
+                    for lyric_line in lyrics_lines:
+                        if not lyric_line:
+                            wrapped_lyrics.append("")
+                            continue
+                        wrapped_lyrics.extend(
+                            textwrap.wrap(
+                                lyric_line,
+                                width=lyric_line_w,
+                                replace_whitespace=False,
+                                drop_whitespace=True,
+                            )
+                            or [""]
                         )
-                        or [""]
+                    lyrics_content_h = max(0, lyrics_h - 1)
+                    lyrics_max_scroll = max(
+                        0, len(wrapped_lyrics) - lyrics_content_h
                     )
-                lyrics_content_h = max(0, lyrics_h - 1)
-                lyrics_max_scroll = max(
-                    0, len(wrapped_lyrics) - lyrics_content_h
+                    self.youtube_lyrics_scroll = min(
+                        max(0, self.youtube_lyrics_scroll), lyrics_max_scroll
+                    )
+                    visible_lyrics = wrapped_lyrics[
+                        self.youtube_lyrics_scroll :
+                        self.youtube_lyrics_scroll + lyrics_content_h
+                    ]
+                    lyrics_focus = (
+                        "[Lyrics]" if self.focus_panel == "lyrics" else " Lyrics "
+                    )
+                    lyrics_title = (
+                        f"{lyrics_focus} {lyrics_source}"
+                        if lyrics_source
+                        else lyrics_focus
+                    )
+                    render_pane(
+                        lyrics_title.ljust(lyrics_w),
+                        visible_lyrics,
+                        lyrics_x,
+                        lyrics_y,
+                        lyrics_w,
+                        lyrics_h,
+                    )
+                    if split_vertical:
+                        separator_x = max(0, lyrics_x - 1)
+                        for row in range(table_height):
+                            self._draw(table_top + row, separator_x, "│")
+                    else:
+                        self._draw(lyrics_y - 1, 0, "─" * full_w)
+
+                lyrics_toggle = (
+                    "[lyrics ▶]" if self.youtube_lyrics_open else "[lyrics ◀]"
                 )
-                self.youtube_lyrics_scroll = min(
-                    max(0, self.youtube_lyrics_scroll), lyrics_max_scroll
+                toggle_w = min(full_w, len(lyrics_toggle))
+                toggle_x = max(0, full_w - toggle_w)
+                toggle_text = lyrics_toggle[-toggle_w:]
+                self._draw(table_top, toggle_x, toggle_text)
+                self.youtube_lyrics_toggle_bounds = (
+                    toggle_x,
+                    table_top,
+                    toggle_w,
+                    1,
                 )
-                visible_lyrics = wrapped_lyrics[
-                    self.youtube_lyrics_scroll :
-                    self.youtube_lyrics_scroll + lyrics_content_h
-                ]
-                lyrics_focus = (
-                    "[Lyrics]" if self.focus_panel == "lyrics" else " Lyrics "
-                )
-                lyrics_title = (
-                    f"{lyrics_focus} {lyrics_source}" if lyrics_source else lyrics_focus
-                )
-                render_pane(
-                    lyrics_title.ljust(lyrics_w),
-                    visible_lyrics,
-                    lyrics_x,
-                    lyrics_y,
-                    lyrics_w,
-                    lyrics_h,
-                )
-                if split_vertical:
-                    for row in range(table_height):
-                        self._draw(table_top + row, yt_w, "│")
-                elif lyrics_h > 0:
-                    self._draw(lyrics_y - 1, 0, "─" * full_w)
             else:
                 self.youtube_lyrics_bounds = (0, 0, 0, 0)
+                self.youtube_lyrics_toggle_bounds = (0, 0, 0, 0)
 
         # Input bar + footer
         self._set_draw_target(self._input_win, input_y - 1)

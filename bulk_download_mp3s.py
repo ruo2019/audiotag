@@ -105,19 +105,23 @@ def cache_downloaded_lyrics(
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     from headphones_markov import (
         YouTubeCookieConfig,
+        delete_cached_lyrics,
         fetch_youtube_lyrics,
         is_instrumental_track,
+        library_lyrics_cache_key,
+        mark_library_lyrics_removed,
         write_cached_lyrics,
-        youtube_lyrics_cache_key,
         youtube_result_from_video_id,
     )
 
     cookie_config = YouTubeCookieConfig(cookies_file=cookies_file)
+    delete_cached_lyrics(library_lyrics_cache_key(output_path))
     result = youtube_result_from_video_id(video_id, cookie_config)
     if result is None:
         print(f"Lyrics not cached for {output_path.name}: video metadata unavailable")
         return
     if is_instrumental_track(output_path.stem, result.title):
+        mark_library_lyrics_removed(output_path)
         print(f"Lyrics skipped for instrumental track: {output_path.name}")
         return
 
@@ -125,7 +129,7 @@ def cache_downloaded_lyrics(
     if not lyrics:
         print(f"Lyrics not cached for {output_path.name}: {source}")
         return
-    write_cached_lyrics(youtube_lyrics_cache_key(result), lyrics, source)
+    write_cached_lyrics(library_lyrics_cache_key(output_path), lyrics, source)
     print(f"Lyrics cached for {output_path.name}: {source}")
 
 

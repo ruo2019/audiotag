@@ -274,6 +274,11 @@
       "base": "Ovunque Sarai",
       "play_once": false,
       "library": "mid-mp3s"
+    },
+    {
+      "base": "Jamais",
+      "play_once": false,
+      "library": "mid-mp3s"
     }
   ]
 }

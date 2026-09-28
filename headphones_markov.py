@@ -47,8 +47,6 @@ try:
 except Exception:
     YoutubeDL = None  # type: ignore[assignment]
 
-HEADPHONES_LOST = threading.Event()
-
 _BROWSER_COOKIE_RE = re.compile(
     r"(?x)"
     r"(?P<name>[^+:]+)"
@@ -96,11 +94,12 @@ GENIUS_WEB_USER_AGENT = (
 )
 LYRICS_FETCH_TIMEOUT_SECONDS = 10
 GENIUS_REQUEST_RETRIES = 2
+GENIUS_WEB_SEARCH_TIMEOUT_SECONDS = 2.5
 LRCLIB_REQUEST_RETRIES = 3
 LRCLIB_REQUEST_INTERVAL_SECONDS = 0.3
 LRCLIB_REQUEST_LOCK = threading.Lock()
 LRCLIB_LAST_REQUEST_AT = -math.inf
-PLAYLISTS_FILE = "queue_playlists.json"
+YOUTUBE_TITLE_TIMEOUT_SECONDS = 3
 DOWNLOAD_LIST_FILE = "download_list.txt"
 DOWNLOAD_LIST_BLANK_AFTER_DAYS = 3
 AUTO_COMMIT_STATE_DEFAULT_DAYS = 1
@@ -145,6 +144,7 @@ AUDIO_COLOR_CACHE_NAME = ".autoplay_audio_colors.json"
 AUDIO_FEATURES_CACHE_FILE = Path("audio_features_cache.json")
 LYRICS_CACHE_FILE = Path(".lyrics_cache.json")
 LYRICS_CACHE_FORMAT_VERSION = 2
+LYRICS_REMOVED_SOURCE = "Lyrics removed."
 BASE_VOLUME_SCALE = 0.5
 TRUE_PEAK_LIMIT_DBTP = -1.0
 
@@ -152,7 +152,6 @@ LYRICS_CACHE_LOCK = threading.RLock()
 
 # Listen DBs stored next to this script
 LISTEN_DB_FILE = "listen_counts.json"
-LISTEN_TIMESTAMPS_FILE = "listen_timestamps.json"
 MARKOV_SESSION_CUTOFF_SECONDS = 10 * 60
 MARKOV_RANDOM_FALLBACK_PROBABILITY = 0.05
 AutoTrackKey = Tuple[int, str]
@@ -288,14 +287,8 @@ def lyrics_cache_path() -> Path:
     return Path(__file__).resolve().parent / LYRICS_CACHE_FILE
 
 
-def youtube_lyrics_cache_key(result: YouTubeResult) -> str:
-    return youtube_lyrics_cache_key_from_id(
-        result.video_id.strip() or result.url.strip()
-    )
-
-
-def youtube_lyrics_cache_key_from_id(video_id: str) -> str:
-    source = video_id.strip()
+def youtube_video_id(source: str) -> str:
+    source = source.strip()
     if not source:
         return ""
     for pattern in (
@@ -308,9 +301,23 @@ def youtube_lyrics_cache_key_from_id(video_id: str) -> str:
         if match:
             source = match.group(1)
             break
-    if not re.fullmatch(r"[A-Za-z0-9_-]{6,}", source):
-        return ""
-    return f"youtube:{source}"
+    return source if re.fullmatch(r"[A-Za-z0-9_-]{6,}", source) else ""
+
+
+def youtube_result_video_id(result: YouTubeResult) -> str:
+    source = result.video_id.strip() or result.url.strip()
+    return youtube_video_id(source) or source
+
+
+def library_lyrics_cache_key(track_path: Path) -> str:
+    """Return a readable cache key for lyrics attached directly to a local MP3."""
+    resolved = track_path.expanduser().resolve()
+    app_dir = Path(__file__).resolve().parent
+    try:
+        display_path = resolved.relative_to(app_dir).as_posix()
+    except ValueError:
+        display_path = resolved.as_posix()
+    return f"local:{display_path}"
 
 
 def read_cached_lyrics(key: str) -> Optional[Tuple[str, str]]:
@@ -346,6 +353,50 @@ def write_cached_lyrics(key: str, lyrics: str, source: str) -> None:
             "source": source,
             "format_version": LYRICS_CACHE_FORMAT_VERSION,
         }
+        atomic_write_json(path, cache)
+
+
+def delete_cached_lyrics(key: str) -> None:
+    if not key:
+        return
+    with LYRICS_CACHE_LOCK:
+        path = lyrics_cache_path()
+        raw = safe_read_json(path, {})
+        if not isinstance(raw, dict) or key not in raw:
+            return
+        del raw[key]
+        atomic_write_json(path, raw)
+
+
+def library_lyrics_were_removed(track_path: Path) -> bool:
+    key = library_lyrics_cache_key(track_path)
+    with LYRICS_CACHE_LOCK:
+        raw = safe_read_json(lyrics_cache_path(), {})
+    if not isinstance(raw, dict):
+        return False
+    entry = raw.get(key)
+    return (
+        isinstance(entry, dict)
+        and entry.get("lyrics") == ""
+        and entry.get("source") == LYRICS_REMOVED_SOURCE
+    )
+
+
+def mark_library_lyrics_removed(track_path: Path) -> None:
+    key = library_lyrics_cache_key(track_path)
+    with LYRICS_CACHE_LOCK:
+        path = lyrics_cache_path()
+        raw = safe_read_json(path, {})
+        cache = raw if isinstance(raw, dict) else {}
+        entry = cache.get(key)
+        marker = {
+            "lyrics": "",
+            "source": LYRICS_REMOVED_SOURCE,
+            "format_version": LYRICS_CACHE_FORMAT_VERSION,
+        }
+        if entry == marker:
+            return
+        cache[key] = marker
         atomic_write_json(path, cache)
 
 
@@ -1137,22 +1188,6 @@ def download_list_path(filename: str = DOWNLOAD_LIST_FILE) -> Path:
     return Path(__file__).resolve().parent / filename
 
 
-def youtube_video_id_for_history(result: YouTubeResult) -> str:
-    if result.video_id.strip():
-        return result.video_id.strip()
-    url = result.url.strip()
-    for pattern in (
-        r"(?:\?|&)v=([A-Za-z0-9_-]{6,})",
-        r"youtu\.be/([A-Za-z0-9_-]{6,})",
-        r"youtube\.com/shorts/([A-Za-z0-9_-]{6,})",
-        r"youtube\.com/embed/([A-Za-z0-9_-]{6,})",
-    ):
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return url
-
-
 def downloaded_youtube_video_id(
     title: str,
     marker: str,
@@ -1187,14 +1222,38 @@ def youtube_result_from_video_id(
     cookie_config: Optional[YouTubeCookieConfig] = None,
 ) -> Optional[YouTubeResult]:
     """Resolve the original title and uploader for a downloaded YouTube track."""
-    if YoutubeDL is None or not video_id.strip():
+    if not video_id.strip():
         return None
     source = video_id.strip()
+    source_key = youtube_video_id(source)
+    if not source_key:
+        return None
     url = (
         source
         if source.startswith(("http://", "https://"))
-        else f"https://www.youtube.com/watch?v={source}"
+        else f"https://www.youtube.com/watch?v={source_key}"
     )
+    oembed_url = "https://www.youtube.com/oembed?" + urlencode(
+        {"url": url, "format": "json"}
+    )
+    try:
+        request = Request(oembed_url, headers={"User-Agent": GENIUS_WEB_USER_AGENT})
+        with urlopen(request, timeout=YOUTUBE_TITLE_TIMEOUT_SECONDS) as response:
+            oembed = json.load(response)
+        if isinstance(oembed, dict):
+            title = str(oembed.get("title") or "").strip()
+            uploader = str(oembed.get("author_name") or "").strip()
+            if title and uploader:
+                return YouTubeResult(
+                    title=title,
+                    url=url,
+                    uploader=uploader,
+                    video_id=source_key,
+                )
+    except (HTTPError, URLError, OSError, ValueError, UnicodeError):
+        pass
+    if YoutubeDL is None:
+        return None
     ydl_opts: Dict[str, object] = {
         "quiet": True,
         "no_warnings": True,
@@ -1226,7 +1285,7 @@ def youtube_result_from_video_id(
     ).strip()
     if not title or not uploader:
         return None
-    return YouTubeResult(title=title, url=url, uploader=uploader, video_id=source)
+    return YouTubeResult(title=title, url=url, uploader=uploader, video_id=source_key)
 
 
 def append_download_list_entry(
@@ -1238,7 +1297,7 @@ def append_download_list_entry(
     path = download_list_path(filename)
     path.parent.mkdir(parents=True, exist_ok=True)
     line = (
-        f"# {youtube_video_id_for_history(result)} "
+        f"# {youtube_result_video_id(result)} "
         f"{title} [{marker}]\n"
     )
     prefix = ""
@@ -2154,14 +2213,30 @@ def simplify_lyrics_title(value: str) -> str:
     text = re.sub(
         r"\s+(?:feat(?:uring)?|ft)\.?\s+.+$", "", text, flags=re.IGNORECASE
     )
-    return re.sub(r"\s+", " ", text).strip(" -–—|")
+    text = re.sub(r"\s+", " ", text)
+    return re.sub(r"^[\s|–—-]+|[\s|–—-]+$", "", text)
+
+
+INSTRUMENTAL_TRACK_RE = re.compile(
+    r"(?:"
+    r"\binstrumentals?\b|"
+    r"\bkaraoke\b|"
+    r"\bbacking\s+(?:track|version)\b|"
+    r"\b(?:no|without)\s+vocals?\b|"
+    r"\boff[ -]?vocal\b|"
+    r"\bmusic\s+only\b|"
+    r"\b(?:piano|keyboard|organ|guitar|ukulele|violin|viola|cello|"
+    r"harp|flute|saxophone|trumpet|orchestral|orchestra|symphonic)\s+"
+    r"(?:cover|version|arrangement|rendition|solo)\b|"
+    r"\btheme(?:\s+\d+)?(?=\s*(?:$|[\[(]|[-–—|]))|"
+    r"\b(?:original|film|movie|game)\s+score\b"
+    r")",
+    flags=re.IGNORECASE,
+)
 
 
 def is_instrumental_track(*labels: str) -> bool:
-    return any(
-        re.search(r"\binstrumental\b", str(label), flags=re.IGNORECASE)
-        for label in labels
-    )
+    return any(INSTRUMENTAL_TRACK_RE.search(str(label)) for label in labels)
 
 
 LYRICS_SECTION_HEADER_RE = re.compile(r"^\s*\[[^\]\r\n]{1,80}\]\s*$")
@@ -2378,24 +2453,17 @@ def genius_song_path_from_web_search(title: str, artist: str) -> str:
         lucky_url,
         headers={"Accept": "text/html", "User-Agent": GENIUS_WEB_USER_AGENT},
     )
-    for attempt in range(GENIUS_REQUEST_RETRIES):
-        try:
-            with urlopen(
-                lucky_request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS
-            ) as response:
-                path = genius_path_from_url(response.geturl())
-            if genius_search_path_score(
-                path, wanted_title_words, wanted_artist_words
-            ) >= 120.0:
-                return path
-            break
-        except HTTPError as exc:
-            if exc.code not in (429, 502, 503, 504):
-                break
-        except (URLError, OSError, UnicodeError):
-            pass
-        if attempt + 1 < GENIUS_REQUEST_RETRIES:
-            time.sleep(0.4 * (2**attempt))
+    try:
+        with urlopen(
+            lucky_request, timeout=GENIUS_WEB_SEARCH_TIMEOUT_SECONDS
+        ) as response:
+            path = genius_path_from_url(response.geturl())
+        if genius_search_path_score(
+            path, wanted_title_words, wanted_artist_words
+        ) >= 120.0:
+            return path
+    except (URLError, OSError, UnicodeError):
+        pass
 
     for search_url in GENIUS_SEARCH_ENGINE_URLS:
         url = f"{search_url}?{urlencode({'q': f'site:genius.com {query}'})}"
@@ -2403,20 +2471,12 @@ def genius_song_path_from_web_search(title: str, artist: str) -> str:
             url,
             headers={"Accept": "text/html", "User-Agent": GENIUS_WEB_USER_AGENT},
         )
-        page = ""
-        for attempt in range(GENIUS_REQUEST_RETRIES):
-            try:
-                with urlopen(request, timeout=LYRICS_FETCH_TIMEOUT_SECONDS) as response:
-                    page = response.read().decode("utf-8")
-                break
-            except HTTPError as exc:
-                if exc.code not in (429, 502, 503, 504):
-                    break
-            except (URLError, OSError, UnicodeError):
-                pass
-            if attempt + 1 < GENIUS_REQUEST_RETRIES:
-                time.sleep(0.4 * (2**attempt))
-        if not page:
+        try:
+            with urlopen(
+                request, timeout=GENIUS_WEB_SEARCH_TIMEOUT_SECONDS
+            ) as response:
+                page = response.read().decode("utf-8")
+        except (URLError, OSError, UnicodeError):
             continue
 
         parser = GeniusSearchResultParser()
@@ -2615,7 +2675,7 @@ def lyrics_from_synced_timing(lyrics: str) -> str:
     nonempty_times = [timestamp for timestamp, text in entries if text]
     gaps = [
         later - earlier
-        for earlier, later in zip(nonempty_times, nonempty_times[1:])
+        for earlier, later in zip(nonempty_times, nonempty_times[1:], strict=False)
         if later > earlier
     ]
     ordered_gaps = sorted(gaps)
@@ -2797,6 +2857,17 @@ def fetch_youtube_lyrics(result: YouTubeResult) -> Tuple[str, str]:
     return "", last_source
 
 
+def fetch_lyrics_for_query(
+    query: str,
+    cookie_config: Optional[YouTubeCookieConfig] = None,
+) -> Tuple[str, str]:
+    """Resolve a loose query through YouTube, then use the usual lyric lookup."""
+    youtube_results = search_youtube(query, 1, cookie_config)
+    if not youtube_results:
+        return "", "No YouTube results."
+    return fetch_youtube_lyrics(youtube_results[0])
+
+
 class CursesTUI:
     """
     Minimal curses UI:
@@ -2876,7 +2947,9 @@ class CursesTUI:
         self.playlist_item_drag_target: Optional[int] = None
         self.playlist_item_drag_commit_target: Optional[int] = None
         self.playlist_item_drag_commit_start: Optional[int] = None
-        self.input_mode = "mood"  # mood | save_playlist | tag_add | tag_edit | youtube_search | youtube_download
+        # mood | save_playlist | tag_add | tag_edit | youtube_search |
+        # youtube_download | lyrics_lookup
+        self.input_mode = "mood"
         self.tag_panel_open = False
         self.tag_delete_request = False
         self.tag_edit_request = False
@@ -2984,22 +3057,23 @@ class CursesTUI:
         self.library_lyrics_view = False
         self.library_lyrics_toggle_request = False
         self.library_lyrics_bounds = (0, 0, 0, 0)  # x, y, w, h
+        self.library_lyrics_track_path: Optional[Path] = None
+        self.library_lyrics_is_preview = False
+        self.library_lyrics_lookup_query = ""
+        self.library_lyrics_lookup_token = ""
+        self.library_lyrics_cancel_source = ""
+        self.library_lyrics_action_request: Optional[str] = None
+        self.library_lyrics_action_bounds: Dict[str, Tuple[int, int, int, int]] = {}
 
     def load_youtube_lyrics(self, result: YouTubeResult) -> None:
         """Look up lyrics for a playing YouTube result without blocking audio."""
-        key = youtube_lyrics_cache_key(result)
+        key = youtube_result_video_id(result)
         if key == self.youtube_lyrics_key:
             return
         self.youtube_lyrics_key = key
         if is_instrumental_track(result.title):
             self.youtube_lyrics_text = ""
             self.youtube_lyrics_source = "Instrumental track."
-            self.youtube_lyrics_loading = False
-            self.youtube_lyrics_scroll = 0
-            return
-        cached = read_cached_lyrics(key)
-        if cached is not None:
-            self.youtube_lyrics_text, self.youtube_lyrics_source = cached
             self.youtube_lyrics_loading = False
             self.youtube_lyrics_scroll = 0
             return
@@ -3022,35 +3096,50 @@ class CursesTUI:
         track_path: Path,
         download_marker: str = "",
         cookie_config: Optional[YouTubeCookieConfig] = None,
+        track_tags: Iterable[str] = (),
     ) -> None:
-        """Load or fetch lyrics only for a track recorded in download history."""
+        """Load cached lyrics, or fetch them for a track in download history."""
         memory_key = str(track_path.resolve())
         if memory_key == self.library_lyrics_key and (
             self.library_lyrics_loading or self.library_lyrics_text
         ):
             return
         self.library_lyrics_key = memory_key
+        self.library_lyrics_track_path = track_path
+        self.library_lyrics_lookup_token = str(uuid.uuid4())
+        if self.input_mode == "lyrics_lookup":
+            self.input_mode = "mood"
+            self.input_buffer = ""
         self.library_lyrics_scroll = 0
+        self.library_lyrics_is_preview = False
+        self.library_lyrics_lookup_query = ""
+        self.library_lyrics_cancel_source = ""
 
-        if is_instrumental_track(track_path.stem):
+        if library_lyrics_were_removed(track_path):
+            self.library_lyrics_text = ""
+            self.library_lyrics_source = LYRICS_REMOVED_SOURCE
+            self.library_lyrics_loading = False
+            return
+
+        if is_instrumental_track(track_path.stem, *track_tags):
             self.library_lyrics_text = ""
             self.library_lyrics_source = "Instrumental track."
+            self.library_lyrics_loading = False
+            return
+
+        local_cache_key = library_lyrics_cache_key(track_path)
+        local_cached = read_cached_lyrics(local_cache_key)
+        if local_cached is not None:
+            self.library_lyrics_text, self.library_lyrics_source = local_cached
             self.library_lyrics_loading = False
             return
 
         source_video_id = downloaded_youtube_video_id(
             track_path.stem, download_marker
         )
-        cache_key = youtube_lyrics_cache_key_from_id(source_video_id)
-        if not cache_key:
+        if not source_video_id:
             self.library_lyrics_text = ""
-            self.library_lyrics_source = ""
-            self.library_lyrics_loading = False
-            return
-
-        cached = read_cached_lyrics(cache_key)
-        if cached is not None:
-            self.library_lyrics_text, self.library_lyrics_source = cached
+            self.library_lyrics_source = "No download history."
             self.library_lyrics_loading = False
             return
 
@@ -3063,12 +3152,15 @@ class CursesTUI:
                 result = youtube_result_from_video_id(source_video_id, cookie_config)
                 if result is None:
                     lyrics, source = "", "YouTube metadata unavailable."
-                elif is_instrumental_track(track_path.stem, result.title):
+                elif is_instrumental_track(
+                    track_path.stem, result.title, *track_tags
+                ):
                     lyrics, source = "", "Instrumental track."
+                    mark_library_lyrics_removed(track_path)
                 else:
                     lyrics, source = fetch_youtube_lyrics(result)
                     if lyrics:
-                        write_cached_lyrics(cache_key, lyrics, source)
+                        write_cached_lyrics(local_cache_key, lyrics, source)
             except Exception:
                 lyrics, source = "", "Lyrics lookup failed."
             if self.library_lyrics_key == memory_key:
@@ -3077,6 +3169,108 @@ class CursesTUI:
                 self.library_lyrics_loading = False
 
         threading.Thread(target=fetch, name="library-lyrics-fetch", daemon=True).start()
+
+    def start_library_lyrics_lookup(
+        self,
+        query: str,
+        cookie_config: Optional[YouTubeCookieConfig] = None,
+    ) -> None:
+        """Fetch a reviewable lyric candidate for the current local track."""
+        track_path = self.library_lyrics_track_path
+        if track_path is None:
+            self.status_msg = "Play a library track before looking up lyrics."
+            return
+        memory_key = self.library_lyrics_key
+        lookup_token = str(uuid.uuid4())
+        self.library_lyrics_lookup_token = lookup_token
+        if not self.library_lyrics_lookup_query:
+            self.library_lyrics_cancel_source = self.library_lyrics_source
+        self.library_lyrics_lookup_query = query
+        self.library_lyrics_text = ""
+        self.library_lyrics_source = f"Searching for {query}…"
+        self.library_lyrics_loading = True
+        self.library_lyrics_is_preview = False
+        self.library_lyrics_scroll = 0
+        self.input_mode = "lyrics_lookup"
+        self.input_buffer = ""
+        self.status_msg = f"Looking up lyrics for {query}…"
+
+        def fetch() -> None:
+            try:
+                lyrics, source = fetch_lyrics_for_query(query, cookie_config)
+            except Exception:
+                lyrics, source = "", "Lyrics lookup failed."
+            if (
+                self.library_lyrics_key != memory_key
+                or self.library_lyrics_lookup_token != lookup_token
+            ):
+                return
+            self.library_lyrics_text = lyrics
+            self.library_lyrics_source = source
+            self.library_lyrics_loading = False
+            self.library_lyrics_is_preview = bool(lyrics)
+            if lyrics:
+                self.status_msg = "Check the preview, save it, or type another lyrics search."
+            else:
+                self.status_msg = f"No lyrics found for {query}."
+
+        threading.Thread(
+            target=fetch,
+            name="manual-library-lyrics-fetch",
+            daemon=True,
+        ).start()
+
+    def save_library_lyrics_preview(self) -> None:
+        """Attach the reviewed lyric candidate to the current MP3."""
+        track_path = self.library_lyrics_track_path
+        if track_path is None or not self.library_lyrics_is_preview:
+            self.status_msg = "There is no lyric preview to save."
+            return
+        write_cached_lyrics(
+            library_lyrics_cache_key(track_path),
+            self.library_lyrics_text,
+            self.library_lyrics_source,
+        )
+        self.library_lyrics_is_preview = False
+        self.library_lyrics_cancel_source = ""
+        self.library_lyrics_lookup_query = ""
+        self.input_mode = "mood"
+        self.input_buffer = ""
+        self.status_msg = f"Saved lyrics for {track_path.name}."
+
+    def delete_library_lyrics(self) -> None:
+        """Remove saved lyrics and prevent another automatic lookup."""
+        track_path = self.library_lyrics_track_path
+        if track_path is None or not self.library_lyrics_text:
+            self.status_msg = "There are no saved lyrics to delete."
+            return
+        self.library_lyrics_lookup_token = str(uuid.uuid4())
+        mark_library_lyrics_removed(track_path)
+        self.library_lyrics_text = ""
+        self.library_lyrics_source = LYRICS_REMOVED_SOURCE
+        self.library_lyrics_loading = False
+        self.library_lyrics_is_preview = False
+        self.library_lyrics_lookup_query = ""
+        self.library_lyrics_cancel_source = ""
+        self.library_lyrics_scroll = 0
+        self.input_mode = "mood"
+        self.input_buffer = ""
+        self.status_msg = f"Deleted lyrics for {track_path.name}."
+
+    def cancel_library_lyrics_preview(self) -> None:
+        """Discard an unsaved candidate and restore the prior lyrics display."""
+        if self.library_lyrics_loading:
+            self.library_lyrics_lookup_token = str(uuid.uuid4())
+        self.library_lyrics_text = ""
+        self.library_lyrics_source = self.library_lyrics_cancel_source
+        self.library_lyrics_cancel_source = ""
+        self.library_lyrics_loading = False
+        self.library_lyrics_is_preview = False
+        self.library_lyrics_lookup_query = ""
+        self.library_lyrics_scroll = 0
+        self.input_mode = "mood"
+        self.input_buffer = ""
+        self.status_msg = "Lyric candidate discarded."
 
     def scroll_lyrics(self, amount: int) -> None:
         if self.youtube_active:
@@ -3451,6 +3645,11 @@ class CursesTUI:
                 if self.library_lyrics_view:
                     lx, ly, lw, _ = self.library_lyrics_bounds
                     if lx <= mx < lx + lw and my == ly:
+                        for action, bounds in self.library_lyrics_action_bounds.items():
+                            bx, by, bw, bh = bounds
+                            if bx <= mx < bx + bw and by <= my < by + bh:
+                                self.library_lyrics_action_request = action
+                                return None
                         self.library_lyrics_toggle_request = True
                         return None
                 else:
@@ -4878,11 +5077,29 @@ class CursesTUI:
                 else:
                     local_lyrics = "No lyrics were found for this track."
                     local_source = self.library_lyrics_source
-                lyrics_title = (
-                    f"[Lyrics] {local_source}"
-                    if local_source
-                    else "[Lyrics]"
-                )
+                title_label = "[Lyrics preview]" if self.library_lyrics_is_preview else "[Lyrics]"
+                title_base = f"{title_label} {local_source}" if local_source else title_label
+                lyric_buttons: List[Tuple[str, str]] = []
+                if now_playing and self.library_lyrics_track_path is not None:
+                    if self.library_lyrics_is_preview:
+                        lyric_buttons = [
+                            ("[save lyrics]", "save"),
+                            ("[cancel]", "cancel"),
+                        ]
+                    elif self.library_lyrics_lookup_query:
+                        lyric_buttons = [("[cancel]", "cancel")]
+                    elif self.library_lyrics_text:
+                        lyric_buttons = [("[delete lyrics]", "delete")]
+                    elif (
+                        not self.library_lyrics_loading
+                        and self.library_lyrics_source != "Instrumental track."
+                    ):
+                        lyric_buttons = [("[get lyrics]", "get")]
+                buttons_text = " ".join(label for label, _ in lyric_buttons)
+                title_base_w = max(0, right_w - len(buttons_text) - (1 if buttons_text else 0))
+                lyrics_title = title_base[:title_base_w].ljust(title_base_w)
+                if buttons_text:
+                    lyrics_title += " " + buttons_text
                 lyrics_content_h = max(0, table_height - 1)
                 all_lyric_rows = wrap_lyrics_for_display(
                     local_lyrics, max(1, right_w - 2)
@@ -4905,8 +5122,15 @@ class CursesTUI:
                     right_w,
                     table_height,
                 )
+                self.library_lyrics_action_bounds = {}
+                button_x = right_x + title_base_w + (1 if buttons_text else 0)
+                for label, action in lyric_buttons:
+                    bounds = (button_x, table_top, len(label), 1)
+                    self.library_lyrics_action_bounds[action] = bounds
+                    button_x += len(label) + 1
             else:
                 self.library_lyrics_bounds = (0, 0, 0, 0)
+                self.library_lyrics_action_bounds = {}
 
             if self.youtube_active:
                 full_w = max(1, w)
@@ -5114,6 +5338,9 @@ class CursesTUI:
         elif self.input_mode == "youtube_download":
             self._hline(input_y - 1, "-")
             prompt = "download: "
+        elif self.input_mode == "lyrics_lookup":
+            self._hline(input_y - 1, "-")
+            prompt = "get lyrics: "
         elif self.input_mode == "youtube_search" or self.youtube_active:
             self._hline(input_y - 1, "-")
             prompt = "youtube: "
@@ -6505,7 +6732,7 @@ def main(
         # Update cached per-track scales (fast: no re-decode)
         if isinstance(state_resolved_target, (int, float)):
             tgt = float(state_resolved_target)
-            for p, d in state_audio_data.items():
+            for d in state_audio_data.values():
                 loud = d.get("loudness_lufs")
                 true_peak = d.get("true_peak_dbtp")
                 if isinstance(loud, (int, float)):
@@ -6546,6 +6773,14 @@ def main(
         library_state: Optional[LibraryState] = None,
     ) -> None:
         nonlocal current_top_n
+        if tui and tui.enable and tui.input_mode == "lyrics_lookup":
+            query = re.sub(r"\s+", " ", text).strip()
+            if not query:
+                tui.input_buffer = text
+                tui.status_msg = "Enter a lyrics search."
+                return
+            tui.start_library_lyrics_lookup(query, youtube_cookie_config)
+            return
         if text.strip() == "--help":
             if tui and tui.enable:
                 tui.show_help = True
@@ -6918,14 +7153,16 @@ def main(
                     target_state.artists_data[output_path.stem] = artist_names
                     save_artists(target_state.artists_file, target_state.artists_data)
                 append_download_list_entry(result, title, marker)
-                youtube_key = youtube_lyrics_cache_key(result)
+                local_lyrics_key = library_lyrics_cache_key(output_path)
+                delete_cached_lyrics(local_lyrics_key)
                 if is_instrumental_track(title, result.title):
+                    mark_library_lyrics_removed(output_path)
                     lyrics = ""
                     lyrics_source = "Instrumental track."
                 else:
                     tui.status_msg = f"Fetching lyrics for {output_path.name}…"
                     if (
-                        tui.youtube_lyrics_key == youtube_key
+                        tui.youtube_lyrics_key == youtube_result_video_id(result)
                         and tui.youtube_lyrics_text
                     ):
                         lyrics = tui.youtube_lyrics_text
@@ -6933,7 +7170,7 @@ def main(
                     else:
                         lyrics, lyrics_source = fetch_youtube_lyrics(result)
                 if lyrics:
-                    write_cached_lyrics(youtube_key, lyrics, lyrics_source)
+                    write_cached_lyrics(local_lyrics_key, lyrics, lyrics_source)
                 refresh_library_after_download(target_idx, output_path)
                 tui.input_mode = "youtube_search"
                 tui.input_buffer = ""
@@ -7168,6 +7405,22 @@ def main(
                 tui.stats_toggle_request = False
                 tui.stats_panel_open = not tui.stats_panel_open
                 tui.focus_panel = "stats" if tui.stats_panel_open else "most"
+            lyrics_action = tui.library_lyrics_action_request
+            tui.library_lyrics_action_request = None
+            if lyrics_action == "get":
+                tui.input_mode = "lyrics_lookup"
+                if tui.library_lyrics_lookup_query:
+                    tui.input_buffer = tui.library_lyrics_lookup_query
+                else:
+                    tui.input_buffer = ""
+                tui.focus_panel = "lyrics"
+                tui.status_msg = "Enter a lyrics search, then press Enter."
+            elif lyrics_action == "save":
+                tui.save_library_lyrics_preview()
+            elif lyrics_action == "cancel":
+                tui.cancel_library_lyrics_preview()
+            elif lyrics_action == "delete":
+                tui.delete_library_lyrics()
             if tui.library_lyrics_toggle_request:
                 tui.library_lyrics_toggle_request = False
                 tui.library_lyrics_view = not tui.library_lyrics_view
@@ -7177,6 +7430,9 @@ def main(
                     tui.focus_panel = "lyrics"
                     tui.status_msg = "Lyrics opened."
                 else:
+                    if tui.input_mode == "lyrics_lookup":
+                        tui.input_mode = "mood"
+                        tui.input_buffer = ""
                     tui.focus_panel = "similar"
                     tui.status_msg = "Similar, Queue, and Playlists restored."
             if tui.queue_filter_toggle_request:
@@ -7406,6 +7662,10 @@ def main(
                         if handle_tag_submission(submitted, tui):
                             EXIT_NOW.wait(1.0 / tui.input_poll_hz())
                             continue
+                        if tui.input_mode == "lyrics_lookup":
+                            apply_submission(submitted, tui)
+                            EXIT_NOW.wait(1.0 / tui.input_poll_hz())
+                            continue
                         if handle_stats_query(submitted, tui):
                             EXIT_NOW.wait(1.0 / tui.input_poll_hz())
                             continue
@@ -7465,6 +7725,7 @@ def main(
                             else "mm" if track_library_idx == 1 else ""
                         ),
                         youtube_cookie_config,
+                        track_state.tags_data.get(track_path.stem, []),
                     )
                 if enable_tui and tui.input_mode in ("tag_add", "tag_edit"):
                     tui.input_buffer = ""

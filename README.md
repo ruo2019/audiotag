@@ -51,11 +51,18 @@ timestamps, while rebuilding its audio-derived caches.
 Lyrics fetched while downloading through the YouTube tab or
 `bulk_download_mp3s.py` are saved in one hidden `.lyrics_cache.json` file beside
 the app. Playing a YouTube result may fetch lyrics for its pane, but does not add
-them to the cache. A library track can fetch and cache lyrics only when its MP3
-name and library match an entry in `download_list.txt`; the cache is keyed only
-by that entry's YouTube ID. Tracks with no matching entry never request lyrics.
-Instrumental downloads skip lyric lookup. An artist is saved to the library only
-when the download prompt includes it explicitly (`[artist] title [m]`).
+them to the cache. Downloaded and manually approved lyrics are stored under a
+readable local key such as `local:static/mp3/Song.mp3`. For an MP3 with no
+matching download history, open its library lyrics pane and click `[get lyrics]`.
+The text entered is used directly as the search: try the title first, then add the
+artist if the result is not right. The player resolves the search through YouTube for the same
+title and uploader metadata used by the YouTube tab, then searches Genius first
+and LRCLIB second. It shows the result as an unsaved preview. Click
+`[save lyrics]` after checking it, or keep typing searches in the lyrics input
+until the result is right. `[cancel]` leaves lyric search without saving. Approved
+lyrics are cached directly against that local MP3. Instrumental downloads skip
+automatic lyric lookup. An artist is saved to the library only when the download prompt includes
+it explicitly (`[artist] title [m]`).
 
 The YouTube tab has a collapsible lyrics drawer. Click the `[lyrics ◀]` control
 at the far right to slide it open and click `[lyrics ▶]` to close it again.
@@ -73,9 +80,8 @@ credits.
 
 In a library tab, click the Similar pane's header to replace the three right-side
 panes with a full-height lyrics view; click the Lyrics header to restore Similar,
-Queue, and Playlists. Library lyrics use the YouTube ID recovered from the
-matching download-list entry, whether they were cached during download or later
-fetched when the library track played.
+Queue, and Playlists. Library lyrics use the readable local MP3 path in the lyric
+cache whether they were fetched during download or manually approved later.
 
 ```bash
 python headphones_markov.py

@@ -125,6 +125,7 @@ UI_REFRESH_HZ = 10
 LOCK_POLL_SECONDS = 0.25
 LOCKED_WAIT_SECONDS = 1.0
 LOCK_AUDIO_RELEASE_SECONDS = 30 * 60
+AUDIO_DEVICE_RECONNECT_POLL_SECONDS = 0.5
 
 # Mood directive clamp
 TOP_MIN, TOP_MAX = 1, 50
@@ -5416,21 +5417,38 @@ def list_pygame_output_devices() -> List[str]:
 
 
 class AudioOutput:
-    """Serialize mixer shutdown/reopening with device-presence checks."""
+    """Serialize mixer shutdown/reopening and remember device loss."""
 
     def __init__(self, device_name: Optional[str]):
         self.device_name = device_name
         self._lock = threading.Lock()
+        self._device_lost = threading.Event()
 
-    def open(self) -> None:
+    def open(self) -> bool:
         with self._lock:
             if pygame.mixer.get_init():
-                return
-            init_pygame(device_name=self.device_name)
+                if self._device_missing():
+                    self._device_lost.set()
+                    pygame.mixer.stop()
+                    pygame.mixer.quit()
+                else:
+                    self._device_lost.clear()
+                    return True
+            try:
+                init_pygame(device_name=self.device_name)
+            except pygame.error:
+                # SDL cannot enumerate playback devices while its audio
+                # subsystem is closed. Attempting to open the named device is
+                # therefore the reliable availability check during reconnect.
+                pygame.mixer.quit()
+                self._device_lost.set()
+                return False
             if self._device_missing():
                 pygame.mixer.quit()
-                EXIT_NOW.set()
-                raise SystemExit
+                self._device_lost.set()
+                return False
+            self._device_lost.clear()
+            return True
 
     def close(self) -> None:
         with self._lock:
@@ -5443,25 +5461,33 @@ class AudioOutput:
         if not self.device_name:
             return False
         devices = list_pygame_output_devices()
+        # An empty result means SDL audio is closed or temporarily unable to
+        # enumerate. It does not prove that the requested device disappeared.
         return bool(devices and self.device_name not in devices)
+
+    def device_lost(self) -> bool:
+        return self._device_lost.is_set()
 
     def stop_if_disconnected(self) -> bool:
         with self._lock:
             # Do not enumerate devices while intentionally closed/locked.
             if not pygame.mixer.get_init() or not self._device_missing():
                 return False
-            EXIT_NOW.set()
+            self._device_lost.set()
             pygame.mixer.stop()
+            pygame.mixer.quit()
             return True
 
 
 def start_device_presence_watchdog(output: AudioOutput, logging: bool = False) -> None:
     def _run():
-        while not EXIT_NOW.wait(0.5):
+        while not EXIT_NOW.wait(AUDIO_DEVICE_RECONNECT_POLL_SECONDS):
             if output.stop_if_disconnected():
                 if logging:
-                    print(f"[audio] Output device '{output.device_name}' disconnected. Stopping.")
-                return
+                    print(
+                        f"[audio] Output device '{output.device_name}' disconnected; "
+                        "waiting for it to return."
+                    )
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -5812,11 +5838,11 @@ def main(
         if logging and sdl_devs:
             print(f"[audio] SDL playback devices: {sdl_devs}")
         if sdl_devs and FORCE_DEVICE not in sdl_devs:
-            raise RuntimeError(
-                f"SDL/pygame output device '{FORCE_DEVICE}' not found.\n"
-                f"Available SDL devices: {sdl_devs}\n"
-                "Set FORCE_DEVICE to one of the exact names above."
-            )
+            if logging:
+                print(
+                    f"[audio] Output device '{FORCE_DEVICE}' is not connected; "
+                    "waiting for it to return."
+                )
 
     if logging:
         print("Initializing pygame mixer...")
@@ -7766,7 +7792,32 @@ def main(
                                 break
                             if pause_silence(GAP_SECONDS):
                                 break
-                        audio_output.open()
+                        waiting_for_audio = False
+                        stop_while_waiting = False
+                        while not audio_output.open():
+                            if enable_tui:
+                                tui.status_msg = (
+                                    "Waiting for audio device "
+                                    f"'{audio_output.device_name}'..."
+                                )
+                            elif logging and not waiting_for_audio:
+                                print(
+                                    "Waiting for audio device "
+                                    f"'{audio_output.device_name}'..."
+                                )
+                            waiting_for_audio = True
+                            if pause_silence(AUDIO_DEVICE_RECONNECT_POLL_SECONDS):
+                                stop_while_waiting = True
+                                break
+                        if stop_while_waiting:
+                            track_tag_session.abandon()
+                            current_playing_item = None
+                            current_playing_tag_session = None
+                            break
+                        if waiting_for_audio and enable_tui:
+                            tui.status_msg = (
+                                f"Audio device '{audio_output.device_name}' reconnected."
+                            )
                         sound = pygame.mixer.Sound(str(track_path))
                         if mac_is_locked_poll(force=True):
                             sound = None
@@ -7921,7 +7972,13 @@ def main(
 
                             clock.tick(tui.input_poll_hz())
 
-                        if not interrupted_by_lock and not user_skip and not user_stop:
+                        device_lost = audio_output.device_lost()
+                        if (
+                            not interrupted_by_lock
+                            and not user_skip
+                            and not user_stop
+                            and not device_lost
+                        ):
                             # The loop above exits normally when pygame reports the
                             # channel is no longer busy. Treat that as completion;
                             # elapsed duration is only a fallback sanity check.
@@ -7933,7 +7990,16 @@ def main(
                                     or elapsed_final >= max(0.0, total_dur - 0.75)
                                 )
 
-                        if reached_end:
+                        if device_lost:
+                            track_tag_session.abandon()
+                            queue.insert(0, current_item)
+                            if enable_tui:
+                                tui.status_msg = (
+                                    "Audio device "
+                                    f"'{audio_output.device_name}' disconnected; "
+                                    "waiting to resume."
+                                )
+                        elif reached_end:
                             last_completed_track_key = (
                                 track_library_idx,
                                 track_path.name,
@@ -7972,6 +8038,10 @@ def main(
 
                         sound = None
                         channel = None
+                        if device_lost:
+                            current_playing_item = None
+                            current_playing_tag_session = None
+                            break
                         if user_stop:
                             audio_output.close()
                             current_playing_item = None
@@ -7998,12 +8068,28 @@ def main(
 
                     except pygame.error as e:
                         track_tag_session.abandon()
-                        if enable_tui:
+                        device_lost = audio_output.device_lost()
+                        if device_lost:
+                            if enable_tui:
+                                tui.status_msg = (
+                                    "Audio device "
+                                    f"'{audio_output.device_name}' disconnected; "
+                                    "waiting to resume."
+                                )
+                            elif logging:
+                                print(
+                                    "Audio device "
+                                    f"'{audio_output.device_name}' disconnected; "
+                                    "waiting to resume."
+                                )
+                        elif enable_tui:
                             tui.status_msg = f"Error playing {filename_ext}: {e}"
                         else:
                             print(f"Error playing {filename_ext}: {e}")
                         time.sleep(1)
-                        if (
+                        if device_lost:
+                            queue.insert(0, current_item)
+                        elif (
                             not item_effective_play_once(current_item)
                             and current_item is not skip_requeue_item
                         ):

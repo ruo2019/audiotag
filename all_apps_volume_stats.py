@@ -451,6 +451,17 @@ class CoreAudio:
         return percent, None
 
 
+def reacquire_output_device(
+    core_audio: CoreAudio, device_name: str
+) -> OutputDevice | None:
+    """Return the current usable CoreAudio object for a named output device."""
+    candidate = core_audio.find_device(device_name)
+    if candidate is None:
+        return None
+    _percent, attenuation = core_audio.volume(candidate)
+    return candidate if attenuation is not None else None
+
+
 def screen_capture_authorized(request_if_needed: bool = True) -> bool:
     """Check the permission ScreenCaptureKit needs before launching its helper."""
     try:
@@ -1144,6 +1155,8 @@ def main() -> int:
     capture_retry_at: float | None = None
     capture_failures = 0
     interactive = sys.stdout.isatty() and not args.json
+    wanted_device_name = device.name
+    device_available = True
 
     def start_capture() -> None:
         nonlocal process, ready, helper_messages, last_measurement_at, capture_retry_at
@@ -1203,6 +1216,25 @@ def main() -> int:
         else:
             print(output, flush=True)
 
+    def set_output_device(candidate: OutputDevice | None) -> None:
+        nonlocal device, device_available, estimate, last_active_at, last_measurement_at
+        if candidate is None:
+            if device_available:
+                device_available = False
+                estimate = None
+                last_active_at = None
+                last_measurement_at = None
+                recorder.finish("output_device_disconnected")
+                show(f"waiting for {wanted_device_name} to reconnect…")
+            return
+        device = candidate
+        if not device_available:
+            device_available = True
+            estimate = None
+            last_active_at = None
+            last_measurement_at = None
+            show(f"{wanted_device_name} reconnected; resuming monitoring…")
+
     screen_locked = session_lock.is_locked()
     if not screen_locked:
         start_capture()
@@ -1230,6 +1262,10 @@ def main() -> int:
                     show("resuming capture…")
             if screen_locked:
                 continue
+
+            set_output_device(
+                reacquire_output_device(core_audio, wanted_device_name)
+            )
 
             if (
                 process is None
@@ -1259,7 +1295,12 @@ def main() -> int:
                 except ValueError:
                     continue
                 capture_failures = 0
+                if not device_available:
+                    continue
                 percent, attenuation = core_audio.volume(device)
+                if attenuation is None:
+                    set_output_device(None)
+                    continue
                 elapsed = (
                     min(1.0, max(0.0, now - last_measurement_at))
                     if last_measurement_at is not None

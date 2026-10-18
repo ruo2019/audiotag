@@ -237,6 +237,9 @@
   "Oxygene": [
     "Patrik Pietschmann"
   ],
+  "Paladin Strait": [
+    "21P"
+  ],
   "Passacaglia": [
     "Jacob's Piano",
     "Handel"
@@ -290,6 +293,9 @@
   ],
   "SI": [
     "Jamie Duffy",
+    "Hans Zimmer"
+  ],
+  "Samara's Theme": [
     "Hans Zimmer"
   ],
   "Schindler's List": [
@@ -394,6 +400,10 @@
   "[21P] Stressed Out": [
     "21P"
   ],
+  "[21P] The Line": [
+    "Arcane",
+    "21P"
+  ],
   "[AG] like i do": [
     "Ariana Grande"
   ],
@@ -422,6 +432,7 @@
     "Imagine Dragons"
   ],
   "[ID] Enemy": [
+    "Arcane",
     "Imagine Dragons"
   ],
   "[JM] traitor": [
@@ -464,11 +475,17 @@
   "deja vu": [
     "OR"
   ],
+  "drop dead": [
+    "OR"
+  ],
   "golden hour": [
     "JVKE"
   ],
   "hate that i made you": [
     "Ariana Grande"
+  ],
+  "honeybee (Instrumental)": [
+    "OR"
   ],
   "l bozo": [
     "Jova Musique",
@@ -481,18 +498,6 @@
     "Annalisa"
   ],
   "stupid song": [
-    "OR"
-  ],
-  "honeybee (Instrumental)": [
-    "OR"
-  ],
-  "Paladin Strait": [
-    "21P"
-  ],
-  "[21P] The Line": [
-    "21P"
-  ],
-  "drop dead": [
     "OR"
   ]
 }

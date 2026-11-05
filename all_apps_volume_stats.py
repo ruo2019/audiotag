@@ -1080,6 +1080,11 @@ def parse_args() -> argparse.Namespace:
         "--json", action="store_true", help="emit one JSON object per measurement"
     )
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress the live terminal display while continuing to log exposure",
+    )
+    parser.add_argument(
         "--prepare", action="store_true", help="compile the native helper and exit"
     )
     return parser.parse_args()
@@ -1199,6 +1204,8 @@ def main() -> int:
         ready = False
 
     def show(status: str) -> None:
+        if args.quiet:
+            return
         summary = recorder.summary()
         if args.json:
             payload = {

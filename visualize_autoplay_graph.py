@@ -24,6 +24,11 @@ from audio_colors import (
     cached_audio_color_records,
     ensure_audio_color_records,
 )
+from external_listens import (
+    EXTERNAL_MAPPINGS_FILE,
+    EXTERNAL_PLAYS_FILE,
+    mapped_contributions,
+)
 
 try:
     from mutagen.mp3 import MP3
@@ -216,6 +221,15 @@ def artists_filename_for_folder(folder: Path) -> str:
     return ARTISTS_FILE
 
 
+def add_mapped_external_counts(folder: Path, song_counts):
+    external_counts, _external_history = mapped_contributions(folder.name)
+    return {
+        song_name: int(local_count or 0)
+        + int(external_counts.get(Path(song_name).stem, 0) or 0)
+        for song_name, local_count in song_counts.items()
+    }
+
+
 def parse_repo_timestamp(value):
     try:
         return int(datetime.fromisoformat(str(value)).timestamp())
@@ -264,7 +278,7 @@ def load_repo_listen_counts(folder: Path, repo_root: Path):
     for path in folder.iterdir():
         if path.is_file() and path.suffix.lower() == ".mp3":
             song_counts[path.name] = int(raw.get(path.stem, 0) or 0)
-    return song_counts, counts_path
+    return add_mapped_external_counts(folder, song_counts), counts_path
 
 
 def load_repo_history_mapping(folder: Path, repo_root: Path, song_counts):
@@ -351,6 +365,7 @@ def load_folder_data(folder: Path):
             for name, count in data.items()
             if not str(name).startswith("__") and isinstance(count, int)
         }
+        song_counts = add_mapped_external_counts(folder, song_counts)
         config = data.get(CONFIG_KEY, {})
         raw_history_mapping = config.get(PLAY_HISTORY_CONFIG_KEY, {})
 
@@ -1507,7 +1522,7 @@ def hash_graph_payload(graph_payload) -> str:
 
 def source_paths_for_folder(repo_root: Path, folder: Path, use_all_folders: bool):
     if use_all_folders:
-        source_paths = []
+        source_paths = [EXTERNAL_PLAYS_FILE, EXTERNAL_MAPPINGS_FILE]
         for relative_folder in ALL_FOLDERS:
             source_folder = repo_root / relative_folder
             source_paths.extend(
@@ -1524,7 +1539,13 @@ def source_paths_for_folder(repo_root: Path, folder: Path, use_all_folders: bool
 
     meta_path = folder / META_FILENAME
     if meta_path.is_file():
-        return [meta_path, folder, repo_root / AUDIO_COLOR_CACHE_FILENAME]
+        return [
+            meta_path,
+            folder,
+            EXTERNAL_PLAYS_FILE,
+            EXTERNAL_MAPPINGS_FILE,
+            repo_root / AUDIO_COLOR_CACHE_FILENAME,
+        ]
 
     return [
         folder,
@@ -1532,6 +1553,8 @@ def source_paths_for_folder(repo_root: Path, folder: Path, use_all_folders: bool
         repo_root / listen_timestamps_filename_for_folder(folder),
         repo_root / artists_filename_for_folder(folder),
         folder / ".loudness_cache.json",
+        EXTERNAL_PLAYS_FILE,
+        EXTERNAL_MAPPINGS_FILE,
         repo_root / AUDIO_COLOR_CACHE_FILENAME,
     ]
 

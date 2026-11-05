@@ -30,6 +30,17 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 
+from background_services import BackgroundServiceManager
+from external_listens import (
+    EXTERNAL_MAPPINGS_FILE,
+    EXTERNAL_PLAYS_FILE,
+    load_mappings as load_external_mappings,
+    load_plays as load_external_plays,
+    mapped_contributions,
+    store_revision as external_store_revision,
+    sync_mapped_listen_timestamps,
+)
+
 # Pygame disables the system screensaver by default.  This is a terminal audio
 # player, so let macOS turn off the displays normally while it keeps running.
 os.environ["SDL_VIDEO_ALLOW_SCREENSAVER"] = "1"
@@ -116,6 +127,8 @@ AUTO_COMMIT_STATE_PATTERNS = (
     "mid_artists.json",
     "queue_playlists*.json",
     DOWNLOAD_LIST_FILE,
+    EXTERNAL_PLAYS_FILE.name,
+    EXTERNAL_MAPPINGS_FILE.name,
 )
 
 UI_POLL_HZ = 20
@@ -587,7 +600,9 @@ class LibraryState:
     listen_timestamps_filename: str
     tags_data: Dict[str, List[str]]
     artists_data: Dict[str, List[str]]
+    local_counts: Dict[str, int]
     counts: Dict[str, int]
+    local_listen_timestamps: List[dict]
     listen_timestamps: List[dict]
     history_duration_by_track_name: Dict[str, float]
     markov_transitions: Dict[str, Dict[str, int]]
@@ -757,9 +772,26 @@ def load_library_state(
             f"'{artists_file}' ({label})."
         )
 
-    counts = load_listen_counts(mp3_folder, listen_db_filename)
+    local_counts = load_listen_counts(mp3_folder, listen_db_filename)
     listen_timestamps_filename = listen_timestamps_filename_for_folder(mp3_folder)
-    listen_timestamps = load_listen_timestamps(mp3_folder, listen_timestamps_filename)
+    local_listen_timestamps = load_listen_timestamps(
+        mp3_folder, listen_timestamps_filename
+    )
+    external_counts, _external_timestamps = mapped_contributions(label)
+    known_track_names = {
+        path.name
+        for path in mp3_folder.glob("*.mp3")
+        if path.is_file()
+    }
+    external_counts = {
+        stem: count
+        for stem, count in external_counts.items()
+        if f"{stem}.mp3" in known_track_names
+    }
+    counts = dict(local_counts)
+    for stem, count in external_counts.items():
+        counts[stem] = counts.get(stem, 0) + count
+    listen_timestamps = list(local_listen_timestamps)
     history_duration_by_track_name = build_duration_by_track_name(mp3_folder)
     markov_transitions, markov_global_counts = build_markov_transition_counts(
         mp3_folder,
@@ -788,7 +820,9 @@ def load_library_state(
         listen_timestamps_filename=listen_timestamps_filename,
         tags_data=tags_data,
         artists_data=artists_data,
+        local_counts=local_counts,
         counts=counts,
+        local_listen_timestamps=local_listen_timestamps,
         listen_timestamps=listen_timestamps,
         history_duration_by_track_name=history_duration_by_track_name,
         markov_transitions=markov_transitions,
@@ -799,6 +833,45 @@ def load_library_state(
         tag_session=TrackTagSession(tags_file, tags_data),
         duration_by_stem=duration_by_stem,
     )
+
+
+def apply_external_contributions(
+    state: LibraryState,
+    events: Iterable[dict],
+    mappings: Dict[str, dict],
+) -> None:
+    """Refresh one library after external plays or mappings change."""
+    external_counts, _external_timestamps = mapped_contributions(
+        state.mp3_folder.name or state.label,
+        events,
+        mappings,
+    )
+    known_track_names = {
+        path.name
+        for path in state.mp3_folder.glob("*.mp3")
+        if path.is_file()
+    }
+    combined_counts = dict(state.local_counts)
+    for stem, count in external_counts.items():
+        if f"{stem}.mp3" in known_track_names:
+            combined_counts[stem] = combined_counts.get(stem, 0) + count
+    combined_history = list(state.local_listen_timestamps)
+
+    state.counts.clear()
+    state.counts.update(combined_counts)
+    state.listen_timestamps.clear()
+    state.listen_timestamps.extend(combined_history)
+    state.listen_stats_cache = None
+
+    transitions, global_counts = build_markov_transition_counts(
+        state.mp3_folder,
+        state.listen_timestamps,
+        state.history_duration_by_track_name,
+    )
+    state.markov_transitions.clear()
+    state.markov_transitions.update(transitions)
+    state.markov_global_counts.clear()
+    state.markov_global_counts.update(global_counts)
 
 
 def youtube_available() -> bool:
@@ -1335,6 +1408,8 @@ def load_listen_timestamps(mp3_dir: Path, db_filename: str) -> List[dict]:
                 source = item.get("source")
                 if source:
                     event["source"] = str(source)
+                if item.get("external_listen") is True:
+                    event["external_listen"] = True
                 events.append(event)
         return events
 
@@ -5772,6 +5847,12 @@ def main(
     youtube_cookie_config: Optional[YouTubeCookieConfig] = None,
     library_configs: Optional[List[Tuple[str, Path, Path, str]]] = None,
 ) -> None:
+    initial_external_events = load_external_plays()
+    initial_external_mappings = load_external_mappings()
+    sync_mapped_listen_timestamps(
+        initial_external_events,
+        initial_external_mappings,
+    )
     if library_configs is None:
         label, resolved_tags_file, resolved_listen_db = library_defaults_for_folder(
             mp3_folder,
@@ -5824,6 +5905,41 @@ def main(
     active_playlist_name = active_state.active_playlist_name
     active_playlist_library_idx = active_library_idx
 
+    external_revision = external_store_revision(
+        (EXTERNAL_PLAYS_FILE, EXTERNAL_MAPPINGS_FILE)
+    )
+    external_revision_checked_at = -math.inf
+
+    def refresh_external_contributions(*, force: bool = False) -> bool:
+        nonlocal external_revision, external_revision_checked_at
+        nonlocal auto_markov_transitions, auto_markov_global_counts
+        now = time.monotonic()
+        if not force and now - external_revision_checked_at < 0.5:
+            return False
+        external_revision_checked_at = now
+        revision = external_store_revision(
+            (EXTERNAL_PLAYS_FILE, EXTERNAL_MAPPINGS_FILE)
+        )
+        if not force and revision == external_revision:
+            return False
+        events = load_external_plays()
+        mappings = load_external_mappings()
+        sync_mapped_listen_timestamps(events, mappings)
+        for state in library_states:
+            persisted_history = load_listen_timestamps(
+                state.mp3_folder,
+                state.listen_timestamps_filename,
+            )
+            state.local_listen_timestamps.clear()
+            state.local_listen_timestamps.extend(persisted_history)
+            apply_external_contributions(state, events, mappings)
+        auto_markov_transitions, auto_markov_global_counts = (
+            build_combined_markov_transition_counts(library_states)
+        )
+        external_revision = revision
+        return True
+
+    refresh_external_contributions(force=True)
     EMB_CACHE.ensure(model, tags_data, artists_data, mp3_folder, logging=logging)
 
     FORCE_DEVICE: Optional[str] = None
@@ -6270,8 +6386,9 @@ def main(
 
     def refresh_library_after_download(state_idx: int, track_path: Path) -> None:
         state = library_states[state_idx]
+        state.local_counts.setdefault(track_path.stem, 0)
         state.counts.setdefault(track_path.stem, 0)
-        save_listen_counts(state.counts, state.listen_db_filename)
+        save_listen_counts(state.local_counts, state.listen_db_filename)
         duration = get_audio_duration_seconds(track_path)
         state.history_duration_by_track_name[track_path.name] = duration
         state.duration_by_stem[track_path.stem] = duration
@@ -7418,6 +7535,7 @@ def main(
                         tui.status_msg = "No playlists to delete."
 
         def handle_common_actions() -> None:
+            refresh_external_contributions()
             clear_finished_youtube_side_player()
             maybe_auto_commit_state()
             if tui.library_switch_request is not None:
@@ -7618,6 +7736,7 @@ def main(
         try:
             while True:
                 maybe_exit()
+                refresh_external_contributions()
                 if wait_for_unlock():
                     if consume_lock_timeout_stop():
                         continue
@@ -8012,18 +8131,20 @@ def main(
                             saved_tags = track_tag_session.finish(trailing_tag)
                             if trailing_tag and enable_tui and tui.input_mode in ("tag_add", "tag_edit"):
                                 tui.input_buffer = ""
+                            increment_listen(track_path, track_state.local_counts)
                             increment_listen(track_path, track_state.counts)
                             track_state.listen_stats_cache = None
                             save_listen_counts(
-                                track_state.counts, track_state.listen_db_filename
+                                track_state.local_counts, track_state.listen_db_filename
                             )
-                            record_listen_timestamp(
+                            listen_event = record_listen_timestamp(
                                 track_path,
-                                track_state.listen_timestamps,
+                                track_state.local_listen_timestamps,
                                 source=track_source,
                             )
+                            track_state.listen_timestamps.append(listen_event)
                             save_listen_timestamps(
-                                track_state.listen_timestamps,
+                                track_state.local_listen_timestamps,
                                 track_state.listen_timestamps_filename,
                             )
                             listen_msg = (
@@ -8217,36 +8338,50 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--no-tui", action="store_true", help="Disable curses UI.")
+    p.add_argument(
+        "--no-background-services",
+        action="store_true",
+        help=(
+            "Do not supervise external-listen tracking, headphone exposure, "
+            "or the live dashboard servers."
+        ),
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.folders:
-        folder_paths = [Path(folder) for folder in args.folders]
-    elif args.folder:
-        folder_paths = [Path(args.folder)]
-    elif args.no_tui:
-        folder_paths = [DEFAULT_MP3_FOLDER]
-    else:
-        folder_paths = [DEFAULT_MP3_FOLDER, DEFAULT_MID_MP3_FOLDER]
-
-    library_configs: List[Tuple[str, Path, Path, str]] = []
-    for idx, folder_path in enumerate(folder_paths):
-        explicit_tags = Path(args.tags) if args.folder and len(folder_paths) == 1 else None
-        label, tags_path, listen_db = library_defaults_for_folder(
-            folder_path,
-            explicit_tags if idx == 0 else None,
-            None,
-        )
-        library_configs.append((label, folder_path, tags_path, listen_db))
-
-    mp3_folder = library_configs[0][1]
-    tags_file = library_configs[0][2]
-    listen_db = library_configs[0][3]
+    service_manager = BackgroundServiceManager(Path(__file__).resolve().parent)
+    if not args.no_background_services:
+        service_manager.start()
 
     try:
+        if args.folders:
+            folder_paths = [Path(folder) for folder in args.folders]
+        elif args.folder:
+            folder_paths = [Path(args.folder)]
+        elif args.no_tui:
+            folder_paths = [DEFAULT_MP3_FOLDER]
+        else:
+            folder_paths = [DEFAULT_MP3_FOLDER, DEFAULT_MID_MP3_FOLDER]
+
+        library_configs: List[Tuple[str, Path, Path, str]] = []
+        for idx, folder_path in enumerate(folder_paths):
+            explicit_tags = (
+                Path(args.tags) if args.folder and len(folder_paths) == 1 else None
+            )
+            label, tags_path, listen_db = library_defaults_for_folder(
+                folder_path,
+                explicit_tags if idx == 0 else None,
+                None,
+            )
+            library_configs.append((label, folder_path, tags_path, listen_db))
+
+        mp3_folder = library_configs[0][1]
+        tags_file = library_configs[0][2]
+        listen_db = library_configs[0][3]
+
         youtube_cookie_config = build_youtube_cookie_config(
             args.youtube_cookies_from_browser,
             args.youtube_cookies,
@@ -8270,3 +8405,5 @@ if __name__ == "__main__":
         print("\nPlayback stopped.")
     except KeyboardInterrupt:
         print("\nPlayback interrupted.")
+    finally:
+        service_manager.stop()

@@ -96,8 +96,23 @@ Useful options:
 - `--vol -16` sets target integrated LUFS; otherwise the sample track is used.
 - `--sample "Deep Stone Crypt Theme.mp3"` selects the reference track.
 - `--no-tui` disables the curses UI.
+- `--no-background-services` runs only the player.
 - `--youtube-cookies-from-browser chrome` or `--youtube-cookies cookies.txt`
   configures YouTube helpers used by the Markov player.
+
+Starting `headphones_markov.py` also starts and supervises the external-listen
+tracker, all-app headphone-exposure monitor, live exposure dashboard, and live
+autoplay graph. They run quietly in the background, restart after an unexpected
+exit, and stop when the player stops. The dashboards keep stable addresses:
+
+- headphone exposure: `http://127.0.0.1:8769`
+- autoplay graph and trending: `http://127.0.0.1:8787`
+
+Their combined diagnostic log is
+`~/Library/Logs/Audiotag/background-services.log`. If one of the same scripts is
+already running from an older tmux session, the player leaves it alone and takes
+over automatically after that old process exits. Only one player instance owns
+the managed services.
 
 The Markov player stops playback while the Mac is locked. If the lock reaches
 30 minutes, it performs the same stop-and-clear action as Ctrl+G, including
@@ -120,6 +135,79 @@ Related players:
   Similar/Most tabs.
 - `player.py` is the older required-`--mood` looping player.
 - `play.py` is a terminal player for direct folder playback and volume analysis.
+
+## Match External Listens
+
+Install the macOS Now Playing helper, then open the three-column matcher:
+
+```bash
+brew install nowplaying-cli
+python external_listen_matcher.py
+```
+
+The matcher monitors macOS Now Playing while it is open. Its left column shows
+unmatched external tracks only after they have completed enough playback to
+count as a listen. The middle column searches `static/mp3/` and
+`static/mid-mp3s/` together, and the right column shows the newest confirmed
+matches first. Click an external track once, then double-click a local track to
+save the match. Double-click a match in the right column to replace its local
+target. Songs without a local MP3 simply remain unmatched for later. To delete
+an ad or other junk item, select it in the unmatched column, press Delete, then
+press `y` to confirm. Matching is always explicit; search only filters local
+filenames. The deleted record is moved to
+`external_plays_trash.jsonl` before it is removed from the active store, so it
+survives matcher and computer restarts. Press `u` from the unmatched column to
+restore the newest trashed record; repeated presses walk backward through the
+trash history. The mouse wheel scrolls whichever column is under the pointer.
+Local-library labels use `[m]` for `static/mp3/` and `[mm]` for
+`static/mid-mp3s/`.
+
+When `headphones_markov.py` is not running, collect listens by running the tracker
+separately:
+
+```bash
+python external_listen_tracker.py
+```
+
+Only one tracker records at a time. Each distinct external track is one compact
+line in `external_plays.jsonl`, containing its external ID, title, artist,
+duration, and a list of completion timestamps. New listens are added to that
+track's timestamp list only after playback finishes.
+Pausing before the end remains pending, and resuming continues the same session.
+A reported natural ending is saved after a short confirmation delay; changing
+tracks before reaching the end discards the unfinished session. If an app stops
+updating its playback position, one full duration of observed playing time is
+used instead.
+`external_track_mappings.json` uses each `mp3/filename.mp3` or
+`mid-mp3s/filename.mp3` as a key whose value is the list of external IDs matched
+to it. `headphones_markov.py` reloads those files while running and layers mapped
+external listens over the existing local counts. Changing a mapping updates
+totals, timestamps, and Markov history without restarting the player. Mapped
+external plays are written into the appropriate `listen_timestamps_*.json` file
+with `source` set to `manual`; an `external_listen` marker lets rematching move
+those entries without touching ordinary local listens.
+
+## Archive Low-Listen MP3s
+
+Move tracks with fewer than 10 combined local and mapped external listens out of
+the two active libraries:
+
+```bash
+python manage_boring_mp3s.py archive --threshold 10 --apply
+```
+
+Archived tracks go directly into `static/boring-mp3s/`. If a filename already
+exists there, the newly archived file gets an `[m]` or `[mm]` suffix rather than
+overwriting it. The manifest stores only the archived filename, source library,
+and combined listen count. Archived entries are removed from the active listen
+count files, while tags, artists, timestamps, playlists, and external mappings
+remain untouched. List or restore tracks with:
+
+```bash
+python manage_boring_mp3s.py list
+python manage_boring_mp3s.py restore "Song.mp3"
+python manage_boring_mp3s.py restore "static/mp3/Song.mp3"
+```
 
 For headphone listening statistics across all Mac apps, run
 `all_apps_volume_stats.py`. It
@@ -202,6 +290,14 @@ python artist_tagger.py --list-output-devices
 ```
 
 Artist tags are stored separately from mood tags.
+
+The artist tagger opens a terminal interface for each track. Start typing to
+filter every artist already stored in the artist JSON, press Down Arrow to focus
+the results, and press Space to select or remove the focused artist. Selected
+artists remain pinned above the results. If a search has no matches, Enter adds
+the typed name to the pinned section without adding it to the saved artist list
+yet. Right Arrow records all pinned artists, or skips the song when none are
+selected. `+` adds to the current tag instead of replacing it, and `-` clears it.
 
 ## Trim MP3s
 

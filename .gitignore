@@ -47,3 +47,4 @@ autoplay_color_seed.json
 static/
 !templates/trimmer.html
 !templates/headphone_exposure_dashboard.html
+external_plays_trash.jsonl

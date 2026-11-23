@@ -160,12 +160,13 @@ survives matcher and computer restarts. Press `u` from the unmatched column to
 restore the newest trashed record; repeated presses walk backward through the
 trash history. Confirming a deletion also removes that external ID from prior
 `external_plays.jsonl` revisions and force-pushes the rewritten `main` history;
-every commit is retained. Restoring a record adds it back only to the active
-store, so it can appear in future commits without being reinserted into older
-commits. The purge refuses to run if Git has staged changes or local and remote
-history differ. If a network or Git error leaves a purge pending, retry it with
-`python external_history.py`. The mouse wheel scrolls whichever column is under
-the pointer.
+an auto-commit is pruned if removing that ID leaves it with no changes.
+Restoring a record adds it back only to the active store, so it can appear in
+future commits without being reinserted into older commits. The purge refuses
+to run if Git has staged changes or local and remote history differ. If a
+network or Git error leaves a purge pending, retry it with `python
+external_history.py`. The mouse wheel scrolls whichever column is under the
+pointer.
 Local-library labels use `[m]` for `static/mp3/` and `[mm]` for
 `static/mid-mp3s/`.
 

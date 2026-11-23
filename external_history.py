@@ -248,34 +248,32 @@ def purge_trashed_external_history(
                 clone,
                 "filter-repo",
                 "--prune-empty",
-                "never",
+                "auto",
                 "--prune-degenerate",
-                "never",
+                "auto",
                 "--file-info-callback",
                 str(callback),
             )
             after_count = int(
                 _git(clone, "rev-list", "--count", "HEAD").stdout.strip()
             )
-            if after_count != before_count:
-                raise HistoryPurgeError(
-                    f"Commit preservation check failed ({before_count} -> {after_count})."
-                )
             remaining = _history_ids(clone, "HEAD") & present_ids
             if remaining:
                 raise HistoryPurgeError(
                     f"Verification failed: {len(remaining)} trashed IDs remain in history."
                 )
             commit_map = clone / ".git" / "filter-repo" / "commit-map"
+            pruned_commits = before_count - after_count
             if commit_map.exists():
                 deleted = [
                     line
                     for line in commit_map.read_text(encoding="utf-8").splitlines()[1:]
                     if line.split() and line.split()[-1] == "0" * 40
                 ]
-                if deleted:
+                if len(deleted) != pruned_commits:
                     raise HistoryPurgeError(
-                        f"Commit preservation check failed: {len(deleted)} commits deleted."
+                        "Pruned-commit verification failed: "
+                        f"expected {pruned_commits}, found {len(deleted)} mappings."
                     )
             new_head = _git(clone, "rev-parse", "HEAD").stdout.strip()
             _git(clone, "remote", "add", "origin", remote_url)
@@ -303,7 +301,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Remove IDs currently in external_plays_trash.jsonl from all prior "
-            "external_plays.jsonl revisions while preserving every commit."
+            "external_plays.jsonl revisions, pruning commits that become empty."
         )
     )
     parser.add_argument(
@@ -320,8 +318,8 @@ def main() -> int:
         print(f"{result.removed_ids} trashed external IDs still occur in history.")
     elif result.changed:
         print(
-            f"Removed {result.removed_ids} trashed external IDs; preserved "
-            f"{result.commits_preserved} commits; pushed {result.new_head[:8]}."
+            f"Removed {result.removed_ids} trashed external IDs; "
+            f"{result.commits_preserved} commits remain; pushed {result.new_head[:8]}."
         )
     else:
         print("No trashed external IDs occur in reachable history.")

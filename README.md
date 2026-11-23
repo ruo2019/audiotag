@@ -161,6 +161,8 @@ restore the newest trashed record; repeated presses walk backward through the
 trash history. Confirming a deletion also removes that external ID from prior
 `external_plays.jsonl` revisions and force-pushes the rewritten `main` history;
 an auto-commit is pruned if removing that ID leaves it with no changes.
+The matcher queues this rewrite in the background and batches rapid deletions,
+so deleting and continuing to match tracks does not wait for Git or the network.
 Restoring a record adds it back only to the active store, so it can appear in
 future commits without being reinserted into older commits. The purge refuses
 to run if Git has staged changes or local and remote history differ. If a

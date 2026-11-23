@@ -234,7 +234,11 @@ def purge_trashed_external_history(
                     "--single-branch",
                     "--branch",
                     branch,
-                    remote_url,
+                    # Local HEAD was verified byte-for-byte against the live
+                    # remote above. Cloning it avoids downloading the same
+                    # history again while --no-local still gives filter-repo
+                    # the fresh, independent object store it requires.
+                    str(repo),
                     str(clone),
                 ],
                 cwd=repo,

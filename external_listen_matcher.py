@@ -5,6 +5,7 @@ import argparse
 import curses
 import locale
 import math
+import queue
 import threading
 import time
 import unicodedata
@@ -40,6 +41,7 @@ UI_INTERACTIVE_HZ = 60
 UI_INTERACTION_SECONDS = 0.5
 INPUT_DRAIN_LIMIT = 64
 MAX_WHEEL_STEPS_PER_RENDER = 1
+HISTORY_PURGE_DEBOUNCE_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -178,8 +180,61 @@ class MatcherUI:
         self.last_input_at = -math.inf
         self.wheel_steps_this_render = 0
         self.running = True
+        self.history_purge_requested = threading.Event()
+        self.history_purge_stop = threading.Event()
+        self.history_purge_messages: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+        self.history_purge_thread = threading.Thread(
+            target=self._history_purge_worker,
+            name="external-history-purge",
+            daemon=True,
+        )
+        self.history_purge_thread.start()
         self._configure_curses()
         self.refresh_data(force=True)
+
+    def _history_purge_worker(self) -> None:
+        while not self.history_purge_stop.is_set():
+            self.history_purge_requested.wait()
+            if self.history_purge_stop.is_set():
+                return
+
+            # Batch rapid deletions into one history rewrite. A deletion that
+            # arrives during the rewrite sets the event again and gets another
+            # pass immediately afterward.
+            while True:
+                self.history_purge_requested.clear()
+                if not self.history_purge_requested.wait(
+                    HISTORY_PURGE_DEBOUNCE_SECONDS
+                ):
+                    break
+            if self.history_purge_stop.is_set():
+                return
+            try:
+                purge = purge_trashed_external_history()
+            except HistoryPurgeError as error:
+                self.history_purge_messages.put(f"History purge pending: {error}")
+            except Exception as error:
+                self.history_purge_messages.put(
+                    f"History purge pending: unexpected error: {error}"
+                )
+            else:
+                if purge.changed:
+                    self.history_purge_messages.put(
+                        f"History purge finished: removed {purge.removed_ids} "
+                        "trashed external ID(s) from prior commits."
+                    )
+                else:
+                    self.history_purge_messages.put("External-play history is clean.")
+
+    def _request_history_purge(self) -> None:
+        self.history_purge_requested.set()
+
+    def _drain_history_purge_messages(self) -> None:
+        while True:
+            try:
+                self.status = self.history_purge_messages.get_nowait()
+            except queue.Empty:
+                return
 
     def _configure_curses(self) -> None:
         locale.setlocale(locale.LC_ALL, "")
@@ -338,20 +393,11 @@ class MatcherUI:
         if self.active_external_key == key:
             self.active_external_key = None
         self.refresh_data(force=True)
-        try:
-            purge = purge_trashed_external_history()
-        except HistoryPurgeError as error:
-            self.status = (
-                f'Moved "{title}" to Trash. History purge pending: {error}'
-            )
-            return
-        if purge.changed:
-            self.status = (
-                f'Moved "{title}" to Trash and removed it from prior commits. '
-                "Press u to restore it for future commits."
-            )
-        else:
-            self.status = f'Moved "{title}" to Trash. Press u to undo.'
+        self._request_history_purge()
+        self.status = (
+            f'Moved "{title}" to Trash. History purge queued; press u to restore '
+            "it for future commits."
+        )
 
     def undo_delete(self) -> None:
         self.pending_delete_key = None
@@ -718,28 +764,34 @@ class MatcherUI:
             pass
 
     def run(self) -> None:
-        while self.running:
-            self.refresh_data()
-            self.wheel_steps_this_render = 0
-            saw_input = False
-            for _ in range(INPUT_DRAIN_LIMIT):
-                try:
-                    key = self.screen.get_wch()
-                except curses.error:
-                    break
-                saw_input = True
-                if isinstance(key, str):
-                    self.handle_key(ord(key))
-                else:
-                    self.handle_key(key)
-            if saw_input:
-                self.last_input_at = time.monotonic()
-            self.render()
-            interactive = (
-                time.monotonic() - self.last_input_at < UI_INTERACTION_SECONDS
-            )
-            poll_hz = UI_INTERACTIVE_HZ if interactive else UI_POLL_HZ
-            time.sleep(1.0 / poll_hz)
+        try:
+            while self.running:
+                self.refresh_data()
+                self._drain_history_purge_messages()
+                self.wheel_steps_this_render = 0
+                saw_input = False
+                for _ in range(INPUT_DRAIN_LIMIT):
+                    try:
+                        key = self.screen.get_wch()
+                    except curses.error:
+                        break
+                    saw_input = True
+                    if isinstance(key, str):
+                        self.handle_key(ord(key))
+                    else:
+                        self.handle_key(key)
+                if saw_input:
+                    self.last_input_at = time.monotonic()
+                self.render()
+                interactive = (
+                    time.monotonic() - self.last_input_at < UI_INTERACTION_SECONDS
+                )
+                poll_hz = UI_INTERACTIVE_HZ if interactive else UI_POLL_HZ
+                time.sleep(1.0 / poll_hz)
+        finally:
+            self.history_purge_stop.set()
+            self.history_purge_requested.set()
+            self.history_purge_thread.join(timeout=5.0)
 
 
 def parse_args() -> argparse.Namespace:

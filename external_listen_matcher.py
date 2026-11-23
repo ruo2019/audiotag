@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from external_history import HistoryPurgeError, purge_trashed_external_history
 from external_listen_tracker import run_tracker
 from external_listens import (
     EXTERNAL_MAPPINGS_FILE,
@@ -337,7 +338,20 @@ class MatcherUI:
         if self.active_external_key == key:
             self.active_external_key = None
         self.refresh_data(force=True)
-        self.status = f'Moved "{title}" to Trash. Press u to undo.'
+        try:
+            purge = purge_trashed_external_history()
+        except HistoryPurgeError as error:
+            self.status = (
+                f'Moved "{title}" to Trash. History purge pending: {error}'
+            )
+            return
+        if purge.changed:
+            self.status = (
+                f'Moved "{title}" to Trash and removed it from prior commits. '
+                "Press u to restore it for future commits."
+            )
+        else:
+            self.status = f'Moved "{title}" to Trash. Press u to undo.'
 
     def undo_delete(self) -> None:
         self.pending_delete_key = None
